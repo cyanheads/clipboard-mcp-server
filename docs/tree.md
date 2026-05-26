@@ -1,15 +1,16 @@
 # clipboard-mcp-server - Directory Structure
 
-Generated on: 2026-05-25 08:49:16
+Generated on: 2026-05-26 07:43:49
 
 ```text
 clipboard-mcp-server/
 ├── .claude/
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   └── FUNDING.yml
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -139,7 +140,6 @@ clipboard-mcp-server/
 │       ├── clipboard-inspect.tool.test.ts
 │       ├── clipboard-read.tool.test.ts
 │       └── clipboard-write.tool.test.ts
-├── .dockerignore
 ├── .env.example
 ├── .gitignore
 ├── .mcpbignore
@@ -148,7 +148,6 @@ clipboard-mcp-server/
 ├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
-├── Dockerfile
 ├── LICENSE
 ├── manifest.json
 ├── package.json
