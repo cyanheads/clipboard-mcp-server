@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-11
+
+Adopt @cyanheads/mcp-ts-core ^0.10.6: explicit server name/title identity, ValidationError contract codes, agent-doc-stripped bundles; add plugin manifests and repository/license metadata.
+
 ## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-05-26
 
 align package.json and README to gold-standard patterns: bun scripts, funding, author, npm badge
