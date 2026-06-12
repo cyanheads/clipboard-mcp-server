@@ -1,0 +1,20 @@
+{
+  "name": "@cyanheads/clipboard-mcp-server",
+  "version": "0.1.5",
+  "description": "Read, write, and inspect the system clipboard across macOS, Linux (X11/Wayland), and Windows via MCP.",
+  "author": {
+    "name": "cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/clipboard-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/clipboard-mcp-server",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "@cyanheads/clipboard-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/clipboard-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
