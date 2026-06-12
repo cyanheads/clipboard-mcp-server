@@ -33,7 +33,7 @@ export const clipboardWrite = tool('clipboard_write', {
   errors: [
     {
       reason: 'content_too_large',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Write content exceeds the 1MB size limit.',
       recovery:
         'Content is too large to write to the clipboard. Truncate or summarize before writing.',

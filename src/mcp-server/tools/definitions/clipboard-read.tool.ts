@@ -59,7 +59,7 @@ export const clipboardRead = tool('clipboard_read', {
     },
     {
       reason: 'content_too_large',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Clipboard content exceeds the size limit (512KB text/HTML/RTF, 5MB image).',
       recovery:
         'Content is too large to return. Call clipboard_inspect to see available formats and sizes, then decide whether to request a smaller format.',

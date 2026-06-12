@@ -11,6 +11,8 @@ import { clipboardWrite } from './mcp-server/tools/definitions/clipboard-write.t
 import { initClipboardService } from './services/clipboard/clipboard-service.js';
 
 await createApp({
+  name: 'clipboard-mcp-server',
+  title: 'clipboard-mcp-server',
   tools: [clipboardInspect, clipboardRead, clipboardWrite],
   resources: [],
   prompts: [],
