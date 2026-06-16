@@ -1,6 +1,6 @@
 {
-  "name": "@cyanheads/clipboard-mcp-server",
-  "version": "0.1.5",
+  "name": "clipboard-mcp-server",
+  "version": "0.1.6",
   "description": "Read, write, and inspect the system clipboard across macOS, Linux (X11/Wayland), and Windows via MCP.",
   "author": {
     "name": "cyanheads",
@@ -13,7 +13,7 @@
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "clipboard", "system", "automation"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/clipboard-mcp-server",
+    "displayName": "clipboard-mcp-server",
     "shortDescription": "Read, write, and inspect the system clipboard across macOS, Linux, and Windows via MCP.",
     "longDescription": "MCP server for the system clipboard — read the current contents, write text, and inspect clipboard state across macOS, Linux (X11/Wayland), and Windows. STDIO or Streamable HTTP.",
     "developerName": "cyanheads",
