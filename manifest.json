@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "clipboard-mcp-server",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Read, write, and inspect the system clipboard across macOS, Linux (X11/Wayland), and Windows via MCP.",
   "author": {
     "name": "cyanheads"

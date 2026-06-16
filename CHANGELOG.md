@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-06-15
+
+Add server-level instructions for the clipboard_* tools; unscope the plugin manifests' display identity to the bare repo name (install args stay scoped).
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-11
 
 Adopt @cyanheads/mcp-ts-core ^0.10.6: explicit server name/title identity, ValidationError contract codes, agent-doc-stripped bundles; add plugin manifests and repository/license metadata.
