@@ -24,6 +24,7 @@
     "bundle": "bun run build && npx -y @anthropic-ai/mcpb pack . dist/clipboard-mcp-server.mcpb && bun run scripts/clean-mcpb.ts dist/clipboard-mcp-server.mcpb",
     "changelog:build": "bun run scripts/build-changelog.ts",
     "changelog:check": "bun run scripts/build-changelog.ts --check",
+    "release:github": "bun run scripts/release-github.ts",
     "test": "bunx vitest run",
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio bun ./dist/index.js",
     "start:http": "MCP_TRANSPORT_TYPE=http bun ./dist/index.js",
