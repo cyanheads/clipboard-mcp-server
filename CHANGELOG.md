@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-08-21
+
+Adopts mcp-ts-core ^0.12.3 (MCP SDK v2): JSON Schema 2020-12 advertised schemas with declared error envelopes, strict root inputs, supply-chain install scanner, TypeScript 7 toolchain, Bun 1.4 pin.
+
 ## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-06-15
 
 Add server-level instructions for the clipboard_* tools; unscope the plugin manifests' display identity to the bare repo name (install args stay scoped).

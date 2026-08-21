@@ -1,11 +1,9 @@
 # clipboard-mcp-server - Directory Structure
 
-Generated on: 2026-06-12 03:27:16
+Generated on: 2026-08-21 14:47:45
 
 ```text
 clipboard-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,7 +14,10 @@ clipboard-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
-│   └── FUNDING.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -27,8 +28,11 @@ clipboard-mcp-server/
 │   ├── design.md
 │   └── idea.md
 ├── scripts/
+│   ├── audit-open-index-signatures.ts
 │   ├── build-changelog.ts
+│   ├── build-inputs.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
@@ -36,11 +40,18 @@ clipboard-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── devdocs.ts
+│   ├── fetch-openapi-spec.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── public-api-contract-update.ts
+│   ├── public-api-contract.ts
 │   ├── release-github.ts
-│   └── tree.ts
+│   ├── split-changelog.ts
+│   ├── tree.ts
+│   ├── update-coverage.ts
+│   └── verify-package.ts
 ├── skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
@@ -163,10 +174,12 @@ clipboard-mcp-server/
 │       ├── clipboard-read.tool.test.ts
 │       └── clipboard-write.tool.test.ts
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── biome.json
 ├── bun.lock
+├── bunfig.toml
 ├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
