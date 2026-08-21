@@ -200,27 +200,28 @@ describe('LinuxWaylandBackend', () => {
   describe('security — injection prevention', () => {
     const INJECTION_PAYLOADS = ['"; $(whoami); "', '| cat /etc/passwd', '\x00'];
 
-    it.each(
-      INJECTION_PAYLOADS,
-    )('write: MIME type comes from enum, not content (%s)', async (payload) => {
-      const child = fakeChild({ stdout: '' });
-      Object.assign(child, { unref: vi.fn() });
-      const origEmit = child.emit.bind(child);
-      mockSpawn.mockImplementationOnce(() => {
-        setImmediate(() => origEmit('spawn'));
-        return child;
-      });
+    it.each(INJECTION_PAYLOADS)(
+      'write: MIME type comes from enum, not content (%s)',
+      async (payload) => {
+        const child = fakeChild({ stdout: '' });
+        Object.assign(child, { unref: vi.fn() });
+        const origEmit = child.emit.bind(child);
+        mockSpawn.mockImplementationOnce(() => {
+          setImmediate(() => origEmit('spawn'));
+          return child;
+        });
 
-      await backend.write(payload, 'text').catch(() => {
-        /* ignore */
-      });
-      if (mockSpawn.mock.calls.length > 0) {
-        const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
-        for (const arg of args) {
-          expect(arg).not.toContain('$(');
-          expect(arg).not.toContain('whoami');
+        await backend.write(payload, 'text').catch(() => {
+          /* ignore */
+        });
+        if (mockSpawn.mock.calls.length > 0) {
+          const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+          for (const arg of args) {
+            expect(arg).not.toContain('$(');
+            expect(arg).not.toContain('whoami');
+          }
         }
-      }
-    });
+      },
+    );
   });
 });

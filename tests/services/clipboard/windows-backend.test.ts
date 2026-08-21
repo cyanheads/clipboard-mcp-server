@@ -164,21 +164,22 @@ describe('WindowsBackend', () => {
       '\x00',
     ];
 
-    it.each(
-      INJECTION_PAYLOADS,
-    )('write: content passed as base64, not raw in script (%s)', async (payload) => {
-      const child = fakeChild({ stdout: '' });
-      mockSpawn.mockReturnValueOnce(child);
+    it.each(INJECTION_PAYLOADS)(
+      'write: content passed as base64, not raw in script (%s)',
+      async (payload) => {
+        const child = fakeChild({ stdout: '' });
+        mockSpawn.mockReturnValueOnce(child);
 
-      await backend.write(payload, 'text').catch(() => {
-        /* ignore */
-      });
-      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
-      // The -Command arg should have base64 content, not the raw payload
-      const scriptArg = (args as string[]).find((a) => a.includes('FromBase64String')) ?? '';
-      expect(scriptArg).not.toContain('Invoke-Expression');
-      expect(scriptArg).not.toContain('$(');
-      expect(scriptArg).not.toContain('whoami');
-    });
+        await backend.write(payload, 'text').catch(() => {
+          /* ignore */
+        });
+        const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+        // The -Command arg should have base64 content, not the raw payload
+        const scriptArg = (args as string[]).find((a) => a.includes('FromBase64String')) ?? '';
+        expect(scriptArg).not.toContain('Invoke-Expression');
+        expect(scriptArg).not.toContain('$(');
+        expect(scriptArg).not.toContain('whoami');
+      },
+    );
   });
 });

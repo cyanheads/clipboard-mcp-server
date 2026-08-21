@@ -80,118 +80,122 @@ describe('Security: injection prevention', () => {
   });
 
   describe('MacosBackend — write text', () => {
-    it.each(
-      INJECTION_PAYLOADS,
-    )('payload goes to stdin via pbcopy, not into args (%s)', async (payload) => {
-      const child = fakeChild({ stdout: '' });
-      mockSpawn.mockReturnValueOnce(child);
-      const backend = new MacosBackend();
-      await backend.write(payload, 'text').catch(() => {
-        /* ignore */
-      });
+    it.each(INJECTION_PAYLOADS)(
+      'payload goes to stdin via pbcopy, not into args (%s)',
+      async (payload) => {
+        const child = fakeChild({ stdout: '' });
+        mockSpawn.mockReturnValueOnce(child);
+        const backend = new MacosBackend();
+        await backend.write(payload, 'text').catch(() => {
+          /* ignore */
+        });
 
-      const calls = mockSpawn.mock.calls;
-      expect(calls.length).toBeGreaterThan(0);
-      const [cmd, args] = calls[calls.length - 1] as [string, string[]];
-      expect(cmd).toBe('pbcopy');
-      // Args should only be [] — content is on stdin
-      expect(args).toEqual([]);
-    });
+        const calls = mockSpawn.mock.calls;
+        expect(calls.length).toBeGreaterThan(0);
+        const [cmd, args] = calls[calls.length - 1] as [string, string[]];
+        expect(cmd).toBe('pbcopy');
+        // Args should only be [] — content is on stdin
+        expect(args).toEqual([]);
+      },
+    );
   });
 
   describe('MacosBackend — write html', () => {
-    it.each(
-      INJECTION_PAYLOADS,
-    )('html content base64-encoded in JXA script, not raw (%s)', async (payload) => {
-      const child = fakeChild({ stdout: 'ok' });
-      mockSpawn.mockReturnValueOnce(child);
-      const backend = new MacosBackend();
-      await backend.write(payload, 'html').catch(() => {
-        /* ignore */
-      });
+    it.each(INJECTION_PAYLOADS)(
+      'html content base64-encoded in JXA script, not raw (%s)',
+      async (payload) => {
+        const child = fakeChild({ stdout: 'ok' });
+        mockSpawn.mockReturnValueOnce(child);
+        const backend = new MacosBackend();
+        await backend.write(payload, 'html').catch(() => {
+          /* ignore */
+        });
 
-      const calls = mockSpawn.mock.calls;
-      if (calls.length === 0) return; // Skip if spawn wasn't called
-      const [cmd, args] = calls[calls.length - 1] as [string, string[]];
-      expect(cmd).toBe('osascript');
-      // Find the script content in args
-      const scriptArg =
-        (args as string[]).find((a) => typeof a === 'string' && a.includes('base64')) ?? '';
-      // The raw payload must not appear verbatim in the script source
-      // (it should only appear as base64-encoded data)
-      const dangerousChars = [
-        '$(',
-        '`',
-        'process.exit',
-        'ObjC.import',
-        'Invoke-Expression',
-        '| cat',
-      ];
-      for (const danger of dangerousChars) {
-        if (payload.includes(danger)) {
-          expect(scriptArg).not.toContain(danger);
+        const calls = mockSpawn.mock.calls;
+        if (calls.length === 0) return; // Skip if spawn wasn't called
+        const [cmd, args] = calls[calls.length - 1] as [string, string[]];
+        expect(cmd).toBe('osascript');
+        // Find the script content in args
+        const scriptArg =
+          (args as string[]).find((a) => typeof a === 'string' && a.includes('base64')) ?? '';
+        // The raw payload must not appear verbatim in the script source
+        // (it should only appear as base64-encoded data)
+        const dangerousChars = [
+          '$(',
+          '`',
+          'process.exit',
+          'ObjC.import',
+          'Invoke-Expression',
+          '| cat',
+        ];
+        for (const danger of dangerousChars) {
+          if (payload.includes(danger)) {
+            expect(scriptArg).not.toContain(danger);
+          }
         }
-      }
-    });
+      },
+    );
   });
 
   describe('LinuxX11Backend — write', () => {
-    it.each(
-      INJECTION_PAYLOADS,
-    )('content on stdin, MIME type from enum only (%s)', async (payload) => {
-      const child = fakeChild({ stdout: '' });
-      mockSpawn.mockReturnValueOnce(child);
-      const backend = new LinuxX11Backend();
-      await backend.write(payload, 'text').catch(() => {
-        /* ignore */
-      });
+    it.each(INJECTION_PAYLOADS)(
+      'content on stdin, MIME type from enum only (%s)',
+      async (payload) => {
+        const child = fakeChild({ stdout: '' });
+        mockSpawn.mockReturnValueOnce(child);
+        const backend = new LinuxX11Backend();
+        await backend.write(payload, 'text').catch(() => {
+          /* ignore */
+        });
 
-      const calls = mockSpawn.mock.calls;
-      if (calls.length === 0) return;
-      const [cmd, args] = calls[0] as [string, string[]];
-      expect(cmd).toBe('xclip');
-      // The MIME type argument must be from a validated enum
-      const tIdx = (args as string[]).indexOf('-t');
-      if (tIdx >= 0) {
-        const mimeArg = args[tIdx + 1] as string;
-        const validMimes = [
-          'UTF8_STRING',
-          'text/html',
-          'text/plain',
-          'text/rtf',
-          'application/rtf',
-          'image/png',
-          'TARGETS',
-        ];
-        expect(validMimes).toContain(mimeArg);
-      }
-      // Payload chars must not be in args
-      for (const arg of args as string[]) {
-        expect(arg).not.toContain('$(');
-        expect(arg).not.toContain('| cat');
-      }
-    });
+        const calls = mockSpawn.mock.calls;
+        if (calls.length === 0) return;
+        const [cmd, args] = calls[0] as [string, string[]];
+        expect(cmd).toBe('xclip');
+        // The MIME type argument must be from a validated enum
+        const tIdx = (args as string[]).indexOf('-t');
+        if (tIdx >= 0) {
+          const mimeArg = args[tIdx + 1] as string;
+          const validMimes = [
+            'UTF8_STRING',
+            'text/html',
+            'text/plain',
+            'text/rtf',
+            'application/rtf',
+            'image/png',
+            'TARGETS',
+          ];
+          expect(validMimes).toContain(mimeArg);
+        }
+        // Payload chars must not be in args
+        for (const arg of args as string[]) {
+          expect(arg).not.toContain('$(');
+          expect(arg).not.toContain('| cat');
+        }
+      },
+    );
   });
 
   describe('WindowsBackend — write', () => {
-    it.each(
-      INJECTION_PAYLOADS,
-    )('content base64-encoded in PS script, not raw (%s)', async (payload) => {
-      const child = fakeChild({ stdout: '' });
-      mockSpawn.mockReturnValueOnce(child);
-      const backend = new WindowsBackend();
-      await backend.write(payload, 'text').catch(() => {
-        /* ignore */
-      });
+    it.each(INJECTION_PAYLOADS)(
+      'content base64-encoded in PS script, not raw (%s)',
+      async (payload) => {
+        const child = fakeChild({ stdout: '' });
+        mockSpawn.mockReturnValueOnce(child);
+        const backend = new WindowsBackend();
+        await backend.write(payload, 'text').catch(() => {
+          /* ignore */
+        });
 
-      const calls = mockSpawn.mock.calls;
-      if (calls.length === 0) return;
-      const [, args] = calls[0] as [string, string[]];
-      // The -Command script arg must not contain Invoke-Expression or raw injection
-      const scriptArg = (args as string[]).find((a) => a.includes('Base64')) ?? '';
-      expect(scriptArg).not.toContain('Invoke-Expression');
-      expect(scriptArg).not.toContain('$(');
-    });
+        const calls = mockSpawn.mock.calls;
+        if (calls.length === 0) return;
+        const [, args] = calls[0] as [string, string[]];
+        // The -Command script arg must not contain Invoke-Expression or raw injection
+        const scriptArg = (args as string[]).find((a) => a.includes('Base64')) ?? '';
+        expect(scriptArg).not.toContain('Invoke-Expression');
+        expect(scriptArg).not.toContain('$(');
+      },
+    );
   });
 
   describe('Size limit enforcement in ClipboardService', () => {

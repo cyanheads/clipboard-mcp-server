@@ -261,38 +261,40 @@ describe('MacosBackend', () => {
       '\x00',
     ];
 
-    it.each(
-      INJECTION_PAYLOADS,
-    )('write text: payload goes to stdin, not args (%s)', async (payload) => {
-      const child = fakeChild({ stdout: '' });
-      const stdinEnd = vi.fn();
-      Object.assign(child, { stdin: { end: stdinEnd } });
-      mockSpawn.mockReturnValueOnce(child);
+    it.each(INJECTION_PAYLOADS)(
+      'write text: payload goes to stdin, not args (%s)',
+      async (payload) => {
+        const child = fakeChild({ stdout: '' });
+        const stdinEnd = vi.fn();
+        Object.assign(child, { stdin: { end: stdinEnd } });
+        mockSpawn.mockReturnValueOnce(child);
 
-      await backend.write(payload, 'text').catch(() => {
-        /* ignore */
-      });
-      const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
-      expect(cmd).toBe('pbcopy');
-      // None of the injection payload should appear in the args array
-      for (const arg of args) {
-        expect(arg).not.toContain('$(');
-        expect(arg).not.toContain('`id`');
-      }
-    });
+        await backend.write(payload, 'text').catch(() => {
+          /* ignore */
+        });
+        const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
+        expect(cmd).toBe('pbcopy');
+        // None of the injection payload should appear in the args array
+        for (const arg of args) {
+          expect(arg).not.toContain('$(');
+          expect(arg).not.toContain('`id`');
+        }
+      },
+    );
 
-    it.each(
-      INJECTION_PAYLOADS,
-    )('write html: payload base64-encoded, not in script source (%s)', async (payload) => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
-      await backend.write(payload, 'html').catch(() => {
-        /* ignore */
-      });
-      const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
-      expect(cmd).toBe('osascript');
-      const script = (args as string[]).find((a) => a.includes('base64')) ?? '';
-      // The literal injection payload must not appear in the JXA script source
-      expect(script).not.toContain(payload.slice(0, 10));
-    });
+    it.each(INJECTION_PAYLOADS)(
+      'write html: payload base64-encoded, not in script source (%s)',
+      async (payload) => {
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
+        await backend.write(payload, 'html').catch(() => {
+          /* ignore */
+        });
+        const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
+        expect(cmd).toBe('osascript');
+        const script = (args as string[]).find((a) => a.includes('base64')) ?? '';
+        // The literal injection payload must not appear in the JXA script source
+        expect(script).not.toContain(payload.slice(0, 10));
+      },
+    );
   });
 });

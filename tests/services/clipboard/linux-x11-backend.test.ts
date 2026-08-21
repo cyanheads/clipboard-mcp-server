@@ -147,37 +147,38 @@ describe('LinuxX11Backend', () => {
       '\n; rm -rf /',
     ];
 
-    it.each(
-      INJECTION_PAYLOADS,
-    )('write: content goes to stdin, MIME type from enum (%s)', async (payload) => {
-      const stdinEnd = vi.fn();
-      const child = fakeChild({ stdout: '' });
-      Object.assign(child, { stdin: { end: stdinEnd } });
-      mockSpawn.mockReturnValueOnce(child);
+    it.each(INJECTION_PAYLOADS)(
+      'write: content goes to stdin, MIME type from enum (%s)',
+      async (payload) => {
+        const stdinEnd = vi.fn();
+        const child = fakeChild({ stdout: '' });
+        Object.assign(child, { stdin: { end: stdinEnd } });
+        mockSpawn.mockReturnValueOnce(child);
 
-      await backend.write(payload, 'text').catch(() => {
-        /* ignore */
-      });
-      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
-      // The -t value must be a safe MIME type from enum, never user content
-      const tIdx = args.indexOf('-t');
-      if (tIdx >= 0) {
-        const mimeArg = args[tIdx + 1];
-        expect([
-          'UTF8_STRING',
-          'text/html',
-          'text/plain',
-          'text/rtf',
-          'application/rtf',
-          'image/png',
-        ]).toContain(mimeArg);
-      }
-      // Payload must not appear in args
-      for (const arg of args) {
-        expect(arg).not.toContain('$(');
-        expect(arg).not.toContain('`id`');
-        expect(arg).not.toContain('whoami');
-      }
-    });
+        await backend.write(payload, 'text').catch(() => {
+          /* ignore */
+        });
+        const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+        // The -t value must be a safe MIME type from enum, never user content
+        const tIdx = args.indexOf('-t');
+        if (tIdx >= 0) {
+          const mimeArg = args[tIdx + 1];
+          expect([
+            'UTF8_STRING',
+            'text/html',
+            'text/plain',
+            'text/rtf',
+            'application/rtf',
+            'image/png',
+          ]).toContain(mimeArg);
+        }
+        // Payload must not appear in args
+        for (const arg of args) {
+          expect(arg).not.toContain('$(');
+          expect(arg).not.toContain('`id`');
+          expect(arg).not.toContain('whoami');
+        }
+      },
+    );
   });
 });
