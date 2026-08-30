@@ -13,19 +13,20 @@ import type {
 } from './types.js';
 import { buildInspectFormats } from './types.js';
 
+const TEXT_TARGETS: readonly string[] = [
+  'UTF8_STRING',
+  'text/plain',
+  'text/plain;charset=utf-8',
+  'TEXT',
+  'STRING',
+];
+
 /** Map MIME type (or X TARGETS entry) → semantic format. */
 function mimeToFormat(mime: string): ClipboardFormat | null {
-  if (
-    mime === 'UTF8_STRING' ||
-    mime === 'TEXT' ||
-    mime === 'STRING' ||
-    mime === 'text/plain' ||
-    mime === 'text/plain;charset=utf-8'
-  )
-    return 'text';
+  if (TEXT_TARGETS.includes(mime)) return 'text';
   if (mime === 'text/html') return 'html';
   if (mime === 'text/rtf' || mime === 'application/rtf') return 'rtf';
-  if (mime === 'image/png' || mime === 'image/jpeg' || mime === 'image/bmp') return 'image';
+  if (mime === 'image/png') return 'image';
   return null;
 }
 
@@ -78,8 +79,7 @@ export class LinuxX11Backend implements ClipboardBackend {
       // Measure size by reading the content for each known semantic type
       // We only read for recognized MIME types to limit latency
       if (
-        target === 'text/plain' ||
-        target === 'UTF8_STRING' ||
+        TEXT_TARGETS.includes(target) ||
         target === 'text/html' ||
         target === 'text/rtf' ||
         target === 'application/rtf' ||
@@ -102,8 +102,17 @@ export class LinuxX11Backend implements ClipboardBackend {
   async read(format: ClipboardFormat): Promise<ReadResult> {
     switch (format) {
       case 'text': {
-        const buf = await runXclip(['-o', '-selection', 'clipboard', '-t', 'UTF8_STRING']);
-        return { format: 'text', content: buf };
+        let lastError: unknown;
+        for (const target of TEXT_TARGETS) {
+          try {
+            const content = await runXclip(['-o', '-selection', 'clipboard', '-t', target]);
+            return { format: 'text', content };
+          } catch (error) {
+            if (error instanceof Error && error.message.startsWith('xclip not found')) throw error;
+            lastError = error;
+          }
+        }
+        throw lastError;
       }
       case 'html': {
         const buf = await runXclip(['-o', '-selection', 'clipboard', '-t', 'text/html']);

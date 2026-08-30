@@ -26,6 +26,15 @@ describe('clipboardWrite', () => {
     vi.clearAllMocks();
   });
 
+  it('qualifies the HTML plain-text fallback as a macOS and Windows capability', () => {
+    expect(clipboardWrite.description).toContain('macOS and Windows');
+    expect(clipboardWrite.description).toContain('Linux X11 and Wayland publish only text/html');
+    expect(clipboardWrite.input.shape.format.description).toContain('macOS and Windows');
+    expect(clipboardWrite.input.shape.format.description).toContain(
+      'Linux X11 and Wayland publish only text/html',
+    );
+  });
+
   describe('write text', () => {
     it('writes plain text and returns byteSize', async () => {
       const writeMock = vi.fn().mockResolvedValueOnce({ format: 'text' as const, byteSize: 11 });

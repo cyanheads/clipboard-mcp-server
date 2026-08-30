@@ -72,8 +72,32 @@ $result | ConvertTo-Json -Compress
 /** Static PowerShell script to read plain text. */
 const PS_READ_TEXT = `
 Add-Type -AssemblyName System.Windows.Forms
-$text = [System.Windows.Forms.Clipboard]::GetText()
-if ([string]::IsNullOrEmpty($text)) { 'null' } else { $text }
+$data = [System.Windows.Forms.Clipboard]::GetDataObject()
+$selectedFormat = $null
+if ($data) {
+  $nativeTextFormats = @(
+    [System.Windows.Forms.DataFormats]::UnicodeText,
+    [System.Windows.Forms.DataFormats]::Text,
+    [System.Windows.Forms.DataFormats]::OemText
+  )
+  foreach ($format in $nativeTextFormats) {
+    if ($data.GetDataPresent($format, $false)) {
+      $selectedFormat = $format
+      break
+    }
+  }
+}
+if ($selectedFormat) {
+  $text = $data.GetData($selectedFormat, $false)
+  if ($text -is [string]) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+    [PSCustomObject]@{ present = $true; contentBase64 = [Convert]::ToBase64String($bytes) } | ConvertTo-Json -Compress
+  } else {
+    [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress
+  }
+} else {
+  [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress
+}
 `;
 
 /** Static PowerShell script to read HTML from clipboard. */
@@ -86,10 +110,11 @@ if ($data -and $data.GetDataPresent('HTML Format')) {
     # Windows HTML clipboard format includes headers — extract just the HTML body
     $startIdx = $html.IndexOf('<html')
     if ($startIdx -eq -1) { $startIdx = $html.IndexOf('<HTML') }
-    if ($startIdx -ge 0) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $html.Substring($startIdx) }
-    else { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $html }
-  } else { 'null' }
-} else { 'null' }
+    if ($startIdx -ge 0) { $html = $html.Substring($startIdx) }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($html)
+    [PSCustomObject]@{ present = $true; contentBase64 = [Convert]::ToBase64String($bytes) } | ConvertTo-Json -Compress
+  } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
+} else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 `;
 
 /** Static PowerShell script to read RTF from clipboard. */
@@ -98,9 +123,11 @@ Add-Type -AssemblyName System.Windows.Forms
 $data = [System.Windows.Forms.Clipboard]::GetDataObject()
 if ($data -and $data.GetDataPresent([System.Windows.Forms.DataFormats]::Rtf)) {
   $rtf = $data.GetData([System.Windows.Forms.DataFormats]::Rtf)
-  if ($rtf -is [string]) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $rtf }
-  else { 'null' }
-} else { 'null' }
+  if ($rtf -is [string]) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($rtf)
+    [PSCustomObject]@{ present = $true; contentBase64 = [Convert]::ToBase64String($bytes) } | ConvertTo-Json -Compress
+  } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
+} else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 `;
 
 /** Static PowerShell script to read image from clipboard as base64-encoded PNG. */
@@ -109,17 +136,36 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $img = [System.Windows.Forms.Clipboard]::GetImage()
 if ($img) {
+  $w = $img.Width
+  $h = $img.Height
   $ms = New-Object System.IO.MemoryStream
   $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   $bytes = $ms.ToArray()
   $ms.Dispose()
   $img.Dispose()
   $b64 = [Convert]::ToBase64String($bytes)
-  $w = $img.Width
-  $h = $img.Height
   ConvertTo-Json @{ base64 = $b64; width = $w; height = $h } -Compress
 } else { 'null' }
 `;
+
+interface StringReadEnvelope {
+  contentBase64?: string;
+  present: boolean;
+}
+
+/** Decode a JSON/base64 PowerShell string response without altering its content. */
+function decodeStringRead(buf: Buffer, formatName: string): Buffer {
+  const raw = buf.toString('utf8').trim();
+  const parsed = JSON.parse(raw) as StringReadEnvelope | null;
+  if (!parsed || typeof parsed.present !== 'boolean') {
+    throw new Error(`Invalid PowerShell response while reading ${formatName}`);
+  }
+  if (!parsed.present) throw new Error(`${formatName} format not found on clipboard`);
+  if (typeof parsed.contentBase64 !== 'string') {
+    throw new Error(`Invalid PowerShell response while reading ${formatName}`);
+  }
+  return Buffer.from(parsed.contentBase64, 'base64');
+}
 
 /**
  * Build a PowerShell script that writes text to the clipboard.
@@ -195,21 +241,15 @@ export class WindowsBackend implements ClipboardBackend {
     switch (format) {
       case 'text': {
         const buf = await runPowershell(PS_READ_TEXT);
-        const text = buf.toString('utf8').trim();
-        if (text === 'null') throw new Error('Text format not found on clipboard');
-        return { format: 'text', content: Buffer.from(text, 'utf8') };
+        return { format: 'text', content: decodeStringRead(buf, 'Text') };
       }
       case 'html': {
         const buf = await runPowershell(PS_READ_HTML);
-        const text = buf.toString('utf8').trim();
-        if (text === 'null' || text === '') throw new Error('HTML format not found on clipboard');
-        return { format: 'html', content: Buffer.from(text, 'utf8') };
+        return { format: 'html', content: decodeStringRead(buf, 'HTML') };
       }
       case 'rtf': {
         const buf = await runPowershell(PS_READ_RTF);
-        const text = buf.toString('utf8').trim();
-        if (text === 'null' || text === '') throw new Error('RTF format not found on clipboard');
-        return { format: 'rtf', content: Buffer.from(text, 'utf8') };
+        return { format: 'rtf', content: decodeStringRead(buf, 'RTF') };
       }
       case 'image': {
         const buf = await runPowershell(PS_READ_IMAGE);

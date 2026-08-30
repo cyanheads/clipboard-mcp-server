@@ -48,7 +48,7 @@ describe('LinuxWaylandBackend', () => {
 
   beforeEach(() => {
     backend = new LinuxWaylandBackend();
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   describe('inspect()', () => {
@@ -81,6 +81,21 @@ describe('LinuxWaylandBackend', () => {
       const result = await backend.inspect();
       expect(result.primaryFormat).toBe('empty');
     });
+
+    it.each(['image/jpeg', 'image/bmp'])(
+      'retains %s in rawTypes without advertising PNG-compatible image output',
+      async (type) => {
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${type}\n` }));
+
+        const result = await backend.inspect();
+
+        expect(result).toEqual({
+          primaryFormat: 'empty',
+          availableFormats: [],
+          rawTypes: [{ type, bytes: 0 }],
+        });
+      },
+    );
   });
 
   describe('read()', () => {
@@ -93,6 +108,40 @@ describe('LinuxWaylandBackend', () => {
       expect(cmd).toBe('wl-paste');
       expect(args).toContain('text/plain');
     });
+
+    it('keeps text/plain as the first text read MIME type', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'primary text' }));
+
+      await backend.read('text');
+
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+      expect(mockSpawn).toHaveBeenCalledWith('wl-paste', ['-t', 'text/plain'], expect.any(Object));
+    });
+
+    it.each(['text/plain;charset=utf-8', 'UTF8_STRING', 'TEXT', 'STRING'])(
+      'falls back to the advertised %s text MIME type',
+      async (mime) => {
+        const fallbackOrder = [
+          'text/plain',
+          'text/plain;charset=utf-8',
+          'UTF8_STRING',
+          'TEXT',
+          'STRING',
+        ];
+        const targetIndex = fallbackOrder.indexOf(mime);
+        for (let index = 0; index < targetIndex; index += 1) {
+          mockSpawn.mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'no such type' }));
+        }
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${mime} content` }));
+
+        const result = await backend.read('text');
+
+        expect(result.content.toString('utf8')).toBe(`${mime} content`);
+        expect(mockSpawn.mock.calls.map(([, args]) => (args as string[]).at(-1))).toEqual(
+          fallbackOrder.slice(0, targetIndex + 1),
+        );
+      },
+    );
 
     it('reads html via wl-paste with -t text/html', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '<html><body>wayland</body></html>' }));

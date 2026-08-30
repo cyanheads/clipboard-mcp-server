@@ -86,6 +86,36 @@ describe('MacosBackend', () => {
       expect(result.availableFormats).toContain('image');
     });
 
+    it.each(['public.png', 'public.tiff', 'com.apple.pict'])(
+      'classifies supported image type %s as image',
+      async (type) => {
+        mockSpawn.mockReturnValueOnce(
+          fakeChild({ stdout: JSON.stringify([{ type, bytes: 1024 }]) }),
+        );
+
+        const result = await backend.inspect();
+
+        expect(result).toEqual({
+          primaryFormat: 'image',
+          availableFormats: ['image'],
+          rawTypes: [{ type, bytes: 1024 }],
+        });
+      },
+    );
+
+    it('retains a filename-list type without classifying it as an image', async () => {
+      const type = 'NSFilenamesPboardType';
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify([{ type, bytes: 128 }]) }));
+
+      const result = await backend.inspect();
+
+      expect(result).toEqual({
+        primaryFormat: 'empty',
+        availableFormats: [],
+        rawTypes: [{ type, bytes: 128 }],
+      });
+    });
+
     it('returns html as primaryFormat when html and text both present', async () => {
       const types = JSON.stringify([
         { type: 'public.utf8-plain-text', bytes: 5 },
@@ -245,6 +275,17 @@ describe('MacosBackend', () => {
       const scriptArg =
         (callArgs[1] as string[]).find((a) => typeof a === 'string' && a.length > 50) ?? '';
       expect(scriptArg).not.toContain('<script>alert(1)</script>');
+    });
+
+    it('writes the tag-stripped plain-text fallback alongside HTML', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
+      const html = '<h1>Title</h1><script>alert(1)</script><p>Body</p>';
+
+      await backend.write(html, 'html');
+
+      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+      const script = args.at(-1) ?? '';
+      expect(script).toContain(JSON.stringify(Buffer.from('Title Body').toString('base64')));
     });
   });
 

@@ -7,7 +7,7 @@
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
 | `clipboard_read` | Read the current clipboard contents in a requested format. For `auto`, returns the richest explicitly-set format available (image > html > rtf > text). Images are returned as base64-encoded PNG with dimensions. | `format: "text" \| "html" \| "rtf" \| "image" \| "auto"` | `readOnlyHint: true`, `openWorldHint: false` |
-| `clipboard_write` | Write content to the clipboard. `text` sets plain text only. `html` sets both the HTML and a stripped plain-text fallback so paste targets get whichever they prefer. | `content: string`, `format: "text" \| "html"` | `destructiveHint: true` (replaces current contents) |
+| `clipboard_write` | Write content to the clipboard. `text` sets plain text. `html` publishes HTML on every platform; macOS and Windows also publish a stripped plain-text fallback. | `content: string`, `format: "text" \| "html"` | `destructiveHint: true` (replaces current contents) |
 | `clipboard_inspect` | List the explicitly-set types on the clipboard with byte sizes and a semantic summary. Useful for deciding which format to request before calling `clipboard_read`. No content returned. | _(none)_ | `readOnlyHint: true`, `openWorldHint: false` |
 
 ### Resources
@@ -29,7 +29,7 @@ The primary use case: agents that need to receive content a user has copied (a U
 **Platform backends:**
 - **macOS**: `pbcopy`/`pbpaste` for text, JXA/NSPasteboard for rich types (HTML, RTF, image)
 - **Linux**: `xclip` (X11) or `wl-clipboard` (Wayland) — detected at startup
-- **Windows**: PowerShell `Get-Clipboard`/`Set-Clipboard` for text, .NET `System.Windows.Forms.Clipboard` via PowerShell for rich types
+- **Windows**: .NET `System.Windows.Forms.Clipboard` via PowerShell for text and rich types
 
 The tool surface is platform-agnostic — same tools, same schemas, same behavior. Platform differences are encapsulated in the service layer. Feature availability varies by platform (see Platform Capabilities below).
 
@@ -38,7 +38,7 @@ The tool surface is platform-agnostic — same tools, same schemas, same behavio
 ## Requirements
 
 - Read current clipboard: plain text, HTML, RTF, image (base64 PNG)
-- Write current clipboard: plain text, HTML (with stripped plain-text fallback)
+- Write current clipboard: plain text or HTML; HTML includes a stripped plain-text fallback on macOS and Windows
 - Inspect clipboard types and byte sizes without fetching full content
 - Cross-platform: macOS, Linux (X11 + Wayland), Windows
 - Platform detection at startup — select appropriate backend, error if clipboard tools not available
@@ -61,12 +61,12 @@ The service uses a **backend adapter pattern** — a common interface (`Clipboar
 | `MacosBackend` | darwin | `pbcopy`/`pbpaste` | JXA NSPasteboard | JXA NSPasteboard | JXA NSPasteboard (TIFF→PNG) | JXA `pb.types` |
 | `LinuxX11Backend` | linux (X11) | `xclip -selection clipboard` | `xclip -t text/html` | `xclip -t text/rtf` | `xclip -t image/png` | `xclip -o -t TARGETS` |
 | `LinuxWaylandBackend` | linux (Wayland) | `wl-paste` / `wl-copy` | `wl-paste -t text/html` | `wl-paste -t text/rtf` | `wl-paste -t image/png` | `wl-paste --list-types` |
-| `WindowsBackend` | win32 | PowerShell `Get-Clipboard` | PowerShell .NET Forms.Clipboard | PowerShell .NET | PowerShell .NET (BitmapSource→PNG) | PowerShell `GetDataObject().GetFormats()` |
+| `WindowsBackend` | win32 | PowerShell .NET Forms.Clipboard | PowerShell .NET Forms.Clipboard | PowerShell .NET | PowerShell .NET (BitmapSource→PNG) | PowerShell `GetDataObject().GetFormats()` |
 
 **Backend selection at startup:**
 1. Check `process.platform`
 2. For Linux: check `$WAYLAND_DISPLAY` (Wayland) vs `$DISPLAY` (X11)
-3. Verify required CLI tool exists (`which xclip`, `which wl-paste`, etc.)
+3. Verify the required CLI tool with the platform-native PATH probe (`which` on Linux, `where.exe` on Windows)
 4. If tool not found → startup error with install guidance
 
 The service is thin: no retries (clipboard ops are local and near-instant), no HTTP resilience. Its job is to encapsulate platform detection, subprocess spawning, and format conversion.
@@ -108,9 +108,9 @@ An agent that wants "what did I copy?" should get the richest explicitly-set typ
 
 macOS copies images as TIFF internally. The tool always returns PNG (converting TIFF via `NSBitmapImageRep.imageRepWithData` + `representationUsingTypeProperties(NSBitmapImageFileTypePNG, {})`). Verified working. PNG is the only practical base64-over-JSON image format — TIFF is a container format most downstream consumers don't handle.
 
-### HTML write: dual representation
+### HTML write: platform-dependent representations
 
-When writing HTML, the service sets both `NSPasteboardTypeHTML` and `NSPasteboardTypeString` (stripped plain text). This matches what browsers do and ensures paste targets that only accept plain text still get something useful. The plain-text fallback is auto-generated by stripping HTML tags.
+On macOS and Windows, HTML writes publish both HTML and an auto-generated, tag-stripped plain-text fallback. This matches browser clipboard behavior and gives plain-text-only paste targets a usable representation. Linux X11 and Wayland publish `text/html` only because their current command-line backends do not provide the same multi-representation ownership contract.
 
 ### pbcopy/pbpaste for text, JXA for everything else
 
@@ -187,8 +187,8 @@ input: z.object({
     .default('text')
     .describe(
       'Format of the content. "text" writes plain text. ' +
-      '"html" writes HTML with an auto-generated plain-text fallback (tag-stripped), ' +
-      'so paste targets that only accept plain text still receive something useful.'
+      '"html" writes HTML; on macOS and Windows it also publishes an auto-generated, ' +
+      'tag-stripped plain-text fallback. Linux X11 and Wayland publish only text/html.'
     ),
 })
 
@@ -274,13 +274,13 @@ Each tool's `format()` function must render all fields from the output schema �
 
 The server shells out to platform-specific clipboard tools (`pbcopy`, `xclip`, `wl-copy`, `powershell`, `osascript`). Every subprocess is a potential injection vector.
 
-**Hard rule: ALL content is piped via stdin/stdout, NEVER interpolated into command strings.**
+**Hard rule: raw content is never interpolated into command strings.** Text content is piped via stdin where the platform tool supports it. The macOS and Windows rich-format scripts receive only JSON-quoted base64 literals inside fixed script templates.
 
 | Vector | Risk | Mitigation |
 |:-------|:-----|:-----------|
-| `clipboard_write` content → subprocess | Content with shell metacharacters could escape | Write via `child_process.spawn` with content piped to stdin. `spawn` with `shell: false` avoids interpretation entirely. Works identically on all platforms. |
-| JXA scripts via `osascript` (macOS) | String interpolation into JXA could allow code execution | All JXA scripts are static templates. Dynamic values (format names, type identifiers) come from validated enums — never user-provided freeform strings interpolated into script source. |
-| PowerShell commands (Windows) | Script injection via clipboard content | Use `-Command` with static scripts that read from stdin/pipe. Never interpolate content into PS command strings. |
+| `clipboard_write` content → subprocess | Content with shell metacharacters could escape | Use `child_process.spawn` with `shell: false`; pass raw text via stdin or JSON-quoted base64 through a fixed script template. |
+| JXA scripts via `osascript` (macOS) | String interpolation into JXA could allow code execution | Encode both HTML and its plain-text fallback as base64, then embed only JSON-quoted base64 literals in a fixed JXA template. |
+| PowerShell commands (Windows) | Script injection via clipboard content | Encode text and HTML representations as base64, then embed only JSON-quoted base64 literals in fixed PowerShell templates. |
 | `xclip`/`wl-paste` arguments (Linux) | Flag injection via content | Content goes to stdin; MIME types for `-t` flag come from validated enums, not user input. |
 | Clipboard READ content | Malicious clipboard content could be crafted to inject into downstream processing | Not our problem — the server faithfully returns what's on the clipboard. But: never use read content in subsequent shell commands internally without sanitization (defense in depth). |
 
@@ -316,7 +316,7 @@ Every tool gets a test file. Backend adapters are mocked — no actual clipboard
 |:-----|:-----------|:------------|:-----------|
 | `clipboard_inspect` | Text on clipboard → returns types + sizes | Empty clipboard → `primaryFormat: "empty"` | Multiple rich types simultaneously (HTML + text + image from browser copy) |
 | `clipboard_read` | Read text, HTML, RTF, image independently | Format not present → `format_unavailable` error; clipboard tool missing → `clipboard_unavailable`; `auto` on empty clipboard → `format_unavailable` | `auto` with only text; `auto` with image; unicode/emoji round-trip; very large content near size cap |
-| `clipboard_write` | Write text, verify via read; write HTML, verify both representations | Clipboard tool missing → `clipboard_unavailable`; content at 1MB+1 → `content_too_large` | Unicode, emoji, HTML with special chars (`<script>`, `&amp;`), empty string, very large content |
+| `clipboard_write` | Write text, verify via read; on macOS and Windows, write HTML and verify both representations; on Linux, verify `text/html` | Clipboard tool missing → `clipboard_unavailable`; content at 1MB+1 → `content_too_large` | Unicode, emoji, HTML with special chars (`<script>`, `&amp;`), empty string, very large content |
 
 ### Backend adapter tests
 
@@ -385,6 +385,7 @@ Not all formats are available on all platforms:
 |:-----------|:------|:--------------------|:--------|
 | Text read/write | Yes | Yes | Yes |
 | HTML read/write | Yes (JXA) | Yes (`text/html` MIME) | Yes (.NET) |
+| HTML plain-text fallback on write | Yes | No | Yes |
 | RTF read | Yes (JXA) | Partial (if app sets `text/rtf`) | Yes (.NET) |
 | Image read (PNG) | Yes (JXA, TIFF→PNG) | Yes (`image/png` MIME) | Yes (.NET, BitmapSource→PNG) |
 | Type inspection | Yes (`pb.types`) | Yes (`TARGETS` / `--list-types`) | Yes (`.GetFormats()`) |

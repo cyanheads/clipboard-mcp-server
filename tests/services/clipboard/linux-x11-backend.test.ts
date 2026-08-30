@@ -48,7 +48,7 @@ describe('LinuxX11Backend', () => {
 
   beforeEach(() => {
     backend = new LinuxX11Backend();
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   describe('inspect()', () => {
@@ -77,6 +77,36 @@ describe('LinuxX11Backend', () => {
       expect(result.availableFormats).toContain('text');
       expect(result.primaryFormat).toBe('html');
     });
+
+    it('advertises image when image/png is present', async () => {
+      const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      mockSpawn
+        .mockReturnValueOnce(fakeChild({ stdout: 'image/png\n' }))
+        .mockReturnValueOnce(fakeChild({ stdout: pngBytes }));
+
+      const result = await backend.inspect();
+
+      expect(result).toEqual({
+        primaryFormat: 'image',
+        availableFormats: ['image'],
+        rawTypes: [{ type: 'image/png', bytes: pngBytes.byteLength }],
+      });
+    });
+
+    it.each(['image/jpeg', 'image/bmp'])(
+      'retains %s in rawTypes without advertising PNG-compatible image output',
+      async (type) => {
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${type}\n` }));
+
+        const result = await backend.inspect();
+
+        expect(result).toEqual({
+          primaryFormat: 'empty',
+          availableFormats: [],
+          rawTypes: [{ type, bytes: 0 }],
+        });
+      },
+    );
   });
 
   describe('read()', () => {
@@ -90,6 +120,44 @@ describe('LinuxX11Backend', () => {
       expect(args).toContain('-t');
       expect(args).toContain('UTF8_STRING');
     });
+
+    it('keeps UTF8_STRING as the first text read target', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'primary text' }));
+
+      await backend.read('text');
+
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'xclip',
+        ['-o', '-selection', 'clipboard', '-t', 'UTF8_STRING'],
+        expect.any(Object),
+      );
+    });
+
+    it.each(['text/plain', 'text/plain;charset=utf-8', 'TEXT', 'STRING'])(
+      'falls back to the advertised %s text target',
+      async (target) => {
+        const fallbackOrder = [
+          'UTF8_STRING',
+          'text/plain',
+          'text/plain;charset=utf-8',
+          'TEXT',
+          'STRING',
+        ];
+        const targetIndex = fallbackOrder.indexOf(target);
+        for (let index = 0; index < targetIndex; index += 1) {
+          mockSpawn.mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'target not available' }));
+        }
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${target} content` }));
+
+        const result = await backend.read('text');
+
+        expect(result.content.toString('utf8')).toBe(`${target} content`);
+        expect(mockSpawn.mock.calls.map(([, args]) => (args as string[]).at(-1))).toEqual(
+          fallbackOrder.slice(0, targetIndex + 1),
+        );
+      },
+    );
 
     it('reads html via xclip with text/html target', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '<html>test</html>' }));

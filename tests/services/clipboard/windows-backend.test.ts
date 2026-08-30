@@ -13,6 +13,13 @@ import { WindowsBackend } from '@/services/clipboard/windows-backend.js';
 
 const mockSpawn = vi.mocked(spawn);
 
+function stringEnvelope(content: string): string {
+  return JSON.stringify({
+    present: true,
+    contentBase64: Buffer.from(content, 'utf8').toString('base64'),
+  });
+}
+
 function fakeChild(opts: {
   stdout?: string | Buffer;
   stderr?: string;
@@ -89,7 +96,7 @@ describe('WindowsBackend', () => {
 
   describe('read() text', () => {
     it('reads text via PowerShell Get-Text', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'clipboard contents' }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('clipboard contents') }));
       const result = await backend.read('text');
       expect(result.format).toBe('text');
       expect(result.content.toString('utf8')).toBe('clipboard contents');
@@ -97,18 +104,57 @@ describe('WindowsBackend', () => {
       expect(cmd).toBe('powershell.exe');
     });
 
-    it('throws when text not present (returns null)', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'null' }));
+    it('throws when the text representation is absent', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
       await expect(backend.read('text')).rejects.toThrow(/not found/i);
+    });
+
+    it('preserves leading and trailing whitespace and embedded newlines exactly', async () => {
+      const text = '  padded text\r\nsecond line\n';
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${stringEnvelope(text)}\r\n` }));
+
+      const result = await backend.read('text');
+
+      expect(result.content.toString('utf8')).toBe(text);
+    });
+
+    it('returns an empty buffer when an empty text representation is present', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('') }));
+
+      const result = await backend.read('text');
+
+      expect(result).toEqual({ format: 'text', content: Buffer.alloc(0) });
     });
   });
 
   describe('read() html', () => {
     it('reads HTML via PowerShell .NET', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '<html><body>test</body></html>' }));
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: stringEnvelope('<html><body>test</body></html>') }),
+      );
       const result = await backend.read('html');
       expect(result.format).toBe('html');
       expect(result.content.toString('utf8')).toContain('<html>');
+    });
+
+    it('preserves HTML whitespace and newlines exactly', async () => {
+      const html = '  <div>first line</div>\r\n<div>second line</div>  \n';
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope(html) }));
+
+      const result = await backend.read('html');
+
+      expect(result.content.toString('utf8')).toBe(html);
+    });
+  });
+
+  describe('read() rtf', () => {
+    it('preserves RTF whitespace and newlines exactly', async () => {
+      const rtf = '  {\\rtf1\r\n padded }  \n';
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope(rtf) }));
+
+      const result = await backend.read('rtf');
+
+      expect(result.content.toString('utf8')).toBe(rtf);
     });
   });
 
@@ -126,6 +172,32 @@ describe('WindowsBackend', () => {
       expect(result.width).toBe(800);
       expect(result.height).toBe(600);
       expect(result.content).toEqual(pngData);
+    });
+
+    it('captures image dimensions before disposing the image', async () => {
+      const pngData = Buffer.from('fakepngdata');
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({
+          stdout: JSON.stringify({
+            base64: pngData.toString('base64'),
+            width: 800,
+            height: 600,
+          }),
+        }),
+      );
+
+      await backend.read('image');
+
+      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+      const script = args.at(-1) ?? '';
+      const disposeIndex = script.indexOf('$img.Dispose()');
+      const widthIndex = script.indexOf('$w = $img.Width');
+      const heightIndex = script.indexOf('$h = $img.Height');
+      expect(widthIndex).toBeGreaterThanOrEqual(0);
+      expect(heightIndex).toBeGreaterThanOrEqual(0);
+      expect(disposeIndex).toBeGreaterThanOrEqual(0);
+      expect(widthIndex).toBeLessThan(disposeIndex);
+      expect(heightIndex).toBeLessThan(disposeIndex);
     });
   });
 
@@ -145,6 +217,17 @@ describe('WindowsBackend', () => {
       const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
       const scriptArg = (args as string[]).find((a) => a.includes('Base64')) ?? '';
       expect(scriptArg).not.toContain('hello world');
+    });
+
+    it('writes the tag-stripped plain-text fallback alongside HTML', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '' }));
+      const html = '<h1>Title</h1><script>alert(1)</script><p>Body</p>';
+
+      await backend.write(html, 'html');
+
+      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+      const script = args.at(-1) ?? '';
+      expect(script).toContain(JSON.stringify(Buffer.from('Title Body').toString('base64')));
     });
   });
 

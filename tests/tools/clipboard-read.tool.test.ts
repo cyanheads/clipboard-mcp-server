@@ -185,6 +185,26 @@ describe('clipboardRead', () => {
         data: { reason: 'format_unavailable' },
       });
     });
+
+    it('does not read when raw platform types have no semantic format', async () => {
+      const svc = {
+        inspect: vi.fn().mockResolvedValueOnce({
+          primaryFormat: 'empty' as const,
+          availableFormats: [],
+          rawTypes: [{ type: 'NSFilenamesPboardType', bytes: 128 }],
+        }),
+        read: vi.fn(),
+      } as unknown as ReturnType<typeof getClipboardService>;
+      mockGetService.mockReturnValueOnce(svc);
+
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const input = clipboardRead.input.parse({ format: 'auto' });
+
+      await expect(clipboardRead.handler(input, ctx)).rejects.toMatchObject({
+        data: { reason: 'format_unavailable' },
+      });
+      expect(svc.read).not.toHaveBeenCalled();
+    });
   });
 
   describe('error: format_unavailable', () => {

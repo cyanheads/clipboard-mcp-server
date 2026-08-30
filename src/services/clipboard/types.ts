@@ -114,7 +114,8 @@ export interface ClipboardBackend {
 
   /**
    * Write content to the clipboard.
-   * For HTML, also sets a stripped plain-text fallback.
+   * HTML fallback behavior is backend-dependent: macOS and Windows also publish
+   * stripped plain text, while X11 and Wayland publish only text/html.
    */
   write(content: string, format: 'text' | 'html'): Promise<WriteResult>;
 }

@@ -13,19 +13,20 @@ import type {
 } from './types.js';
 import { buildInspectFormats } from './types.js';
 
+const TEXT_MIME_TYPES: readonly string[] = [
+  'text/plain',
+  'text/plain;charset=utf-8',
+  'UTF8_STRING',
+  'TEXT',
+  'STRING',
+];
+
 /** Map MIME type → semantic format. */
 function mimeToFormat(mime: string): ClipboardFormat | null {
-  if (
-    mime === 'text/plain' ||
-    mime === 'text/plain;charset=utf-8' ||
-    mime === 'TEXT' ||
-    mime === 'STRING' ||
-    mime === 'UTF8_STRING'
-  )
-    return 'text';
+  if (TEXT_MIME_TYPES.includes(mime)) return 'text';
   if (mime === 'text/html') return 'html';
   if (mime === 'text/rtf' || mime === 'application/rtf') return 'rtf';
-  if (mime === 'image/png' || mime === 'image/jpeg' || mime === 'image/bmp') return 'image';
+  if (mime === 'image/png') return 'image';
   return null;
 }
 
@@ -112,7 +113,7 @@ export class LinuxWaylandBackend implements ClipboardBackend {
       if (fmt) semanticSet.add(fmt);
       // Read each recognized MIME type to measure size
       if (
-        mime === 'text/plain' ||
+        TEXT_MIME_TYPES.includes(mime) ||
         mime === 'text/html' ||
         mime === 'text/rtf' ||
         mime === 'application/rtf' ||
@@ -135,8 +136,18 @@ export class LinuxWaylandBackend implements ClipboardBackend {
   async read(format: ClipboardFormat): Promise<ReadResult> {
     switch (format) {
       case 'text': {
-        const buf = await runWlPaste(['-t', 'text/plain']);
-        return { format: 'text', content: buf };
+        let lastError: unknown;
+        for (const mime of TEXT_MIME_TYPES) {
+          try {
+            const content = await runWlPaste(['-t', mime]);
+            return { format: 'text', content };
+          } catch (error) {
+            if (error instanceof Error && error.message.startsWith('wl-paste not found'))
+              throw error;
+            lastError = error;
+          }
+        }
+        throw lastError;
       }
       case 'html': {
         const buf = await runWlPaste(['-t', 'text/html']);

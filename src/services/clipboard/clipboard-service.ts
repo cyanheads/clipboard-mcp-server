@@ -51,10 +51,20 @@ export const SIZE_LIMITS = {
   WRITE: 1 * 1024 * 1024,
 } as const;
 
-/** Check whether a CLI tool is available in PATH. */
+/** Check whether a CLI tool is available in PATH on POSIX platforms. */
 async function toolAvailable(name: string): Promise<boolean> {
   try {
     await execFileAsync('which', [name]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Check whether a CLI tool is available in PATH on Windows. */
+async function windowsToolAvailable(name: string): Promise<boolean> {
+  try {
+    await execFileAsync('where.exe', [name]);
     return true;
   } catch {
     return false;
@@ -126,8 +136,7 @@ async function detectBackend(): Promise<ClipboardBackend> {
   if (platform === 'win32') {
     // powershell.exe is built-in on Windows 10+
     const available =
-      (await toolAvailable('powershell.exe').catch(() => false)) ||
-      (await toolAvailable('powershell').catch(() => false));
+      (await windowsToolAvailable('powershell.exe')) || (await windowsToolAvailable('powershell'));
     if (!available) {
       throw serviceUnavailable(
         'powershell.exe not found. Requires PowerShell 5.1+ (built-in on Windows 10+).',

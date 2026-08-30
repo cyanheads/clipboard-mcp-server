@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -50,7 +50,7 @@ Read the current clipboard contents in a requested format.
 Write content to the clipboard, replacing current contents.
 
 - `text` writes plain text
-- `html` writes HTML with an auto-generated plain-text fallback (tag-stripped), so paste targets that only accept plain text still receive something useful
+- `html` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback, while Linux X11 and Wayland publish only `text/html`
 - Size limit: 1 MB
 - `destructiveHint: true` — replaces whatever is currently on the clipboard
 
@@ -82,7 +82,7 @@ Clipboard-specific:
 - Cross-platform backend detection at startup — macOS (pbcopy/pbpaste + osascript), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
 - Semantic format mapping — platform-native type identifiers (UTIs, TARGETS, Windows format names) mapped to `text`, `html`, `rtf`, `image` across all backends
 - Size-guarded reads and writes — typed `ContentTooLargeError` with byte/limit metadata before content returns
-- HTML write with automatic plain-text fallback — stripped and written alongside HTML for apps that only paste plain text
+- Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; Linux X11 and Wayland publish `text/html`
 - Image support — macOS and Windows backends decode PNG bytes and return width/height alongside base64 content
 
 ---

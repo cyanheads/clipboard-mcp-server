@@ -9,11 +9,7 @@ import { getClipboardService, isContentTooLarge } from '@/services/clipboard/cli
 
 export const clipboardWrite = tool('clipboard_write', {
   title: 'Write Clipboard',
-  description:
-    'Write content to the clipboard. This replaces the current clipboard contents. ' +
-    '"text" writes plain text. ' +
-    '"html" writes HTML with an auto-generated plain-text fallback (tag-stripped), ' +
-    'so paste targets that only accept plain text still receive something useful.',
+  description: `Write content to the clipboard, replacing the current contents. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. Linux X11 and Wayland publish only text/html.`,
   annotations: { destructiveHint: true, openWorldHint: false },
   input: z.object({
     content: z.string().describe('Content to write to the clipboard.'),
@@ -21,9 +17,7 @@ export const clipboardWrite = tool('clipboard_write', {
       .enum(['text', 'html'])
       .default('text')
       .describe(
-        'Format of the content. "text" writes plain text. ' +
-          '"html" writes HTML with an auto-generated plain-text fallback (tag-stripped), ' +
-          'so paste targets that only accept plain text still receive something useful.',
+        `Format of the content. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. Linux X11 and Wayland publish only text/html.`,
       ),
   }),
   output: z.object({
