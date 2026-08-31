@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-08-30
+
+Align clipboard format behavior across macOS, Linux, and Windows.
+
 ## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-08-21
 
 Adopts mcp-ts-core ^0.12.3 (MCP SDK v2): JSON Schema 2020-12 advertised schemas with declared error envelopes, strict root inputs, supply-chain install scanner, TypeScript 7 toolchain, Bun 1.4 pin.
