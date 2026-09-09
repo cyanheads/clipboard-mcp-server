@@ -53,6 +53,7 @@ Write content to the clipboard, replacing current contents.
 - `html` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback, while Linux X11 and Wayland publish only `text/html`
 - Size limit: 1 MB
 - `destructiveHint: true` — replaces whatever is currently on the clipboard
+- Not registered when `CLIPBOARD_READ_ONLY` is set — see [Configuration](#configuration)
 
 ---
 
@@ -125,24 +126,6 @@ Or with npx (no Bun required):
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "clipboard-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "ghcr.io/cyanheads/clipboard-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
 For Streamable HTTP, set the transport and start the server:
 
 ```sh
@@ -180,9 +163,12 @@ pacman -S wl-clipboard      # Arch
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_HTTP_HOST` | Hostname for HTTP server. | `127.0.0.1` |
 | `MCP_HTTP_ENDPOINT_PATH` | Endpoint path for the HTTP server. | `/mcp` |
+| `MCP_HTTP_MAX_BODY_BYTES` | Max inbound JSON-RPC request body, in bytes. Raised above the framework's 1 MiB default so a full-size `clipboard_write` survives JSON escaping (worst case costs 6 wire bytes per source byte). `0` disables the guard and defers to the reverse proxy. | `7340032` |
+| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. `auto` resolves to `stateful`. This server defaults to `stateless` — it keeps no per-session state. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `notice`, `warning`, `error`). | `info` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
+| `CLIPBOARD_READ_ONLY` | Serve the clipboard read-only. When `true`, `clipboard_write` is not registered — absent from `tools/list` and uncallable, though still shown in a disabled state on the manifest and landing page. Accepts `true/false/1/0/yes/no/on/off`; an unrecognized value fails startup. | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 
@@ -207,13 +193,6 @@ bun run start:http
 ```sh
 bun run devcheck   # Lint, format, typecheck, security
 bun run test       # Vitest test suite
-```
-
-### Docker
-
-```sh
-docker build -t clipboard-mcp-server .
-docker run -p 3010:3010 clipboard-mcp-server
 ```
 
 ---

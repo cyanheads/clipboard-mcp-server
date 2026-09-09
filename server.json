@@ -31,6 +31,13 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "CLIPBOARD_READ_ONLY",
+          "description": "Serve the clipboard read-only. When true, clipboard_write is not registered: it is absent from tools/list and uncallable, though still listed in a disabled state on the manifest and landing page. Accepts true/false/1/0/yes/no/on/off.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
         }
       ],
       "transport": {
@@ -88,6 +95,27 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "MCP_HTTP_MAX_BODY_BYTES",
+          "description": "Maximum inbound JSON-RPC request body in bytes. Defaults to 7 MiB so a full-size clipboard_write survives worst-case JSON escaping; 0 disables the guard.",
+          "format": "string",
+          "isRequired": false,
+          "default": "7340032"
+        },
+        {
+          "name": "MCP_SESSION_MODE",
+          "description": "HTTP session mode: 'auto', 'stateful', or 'stateless'. 'auto' resolves to 'stateful'. This server defaults to 'stateless'.",
+          "format": "string",
+          "isRequired": false,
+          "default": "stateless"
+        },
+        {
+          "name": "CLIPBOARD_READ_ONLY",
+          "description": "Serve the clipboard read-only. When true, clipboard_write is not registered: it is absent from tools/list and uncallable, though still listed in a disabled state on the manifest and landing page. Accepts true/false/1/0/yes/no/on/off.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
         }
       ],
       "transport": {

@@ -21,7 +21,8 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "CLIPBOARD_READ_ONLY": "${user_config.CLIPBOARD_READ_ONLY}"
       }
     }
   },
@@ -38,6 +39,13 @@
       "description": "Minimum log level for output. Options: debug, info, notice, warning, error.",
       "type": "string",
       "default": "info",
+      "required": false
+    },
+    "CLIPBOARD_READ_ONLY": {
+      "title": "Read-Only Mode",
+      "description": "Serve the clipboard read-only. When true, the clipboard_write tool is not registered. Accepts true/false/1/0/yes/no/on/off.",
+      "type": "string",
+      "default": "false",
       "required": false
     }
   }
