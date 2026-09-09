@@ -4,6 +4,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { readPngDimensions } from './png-dimensions.js';
 import type {
   ClipboardBackend,
   ClipboardFormat,
@@ -66,31 +67,55 @@ function runWlPaste(args: string[]): Promise<Buffer> {
 /**
  * Run wl-copy with content on stdin. Uses detached mode so content persists
  * after the server moves on (Wayland clipboard is owned by the source process).
+ *
+ * Completion is the foreground process's own exit. Run without `--foreground`,
+ * wl-copy drains stdin into a temp file, issues `set_selection`, and only once
+ * that has gone through does it fork and let the process Node spawned exit 0.
+ * That exit therefore proves both halves of the write; a non-zero exit, a spawn
+ * failure, or a broken stdin pipe all mean the selection was never set.
  */
-function runWlCopy(args: string[], content: Buffer): Promise<void> {
+function runWlCopy(args: string[], content?: Buffer): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn('wl-copy', args, {
       shell: false,
-      stdio: ['pipe', 'ignore', 'pipe'],
+      stdio: [content === undefined ? 'ignore' : 'pipe', 'ignore', 'pipe'],
       detached: true,
     });
-    child.stdin.end(content);
-    // Give the process a moment to receive stdin before unreffing
-    child.on('error', (err) => {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('wl-copy not found — install with: apt install wl-clipboard'));
-      } else {
-        reject(err);
+    const err: Buffer[] = [];
+    let settled = false;
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      // Detach the backgrounded selection owner from this process's lifetime.
+      child.unref();
+      if (error) reject(error);
+      else resolve();
+    };
+
+    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
+    child.on('error', (error) => {
+      settle(
+        (error as NodeJS.ErrnoException).code === 'ENOENT'
+          ? new Error('wl-copy not found — install with: apt install wl-clipboard')
+          : error,
+      );
+    });
+    // Without this listener a broken pipe raises an unhandled 'error' event
+    // while the write promise sits pending forever.
+    child.stdin?.on('error', (error: Error) => {
+      settle(new Error(`wl-copy stdin write failed: ${error.message}`));
+    });
+    child.on('exit', (code, signal) => {
+      if (code === 0) {
+        settle();
+        return;
       }
+      const detail = Buffer.concat(err).toString('utf8').trim();
+      settle(new Error(`wl-copy exited ${code ?? signal}: ${detail}`));
     });
-    // Detach after writing stdin — content persists until overwritten
-    child.on('spawn', () => {
-      // Allow the process to run independently after stdin is flushed
-      setTimeout(() => {
-        child.unref();
-        resolve();
-      }, 50);
-    });
+
+    // stdin is a pipe exactly when there is content to send.
+    if (content !== undefined) child.stdin?.end(content);
   });
 }
 
@@ -123,7 +148,9 @@ export class LinuxWaylandBackend implements ClipboardBackend {
           const data = await runWlPaste(['-t', mime]);
           rawTypes.push({ type: mime, bytes: data.byteLength });
         } catch {
-          rawTypes.push({ type: mime, bytes: 0 });
+          // --list-types advertised this MIME type but reading it failed —
+          // report the measurement as failed, not as a zero-byte payload.
+          rawTypes.push({ type: mime, measurementFailed: true });
         }
       } else {
         rawTypes.push({ type: mime, bytes: 0 });
@@ -167,7 +194,9 @@ export class LinuxWaylandBackend implements ClipboardBackend {
       case 'image': {
         const buf = await runWlPaste(['-t', 'image/png']);
         if (buf.byteLength === 0) throw new Error('Image format not found on clipboard');
-        return { format: 'image', content: buf };
+        // wl-paste hands over opaque bytes with no dimension API — read them out
+        // of the PNG header so Linux reads carry what macOS and Windows report.
+        return { format: 'image', content: buf, ...readPngDimensions(buf) };
       }
     }
   }
@@ -183,5 +212,11 @@ export class LinuxWaylandBackend implements ClipboardBackend {
     }
     await runWlCopy(['-t', 'text/html'], buf);
     return { format: 'html', byteSize: buf.byteLength };
+  }
+
+  async clear(): Promise<void> {
+    // wl-copy --clear reads no stdin and exits as soon as the empty selection
+    // is set; copying an empty payload would leave an owned representation.
+    await runWlCopy(['--clear']);
   }
 }

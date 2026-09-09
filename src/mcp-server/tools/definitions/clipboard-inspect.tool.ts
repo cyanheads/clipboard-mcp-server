@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getClipboardService } from '@/services/clipboard/clipboard-service.js';
+import { isInspectUnreadable } from '@/services/clipboard/types.js';
 
 export const clipboardInspect = tool('clipboard_inspect', {
   title: 'Inspect Clipboard',
@@ -40,9 +41,18 @@ export const clipboardInspect = tool('clipboard_inspect', {
             bytes: z
               .number()
               .int()
+              .optional()
               .describe(
                 'Size of this representation in bytes. ' +
-                  'On Linux, sizes are measured by reading each format — may add latency for large items.',
+                  'On Linux, sizes are measured by reading each format — may add latency for large items. ' +
+                  'Absent when measurementFailed is true; 0 means a genuinely empty representation.',
+              ),
+            measurementFailed: z
+              .boolean()
+              .optional()
+              .describe(
+                'True when the platform listed this type but reading it to measure its size failed. ' +
+                  'The type is on the clipboard and clipboard_read may still return it — only the size is unknown.',
               ),
           })
           .describe('A single pasteboard type entry with its identifier and byte size.'),
@@ -52,6 +62,13 @@ export const clipboardInspect = tool('clipboard_inspect', {
       ),
   }),
   errors: [
+    {
+      reason: 'inspect_unreadable',
+      code: JsonRpcErrorCode.SerializationError,
+      when: 'The platform clipboard helper returned output this server could not read.',
+      recovery:
+        'Retry clipboard_inspect once; if it fails again, copy the content afresh — the application holding the clipboard published metadata this server cannot decode.',
+    },
     {
       reason: 'clipboard_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
@@ -64,8 +81,19 @@ export const clipboardInspect = tool('clipboard_inspect', {
   async handler(_input, ctx) {
     ctx.log.info('clipboard_inspect');
     const svc = getClipboardService();
-    const result = await svc.inspect(ctx);
-    return result;
+    try {
+      return await svc.inspect(ctx);
+    } catch (err) {
+      // A backend that could not read its own helper's output must not look
+      // like an empty clipboard.
+      if (isInspectUnreadable(err)) {
+        throw ctx.fail('inspect_unreadable', err.message, {
+          platform: err.platform,
+          ...ctx.recoveryFor('inspect_unreadable'),
+        });
+      }
+      throw err;
+    }
   },
 
   format: (result) => {
@@ -81,7 +109,9 @@ export const clipboardInspect = tool('clipboard_inspect', {
       lines.push('| Type | Bytes |');
       lines.push('|:-----|------:|');
       for (const t of result.rawTypes) {
-        lines.push(`| \`${t.type}\` | ${t.bytes.toLocaleString()} |`);
+        const size = t.bytes === undefined ? 'unknown' : t.bytes.toLocaleString();
+        const note = t.measurementFailed ? ' (measurementFailed: true)' : '';
+        lines.push(`| \`${t.type}\` | ${size}${note} |`);
       }
     } else {
       lines.push('\n**Raw types:** (empty clipboard)');

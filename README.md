@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -28,7 +28,7 @@
 | Tool | Description |
 |:---|:---|
 | `clipboard_read` | Read clipboard contents in a specified format (text, HTML, RTF, image, or auto-select richest) |
-| `clipboard_write` | Write plain text or HTML to the clipboard, replacing current contents |
+| `clipboard_write` | Write plain text or HTML to the clipboard, replacing current contents, or clear it outright |
 | `clipboard_inspect` | List available clipboard formats and byte sizes without reading full content |
 
 ### `clipboard_read`
@@ -36,7 +36,7 @@
 Read the current clipboard contents in a requested format.
 
 - `auto` mode returns the richest format explicitly present — priority: image > html > rtf > text
-- `image` returns base64-encoded PNG data with pixel dimensions
+- `image` returns base64-encoded PNG data, with pixel dimensions on every platform whenever the capture carries a readable PNG header
 - `html` returns raw HTML source as copied from a browser
 - `rtf` returns raw RTF markup
 - `text` returns plain text
@@ -47,14 +47,16 @@ Read the current clipboard contents in a requested format.
 
 ### `clipboard_write`
 
-Write content to the clipboard, replacing current contents.
+Write content to the clipboard, replacing current contents — or clear it.
 
 - `text` writes plain text
 - `html` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback, while Linux X11 and Wayland publish only `text/html`
-- Returns `previousContent` — the plain text that was on the clipboard immediately before the write, so an unintended overwrite can be undone by writing it back. Absent when the clipboard was empty, held no text representation, or its text exceeded the 512 KB read limit
+- `clear: true` removes every representation instead of writing, so a following `clipboard_inspect` reports `primaryFormat: "empty"`. It returns `cleared: true`, `byteSize: 0`, and no `format`. On Linux X11 this needs `xsel` alongside `xclip` — see [Prerequisites](#prerequisites)
+- Supply exactly one of `content` or `clear: true`. Omitting both, sending an empty `content`, or combining the two is rejected as invalid arguments rather than silently writing a zero-byte representation
+- Returns `previousContent` — the plain text that was on the clipboard immediately before the write or clear, so an unintended overwrite can be undone by writing it back. Absent when the clipboard was empty, held no text representation, or its text exceeded the 512 KB read limit
 - Size limit: 1 MB
-- `destructiveHint: true` — replaces whatever is currently on the clipboard
-- Not registered when `CLIPBOARD_READ_ONLY` is set — see [Configuration](#configuration)
+- `destructiveHint: true` — replaces or removes whatever is currently on the clipboard
+- Not registered when `CLIPBOARD_READ_ONLY` is set, which gates clearing along with writing — see [Configuration](#configuration)
 
 ---
 
@@ -64,7 +66,8 @@ List the formats and byte sizes of what is currently on the clipboard without re
 
 - Returns `primaryFormat` — the richest format present (image > html > rtf > text), or `empty`
 - Returns `availableFormats` — all semantic formats present, for deciding which format to pass to `clipboard_read`
-- Returns `rawTypes` — all raw platform type identifiers with byte sizes (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows)
+- Returns `rawTypes` — all raw platform type identifiers with byte sizes (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows). An entry whose size could not be measured carries `measurementFailed: true` and no `bytes`, so a failed measurement is never reported as a zero-byte representation
+- Returns a typed `inspect_unreadable` error when the platform helper's output cannot be read, instead of reporting an empty clipboard
 - Use this before `clipboard_read` to avoid `format_unavailable` errors and to check content size before reading
 
 ---
@@ -138,11 +141,11 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 **macOS:** No additional tools required — `pbcopy`, `pbpaste`, and `osascript` are built in.
 
-**Linux X11:** `xclip` must be installed.
+**Linux X11:** `xclip` must be installed. `xsel` is additionally required for `clipboard_write`'s `clear` mode — it is the only one of the two that can hand the selection back rather than owning an empty one.
 
 ```sh
-apt install xclip           # Debian/Ubuntu
-pacman -S xclip             # Arch
+apt install xclip xsel      # Debian/Ubuntu
+pacman -S xclip xsel        # Arch
 ```
 
 **Linux Wayland:** `wl-clipboard` must be installed.

@@ -8,10 +8,90 @@ export type ClipboardFormat = 'text' | 'html' | 'rtf' | 'image';
 
 /** Metadata about a single pasteboard type. */
 export interface RawTypeEntry {
-  /** Byte size of this representation. */
-  bytes: number;
+  /**
+   * Byte size of this representation. Absent when `measurementFailed` is true —
+   * a size that could not be read is reported as unknown, never as zero.
+   */
+  bytes?: number;
+  /**
+   * True when the platform listed this type but reading it to measure its size
+   * failed. The type is present on the clipboard; only its size is unknown.
+   */
+  measurementFailed?: boolean;
   /** Platform-native type identifier (UTI, MIME type, or Windows format name). */
   type: string;
+}
+
+/**
+ * Sentinel thrown by a backend whose native clipboard helper returned output
+ * this server cannot read. Distinct from an empty clipboard, which is a
+ * successful inspection with no types.
+ */
+export interface InspectUnreadableError {
+  _inspectUnreadable: true;
+  /** Platform whose helper produced the output. */
+  platform: string;
+}
+
+/** Longest slice of unreadable helper output carried in the error message. */
+const UNREADABLE_PREVIEW_LIMIT = 120;
+
+/** Build the sentinel for helper output that could not be read. */
+export function inspectUnreadable(platform: string, raw: string): Error & InspectUnreadableError {
+  const collapsed = raw.replace(/\s+/g, ' ').trim();
+  const preview =
+    collapsed.length > UNREADABLE_PREVIEW_LIMIT
+      ? `${collapsed.slice(0, UNREADABLE_PREVIEW_LIMIT)}…`
+      : collapsed;
+  return Object.assign(
+    new Error(
+      `${platform} clipboard inspection returned unreadable output: ${preview || '(no output)'}`,
+    ),
+    { _inspectUnreadable: true as const, platform },
+  );
+}
+
+/** Type guard for the unreadable-inspection sentinel. */
+export function isInspectUnreadable(err: unknown): err is Error & InspectUnreadableError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    '_inspectUnreadable' in err &&
+    (err as { _inspectUnreadable: unknown })._inspectUnreadable === true
+  );
+}
+
+/** One `{ type, bytes }` pair as a platform's inspection helper emits it. */
+interface NativeTypeEntry {
+  bytes: number;
+  type: string;
+}
+
+/**
+ * Parse the JSON type listing a native inspection helper printed. Anything that
+ * is not a list of `{ type: string, bytes: number }` throws the unreadable
+ * sentinel — collapsing it to an empty list would be indistinguishable from a
+ * genuinely empty clipboard. Callers handle their platform's own way of
+ * spelling "nothing here" before calling.
+ */
+export function parseNativeTypeEntries(raw: string, platform: string): NativeTypeEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw inspectUnreadable(platform, raw);
+  }
+  if (parsed === null) return [];
+
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  return items.map((item) => {
+    if (typeof item !== 'object' || item === null) throw inspectUnreadable(platform, raw);
+    const { bytes, type } = item as { bytes?: unknown; type?: unknown };
+    if (typeof type !== 'string' || typeof bytes !== 'number' || !Number.isFinite(bytes)) {
+      throw inspectUnreadable(platform, raw);
+    }
+    return { type, bytes };
+  });
 }
 
 /** Result of a clipboard inspection operation. */
@@ -119,11 +199,31 @@ export interface WriteResult {
   previousContent?: string;
 }
 
+/** Result of clearing the clipboard. */
+export interface ClearResult {
+  /** Always 0 — clearing publishes no content. */
+  byteSize: number;
+  /** Always true — this call cleared the clipboard instead of writing. */
+  cleared: true;
+  /**
+   * Plain text that was on the clipboard immediately before this clear, for
+   * recovery from an unintended clear. Absent when the clipboard was empty,
+   * held no text representation, or its text exceeded the read size limit.
+   */
+  previousContent?: string;
+}
+
 /**
  * Platform-agnostic clipboard backend interface. All platform-specific
  * clipboard adapters implement this contract.
  */
 export interface ClipboardBackend {
+  /**
+   * Remove every representation from the clipboard.
+   * Each backend uses its platform's ownership-releasing primitive — writing
+   * empty content instead would leave a zero-byte representation behind.
+   */
+  clear(): Promise<void>;
   /**
    * Inspect the clipboard: return type metadata without reading full content.
    * Platform: uses pb.types (macOS), TARGETS (X11), --list-types (Wayland), .GetFormats() (Windows).

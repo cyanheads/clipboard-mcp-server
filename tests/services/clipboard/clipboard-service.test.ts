@@ -41,6 +41,7 @@ function mockToolAvailable(): void {
  * ReadResult to resolve with or an error to reject with.
  */
 function fakeBackend(opts: { read?: ReadResult | Error; write: WriteResult }): ClipboardBackend & {
+  clear: ReturnType<typeof vi.fn>;
   read: ReturnType<typeof vi.fn>;
   write: ReturnType<typeof vi.fn>;
 } {
@@ -49,10 +50,12 @@ function fakeBackend(opts: { read?: ReadResult | Error; write: WriteResult }): C
       ? vi.fn().mockRejectedValue(opts.read)
       : vi.fn().mockResolvedValue(opts.read);
   return {
+    clear: vi.fn().mockResolvedValue(undefined),
     inspect: vi.fn(),
     read,
     write: vi.fn().mockResolvedValue(opts.write),
   } as unknown as ClipboardBackend & {
+    clear: ReturnType<typeof vi.fn>;
     read: ReturnType<typeof vi.fn>;
     write: ReturnType<typeof vi.fn>;
   };
@@ -93,6 +96,39 @@ describe('ClipboardService backend selection', () => {
     expect(selectedBackend()).toBeInstanceOf(LinuxWaylandBackend);
     expect(mockExecFile).toHaveBeenCalledWith('which', ['wl-paste'], expect.any(Function));
   });
+
+  it('probes wl-copy alongside wl-paste before selecting Wayland (#21)', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    vi.stubEnv('WAYLAND_DISPLAY', 'wayland-0');
+    vi.stubEnv('DISPLAY', '');
+    mockToolAvailable();
+
+    await initService();
+
+    expect(mockExecFile).toHaveBeenCalledWith('which', ['wl-copy'], expect.any(Function));
+  });
+
+  it.each([['wl-paste'], ['wl-copy']])(
+    'refuses a Wayland session missing %s, with install guidance',
+    async (missing) => {
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+      vi.stubEnv('WAYLAND_DISPLAY', 'wayland-0');
+      vi.stubEnv('DISPLAY', '');
+      mockExecFile.mockImplementation((_file, args, callback) => {
+        const error = args?.[0] === missing ? new Error('missing') : null;
+        (callback as (error: Error | null, stdout: string, stderr: string) => void)(error, '', '');
+        return {} as ReturnType<typeof execFile>;
+      });
+
+      await expect(initService()).rejects.toMatchObject({
+        message: expect.stringContaining(`${missing} not found`),
+        data: {
+          session: 'wayland',
+          recovery: { hint: expect.stringContaining('apt install wl-clipboard') },
+        },
+      });
+    },
+  );
 
   it('selects X11 after probing xclip with Unix which', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
@@ -328,5 +364,97 @@ describe('ClipboardService.write — prior contents capture (#28)', () => {
       svc.write('a'.repeat(SIZE_LIMITS.WRITE + 1), 'text', createMockContext()),
     ).rejects.toMatchObject({ _contentTooLarge: true });
     expect(backend.read).not.toHaveBeenCalled();
+  });
+});
+
+describe('ClipboardService.clear (#24)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('delegates to the backend and reports a zero-byte cleared result', async () => {
+    const backend = fakeBackend({ write: { format: 'text', byteSize: 0 } });
+    const svc = new ClipboardService(backend);
+
+    const result = await svc.clear(createMockContext());
+
+    expect(result).toMatchObject({ byteSize: 0, cleared: true });
+    expect(backend.clear).toHaveBeenCalledTimes(1);
+    expect(backend.write).not.toHaveBeenCalled();
+  });
+
+  it('returns the plain text that was on the clipboard before the clear', async () => {
+    const backend = fakeBackend({
+      read: { format: 'text', content: Buffer.from('the old note') },
+      write: { format: 'text', byteSize: 0 },
+    });
+    const svc = new ClipboardService(backend);
+
+    const result = await svc.clear(createMockContext());
+
+    expect(result).toEqual({ byteSize: 0, cleared: true, previousContent: 'the old note' });
+  });
+
+  it('reads the prior contents before clearing them', async () => {
+    const order: string[] = [];
+    const backend = fakeBackend({
+      read: { format: 'text', content: Buffer.from('old') },
+      write: { format: 'text', byteSize: 0 },
+    });
+    backend.read.mockImplementation(async () => {
+      order.push('read');
+      return { format: 'text' as const, content: Buffer.from('old') };
+    });
+    backend.clear.mockImplementation(async () => {
+      order.push('clear');
+    });
+    const svc = new ClipboardService(backend);
+
+    await svc.clear(createMockContext());
+
+    expect(order).toEqual(['read', 'clear']);
+  });
+
+  it('clears a clipboard holding only an image, with no previousContent', async () => {
+    const backend = fakeBackend({
+      read: new Error('text format not found on clipboard'),
+      write: { format: 'text', byteSize: 0 },
+    });
+    const svc = new ClipboardService(backend);
+
+    const result = await svc.clear(createMockContext());
+
+    expect(result).toEqual({ byteSize: 0, cleared: true });
+    expect(backend.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits previousContent when the prior text was empty', async () => {
+    const backend = fakeBackend({
+      read: { format: 'text', content: Buffer.alloc(0) },
+      write: { format: 'text', byteSize: 0 },
+    });
+    const svc = new ClipboardService(backend);
+
+    await expect(svc.clear(createMockContext())).resolves.not.toHaveProperty('previousContent');
+  });
+
+  it('omits previousContent when the prior text exceeded the read size limit', async () => {
+    const backend = fakeBackend({
+      read: { format: 'text', content: Buffer.alloc(SIZE_LIMITS.READ_TEXT + 1, 'a') },
+      write: { format: 'text', byteSize: 0 },
+    });
+    const svc = new ClipboardService(backend);
+
+    const result = await svc.clear(createMockContext());
+
+    expect(result).toEqual({ byteSize: 0, cleared: true });
+  });
+
+  it('propagates a backend clear failure', async () => {
+    const backend = fakeBackend({ write: { format: 'text', byteSize: 0 } });
+    backend.clear.mockRejectedValueOnce(new Error('xsel exited 1: cannot open display'));
+    const svc = new ClipboardService(backend);
+
+    await expect(svc.clear(createMockContext())).rejects.toThrow('xsel exited 1');
   });
 });

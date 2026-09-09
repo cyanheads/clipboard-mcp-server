@@ -36,7 +36,7 @@ export const clipboardRead = tool('clipboard_read', {
   description:
     'Read the current clipboard contents in a requested format. ' +
     '"auto" returns the richest format explicitly present (priority: image > html > rtf > text). ' +
-    '"image" returns base64-encoded PNG with dimensions. ' +
+    '"image" returns base64-encoded PNG, with pixel dimensions whenever the capture carries a readable PNG header. ' +
     '"html" returns raw HTML source. "rtf" returns raw RTF markup. "text" returns plain text. ' +
     'If the requested format is not present, returns a format_unavailable error — use "auto" when unsure, or call clipboard_inspect first.',
   annotations: { readOnlyHint: true, openWorldHint: false },
@@ -46,7 +46,8 @@ export const clipboardRead = tool('clipboard_read', {
       .default('auto')
       .describe(
         'Format to return. "auto" returns the richest format explicitly present on the clipboard ' +
-          '(priority: image > html > rtf > text). "image" returns base64-encoded PNG data with dimensions. ' +
+          '(priority: image > html > rtf > text). "image" returns base64-encoded PNG data, with pixel dimensions ' +
+          'whenever the capture carries a readable PNG header. ' +
           '"html" returns raw HTML source as copied from a browser. "rtf" returns raw RTF markup. ' +
           '"text" returns plain text. If the requested format is not on the clipboard, the tool returns an error.',
       ),
@@ -60,12 +61,16 @@ export const clipboardRead = tool('clipboard_read', {
       .number()
       .int()
       .optional()
-      .describe('Image width in pixels. Present only when format is "image".'),
+      .describe(
+        'Image width in pixels. Present on an "image" read whose dimensions could be determined.',
+      ),
     height: z
       .number()
       .int()
       .optional()
-      .describe('Image height in pixels. Present only when format is "image".'),
+      .describe(
+        'Image height in pixels. Present on an "image" read whose dimensions could be determined.',
+      ),
     byteSize: z.number().int().describe('Size of the content in bytes.'),
   }),
   errors: [

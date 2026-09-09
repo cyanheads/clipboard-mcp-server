@@ -132,16 +132,10 @@ describe('clipboardWrite', () => {
   });
 
   describe('edge cases', () => {
-    it('writes empty string without error', async () => {
-      const writeMock = vi.fn().mockResolvedValueOnce({ format: 'text' as const, byteSize: 0 });
-      mockGetService.mockReturnValueOnce({ write: writeMock } as ReturnType<
-        typeof getClipboardService
-      >);
-
-      const ctx = createMockContext({ errors: clipboardWrite.errors });
-      const input = clipboardWrite.input.parse({ content: '', format: 'text' });
-      const result = await clipboardWrite.handler(input, ctx);
-      expect(result.byteSize).toBe(0);
+    it('rejects an empty write and points at the clear mode instead', () => {
+      expect(() => clipboardWrite.input.parse({ content: '', format: 'text' })).toThrow(
+        /clear: true/,
+      );
     });
 
     it('handles content with injection-like chars (service owns safety)', async () => {
@@ -295,6 +289,145 @@ describe('clipboardWrite — previous clipboard contents (#28)', () => {
       const match = /(`{3,})[^\n]*\n([\s\S]*)\n\1/.exec(text);
       expect(match?.[2]).toBe(prior);
       expect(match![1]!.length).toBeGreaterThan(3);
+    });
+  });
+});
+
+describe('clipboardWrite — explicit clear (#24)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function serviceWithClear(result: Record<string, unknown>) {
+    const clearMock = vi.fn().mockResolvedValueOnce(result);
+    const writeMock = vi.fn();
+    mockGetService.mockReturnValueOnce({
+      clear: clearMock,
+      write: writeMock,
+    } as unknown as ReturnType<typeof getClipboardService>);
+    return { clearMock, writeMock };
+  }
+
+  describe('input schema', () => {
+    it('accepts clear: true with no content', () => {
+      expect(clipboardWrite.input.parse({ clear: true })).toMatchObject({ clear: true });
+    });
+
+    it('leaves an ordinary write unchanged', () => {
+      expect(clipboardWrite.input.parse({ content: 'hello' })).toEqual({
+        content: 'hello',
+        format: 'text',
+        clear: false,
+      });
+    });
+
+    it.each([
+      ['neither content nor clear', {}],
+      ['an empty content string', { content: '' }],
+      ['an empty content string with clear: false', { content: '', clear: false }],
+      ['content with clear omitted but blank', { content: '', format: 'html' }],
+    ])('rejects %s with guidance naming clear: true', (_label, args) => {
+      expect(() => clipboardWrite.input.parse(args)).toThrow(/clear: true/);
+    });
+
+    it.each([
+      ['content alongside clear: true', { content: 'ignored', clear: true }],
+      ['html content alongside clear: true', { content: '<b>x</b>', format: 'html', clear: true }],
+    ])('rejects %s rather than silently discarding the content', (_label, args) => {
+      expect(() => clipboardWrite.input.parse(args)).toThrow(/not both|only one/i);
+    });
+
+    it('describes the clear mode on the tool and the field', () => {
+      expect(clipboardWrite.description).toContain('clear');
+      expect(clipboardWrite.input.shape.clear.description).toContain('clear');
+      expect(clipboardWrite.input.shape.content.description).toContain('clear');
+    });
+  });
+
+  describe('handler', () => {
+    it('clears the clipboard and reports a zero-byte cleared result', async () => {
+      const { clearMock, writeMock } = serviceWithClear({ byteSize: 0, cleared: true });
+
+      const ctx = createMockContext({ errors: clipboardWrite.errors });
+      const result = await clipboardWrite.handler(clipboardWrite.input.parse({ clear: true }), ctx);
+
+      expect(result).toEqual({ byteSize: 0, cleared: true });
+      expect(clearMock).toHaveBeenCalledWith(ctx);
+      expect(writeMock).not.toHaveBeenCalled();
+    });
+
+    it('returns previousContent captured before the clear', async () => {
+      serviceWithClear({ byteSize: 0, cleared: true, previousContent: 'the old note' });
+
+      const ctx = createMockContext({ errors: clipboardWrite.errors });
+      const result = await clipboardWrite.handler(clipboardWrite.input.parse({ clear: true }), ctx);
+
+      expect(result.previousContent).toBe('the old note');
+    });
+
+    it('refuses an empty write reaching the handler unvalidated', async () => {
+      mockGetService.mockReturnValueOnce({ write: vi.fn() } as unknown as ReturnType<
+        typeof getClipboardService
+      >);
+
+      const ctx = createMockContext({ errors: clipboardWrite.errors });
+      await expect(
+        clipboardWrite.handler({ clear: false, format: 'text' } as never, ctx),
+      ).rejects.toThrow(/clear: true/);
+    });
+
+    it('propagates a backend clear failure', async () => {
+      const clearMock = vi.fn().mockRejectedValueOnce(new Error('xsel exited 1'));
+      mockGetService.mockReturnValueOnce({ clear: clearMock } as unknown as ReturnType<
+        typeof getClipboardService
+      >);
+
+      const ctx = createMockContext({ errors: clipboardWrite.errors });
+      await expect(
+        clipboardWrite.handler(clipboardWrite.input.parse({ clear: true }), ctx),
+      ).rejects.toThrow('xsel exited 1');
+    });
+  });
+
+  describe('output schema', () => {
+    it('accepts a cleared result with no format', () => {
+      expect(clipboardWrite.output.parse({ byteSize: 0, cleared: true })).toEqual({
+        byteSize: 0,
+        cleared: true,
+      });
+    });
+
+    it('still accepts an ordinary write result', () => {
+      expect(clipboardWrite.output.parse({ format: 'text', byteSize: 5 })).toEqual({
+        format: 'text',
+        byteSize: 5,
+      });
+    });
+  });
+
+  describe('format()', () => {
+    function render(output: Parameters<NonNullable<typeof clipboardWrite.format>>[0]): string {
+      return clipboardWrite.format!(output).find((b) => b.type === 'text')?.text ?? '';
+    }
+
+    it('renders the cleared case without claiming a format was written', () => {
+      const text = render({ byteSize: 0, cleared: true });
+      expect(text).toContain('true');
+      expect(text.toLowerCase()).toContain('cleared');
+      expect(text).not.toMatch(/\*\*Format written:\*\* (text|html)/);
+    });
+
+    it('renders the prior contents alongside a clear', () => {
+      const text = render({ byteSize: 0, cleared: true, previousContent: 'the old note' });
+      expect(text).toContain('the old note');
+      expect(text.toLowerCase()).toContain('previous');
+    });
+
+    it('leaves an ordinary write rendering unchanged', () => {
+      const text = render({ format: 'text', byteSize: 1234 });
+      expect(text).toContain('**Format written:** text');
+      expect(text).toContain('1,234');
+      expect(text.toLowerCase()).not.toContain('cleared');
     });
   });
 });

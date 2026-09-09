@@ -126,10 +126,39 @@ describe('MacosBackend', () => {
       expect(result.primaryFormat).toBe('html');
     });
 
-    it('handles malformed JXA output gracefully', async () => {
+    it('reports malformed JXA output as a failure, not an empty clipboard', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'not json' }));
-      const result = await backend.inspect();
-      expect(result.primaryFormat).toBe('empty');
+      await expect(backend.inspect()).rejects.toThrow(/unreadable/i);
+    });
+  });
+
+  describe('inspect() — unreadable native output (#23)', () => {
+    it.each([
+      ['a JSON string', '"public.utf8-plain-text"'],
+      ['a JSON number', '42'],
+      ['an array of strings', '["public.html"]'],
+      ['entries missing a type', '[{"bytes":12}]'],
+      ['entries with a non-numeric size', '[{"type":"public.html","bytes":"big"}]'],
+    ])('surfaces %s as unreadable rather than an empty clipboard', async (_label, stdout) => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout }));
+      await expect(backend.inspect()).rejects.toThrow(/unreadable/i);
+    });
+
+    it('names the platform on the thrown failure', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'not json' }));
+      await expect(backend.inspect()).rejects.toMatchObject({
+        _inspectUnreadable: true,
+        platform: 'macOS',
+      });
+    });
+
+    it('still reports a genuinely empty pasteboard as an empty success', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '[]' }));
+      await expect(backend.inspect()).resolves.toEqual({
+        primaryFormat: 'empty',
+        availableFormats: [],
+        rawTypes: [],
+      });
     });
   });
 
@@ -307,6 +336,28 @@ describe('MacosBackend', () => {
         expect(script).toContain(JSON.stringify(Buffer.from(expected, 'utf8').toString('base64')));
       },
     );
+  });
+
+  describe('clear() (#24)', () => {
+    it('clears the pasteboard without publishing any representation', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
+
+      await backend.clear();
+
+      const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
+      expect(cmd).toBe('osascript');
+      const script = args.at(-1) ?? '';
+      expect(script).toContain('clearContents');
+      // A following setStringForType is what leaves an empty representation behind.
+      expect(script).not.toContain('setStringForType');
+      expect(script).not.toContain('pbcopy');
+    });
+
+    it('propagates an osascript failure', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'execution error' }));
+
+      await expect(backend.clear()).rejects.toThrow(/osascript exited 1/);
+    });
   });
 
   describe('security — injection prevention', () => {

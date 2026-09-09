@@ -11,7 +11,7 @@ import type {
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats, stripHtmlTags } from './types.js';
+import { buildInspectFormats, parseNativeTypeEntries, stripHtmlTags } from './types.js';
 
 /** Run a PowerShell script. Returns stdout as Buffer. Optionally pipes stdin. */
 function runPowershell(script: string, stdin?: Buffer): Promise<Buffer> {
@@ -148,6 +148,16 @@ if ($img) {
 } else { 'null' }
 `;
 
+/**
+ * Static PowerShell script that empties the clipboard.
+ * `Clipboard::Clear()` removes every format; setting an empty string instead
+ * would leave a zero-length text representation behind.
+ */
+const PS_CLEAR = `
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Clipboard]::Clear()
+`;
+
 interface StringReadEnvelope {
   contentBase64?: string;
   present: boolean;
@@ -217,15 +227,9 @@ export class WindowsBackend implements ClipboardBackend {
     const buf = await runPowershell(PS_INSPECT);
     const raw = buf.toString('utf8').trim();
 
-    let entries: Array<{ type: string; bytes: number }> = [];
-    if (raw && raw !== 'null' && raw !== '') {
-      try {
-        const parsed = JSON.parse(raw);
-        entries = Array.isArray(parsed) ? parsed : [parsed];
-      } catch {
-        entries = [];
-      }
-    }
+    // PowerShell writes nothing (or `null`) for an empty clipboard; every other
+    // shape must parse as a type listing or the inspection has failed.
+    const entries = raw === '' || raw === 'null' ? [] : parseNativeTypeEntries(raw, 'Windows');
 
     const rawTypes: RawTypeEntry[] = entries.map((e) => ({ type: e.type, bytes: e.bytes }));
     const semanticSet = new Set<ClipboardFormat>();
@@ -277,5 +281,9 @@ export class WindowsBackend implements ClipboardBackend {
     const ptB64 = Buffer.from(plaintext, 'utf8').toString('base64');
     await runPowershell(buildPsWriteHtml(htmlB64, ptB64));
     return { format: 'html', byteSize: buf.byteLength };
+  }
+
+  async clear(): Promise<void> {
+    await runPowershell(PS_CLEAR);
   }
 }

@@ -10,6 +10,7 @@ vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 
 import { spawn } from 'node:child_process';
 import { LinuxWaylandBackend } from '@/services/clipboard/linux-wayland-backend.js';
+import { REAL_PNG_13x7 } from './png-fixtures.js';
 
 const mockSpawn = vi.mocked(spawn);
 
@@ -41,6 +42,42 @@ function fakeChild(opts: {
   });
 
   return child;
+}
+
+/**
+ * A wl-copy child under the test's control: nothing is emitted until the test
+ * says so, so "did write() resolve yet?" is an observable question.
+ */
+function fakeWlCopyChild() {
+  const child = new EventEmitter() as ReturnType<typeof spawn>;
+  const stderrEmitter = new EventEmitter();
+  const stdinEmitter = new EventEmitter() as typeof child.stdin;
+  const end = vi.fn();
+  (stdinEmitter as unknown as { end: typeof end }).end = end;
+  Object.assign(child, {
+    stdout: null,
+    stderr: stderrEmitter,
+    stdin: stdinEmitter,
+    unref: vi.fn(),
+  });
+  return { child, stderr: stderrEmitter, stdin: stdinEmitter, stdinEnd: end };
+}
+
+/** Track settlement of a promise without awaiting it. */
+function watch(promise: Promise<unknown>) {
+  const state = { settled: false, status: '' as '' | 'resolved' | 'rejected', reason: '' };
+  const done = promise.then(
+    () => {
+      state.settled = true;
+      state.status = 'resolved';
+    },
+    (error: unknown) => {
+      state.settled = true;
+      state.status = 'rejected';
+      state.reason = error instanceof Error ? error.message : String(error);
+    },
+  );
+  return { state, done };
 }
 
 describe('LinuxWaylandBackend', () => {
@@ -80,6 +117,49 @@ describe('LinuxWaylandBackend', () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stderr: 'nothing is copied', exitCode: 1 }));
       const result = await backend.inspect();
       expect(result.primaryFormat).toBe('empty');
+    });
+
+    it('marks a failed size measurement instead of reporting zero bytes (#23)', async () => {
+      mockSpawn
+        .mockReturnValueOnce(fakeChild({ stdout: 'text/plain\nimage/png\n' }))
+        .mockReturnValueOnce(fakeChild({ stdout: 'hello' }))
+        .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'wl-paste: no data for that type' }));
+
+      const result = await backend.inspect();
+
+      expect(result.rawTypes).toEqual([
+        { type: 'text/plain', bytes: 5 },
+        { type: 'image/png', measurementFailed: true },
+      ]);
+      expect(result.availableFormats).toEqual(['text', 'image']);
+      expect(result.primaryFormat).toBe('image');
+    });
+
+    it('reports a genuine zero-length representation as bytes: 0 (#23)', async () => {
+      mockSpawn
+        .mockReturnValueOnce(fakeChild({ stdout: 'text/plain\n' }))
+        .mockReturnValueOnce(fakeChild({ stdout: '' }));
+
+      const result = await backend.inspect();
+
+      expect(result.rawTypes).toEqual([{ type: 'text/plain', bytes: 0 }]);
+      expect(result.rawTypes[0]).not.toHaveProperty('measurementFailed');
+    });
+
+    it('marks every failed measurement when several types fail (#23)', async () => {
+      mockSpawn
+        .mockReturnValueOnce(fakeChild({ stdout: 'text/plain\ntext/html\nimage/png\n' }))
+        .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'no data for that type' }))
+        .mockReturnValueOnce(fakeChild({ stdout: '<b>ok</b>' }))
+        .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'no data for that type' }));
+
+      const result = await backend.inspect();
+
+      expect(result.rawTypes).toEqual([
+        { type: 'text/plain', measurementFailed: true },
+        { type: 'text/html', bytes: 9 },
+        { type: 'image/png', measurementFailed: true },
+      ]);
     });
 
     it.each(['image/jpeg', 'image/bmp'])(
@@ -183,26 +263,34 @@ describe('LinuxWaylandBackend', () => {
       await expect(backend.read('rtf')).rejects.toThrow(/not found/i);
     });
 
-    it('reads image/png via wl-paste', async () => {
-      const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: pngBytes }));
+    it('reads image/png via wl-paste and reports its dimensions', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: REAL_PNG_13x7 }));
       const result = await backend.read('image');
       expect(result.format).toBe('image');
-      expect(result.content.slice(0, 4)).toEqual(pngBytes);
+      expect(result.content).toEqual(REAL_PNG_13x7);
+      expect(result.width).toBe(13);
+      expect(result.height).toBe(7);
+    });
+
+    it('returns the bytes without dimensions when the PNG capture is truncated', async () => {
+      const truncated = REAL_PNG_13x7.subarray(0, 16);
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: truncated }));
+
+      const result = await backend.read('image');
+
+      expect(result.content).toEqual(truncated);
+      expect(result.width).toBeUndefined();
+      expect(result.height).toBeUndefined();
     });
   });
 
   describe('write() html', () => {
     it('invokes wl-copy with text/html MIME type', async () => {
       const spawnCallArgs: unknown[] = [];
-      const child = fakeChild({ stdout: '' });
-      Object.assign(child, { unref: vi.fn() });
-      const origEmit = child.emit.bind(child);
+      const { child } = fakeWlCopyChild();
       mockSpawn.mockImplementationOnce((...args) => {
         spawnCallArgs.push(...args);
-        setImmediate(() => {
-          origEmit('spawn');
-        });
+        setImmediate(() => child.emit('exit', 0, null));
         return child;
       });
 
@@ -217,16 +305,10 @@ describe('LinuxWaylandBackend', () => {
   describe('write()', () => {
     it('invokes wl-copy detached (Wayland content persistence)', async () => {
       const spawnCallArgs: unknown[] = [];
-      const child = fakeChild({ stdout: '' });
-      // Simulate detach/unref
-      Object.assign(child, { unref: vi.fn() });
-      // Override: emit 'spawn' so the timeout fires
-      const origEmit = child.emit.bind(child);
+      const { child } = fakeWlCopyChild();
       mockSpawn.mockImplementationOnce((...args) => {
         spawnCallArgs.push(...args);
-        setImmediate(() => {
-          origEmit('spawn');
-        });
+        setImmediate(() => child.emit('exit', 0, null));
         return child;
       });
 
@@ -236,6 +318,160 @@ describe('LinuxWaylandBackend', () => {
       expect(cmd).toBe('wl-copy');
       // MIME from enum, not content
       expect(args).toContain('text/plain');
+      const [, , options] = spawnCallArgs as [string, string[], { detached?: boolean }];
+      expect(options.detached).toBe(true);
+    });
+  });
+
+  describe('write() completion signal (#21)', () => {
+    it('stays pending until the wl-copy process exits', async () => {
+      const { child, stdinEnd } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const { state, done } = watch(backend.write('a big payload', 'text'));
+      // stdin is queued immediately; that alone must not complete the write.
+      expect(stdinEnd).toHaveBeenCalled();
+      await Promise.resolve();
+      expect(state.settled).toBe(false);
+
+      child.emit('exit', 0, null);
+      await done;
+      expect(state.status).toBe('resolved');
+    });
+
+    it('does not resolve on a fixed delay while the child is still draining', async () => {
+      vi.useFakeTimers();
+      try {
+        const { child } = fakeWlCopyChild();
+        mockSpawn.mockReturnValueOnce(child);
+
+        const { state, done } = watch(backend.write('slow payload', 'text'));
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(state.settled).toBe(false);
+
+        child.emit('exit', 0, null);
+        await done;
+        expect(state.status).toBe('resolved');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('unrefs the child once it has exited so the process can detach', async () => {
+      const { child } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const write = backend.write('detach me', 'text');
+      child.emit('exit', 0, null);
+      await write;
+
+      expect((child as unknown as { unref: ReturnType<typeof vi.fn> }).unref).toHaveBeenCalled();
+    });
+
+    it('rejects with the captured stderr on a non-zero exit', async () => {
+      const { child, stderr } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const write = backend.write('doomed', 'text');
+      stderr.emit('data', Buffer.from('Failed to connect to a Wayland server'));
+      child.emit('exit', 1, null);
+
+      await expect(write).rejects.toThrow(
+        /wl-copy exited 1: Failed to connect to a Wayland server/,
+      );
+    });
+
+    it('rejects on a non-zero exit that arrives after part of stdin was written', async () => {
+      const { child, stderr } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const write = backend.write('x'.repeat(4096), 'text');
+      // The child read some of stdin, then died mid-transfer.
+      stderr.emit('data', Buffer.from('wl-copy: '));
+      stderr.emit('data', Buffer.from('unexpected end of input'));
+      child.emit('exit', 2, null);
+
+      await expect(write).rejects.toThrow(/wl-copy exited 2: wl-copy: unexpected end of input/);
+    });
+
+    it('rejects with install guidance when wl-copy is missing', async () => {
+      const { child } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const write = backend.write('nowhere to go', 'text');
+      child.emit('error', Object.assign(new Error('spawn wl-copy ENOENT'), { code: 'ENOENT' }));
+
+      await expect(write).rejects.toThrow(
+        'wl-copy not found — install with: apt install wl-clipboard',
+      );
+    });
+
+    it('rejects when the stdin pipe errors instead of leaving the write pending', async () => {
+      const { child, stdin } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const { state, done } = watch(backend.write('broken pipe', 'text'));
+      stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+      await done;
+
+      expect(state.status).toBe('rejected');
+      expect(state.reason).toMatch(/EPIPE/);
+    });
+
+    it('settles once even when stdin errors and the child then exits non-zero', async () => {
+      const { child, stdin } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const { state, done } = watch(backend.write('broken pipe', 'text'));
+      stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+      child.emit('exit', 1, null);
+      await done;
+
+      expect(state.status).toBe('rejected');
+      expect(state.reason).toMatch(/EPIPE/);
+    });
+  });
+
+  describe('clear() (#24)', () => {
+    it('clears with wl-copy --clear instead of copying empty content', async () => {
+      const spawnCallArgs: unknown[] = [];
+      const { child, stdinEnd } = fakeWlCopyChild();
+      mockSpawn.mockImplementationOnce((...args) => {
+        spawnCallArgs.push(...args);
+        setImmediate(() => child.emit('exit', 0, null));
+        return child;
+      });
+
+      await backend.clear();
+
+      const [cmd, args] = spawnCallArgs as [string, string[]];
+      expect(cmd).toBe('wl-copy');
+      expect(args).toEqual(['--clear']);
+      // --clear reads no stdin; an empty copy would leave an owned selection.
+      expect(stdinEnd).not.toHaveBeenCalled();
+    });
+
+    it('rejects when wl-copy --clear exits non-zero', async () => {
+      const { child, stderr } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const cleared = backend.clear();
+      stderr.emit('data', Buffer.from('Failed to connect to a Wayland server'));
+      child.emit('exit', 1, null);
+
+      await expect(cleared).rejects.toThrow(/wl-copy exited 1/);
+    });
+
+    it('rejects with install guidance when wl-copy is missing', async () => {
+      const { child } = fakeWlCopyChild();
+      mockSpawn.mockReturnValueOnce(child);
+
+      const cleared = backend.clear();
+      child.emit('error', Object.assign(new Error('spawn wl-copy ENOENT'), { code: 'ENOENT' }));
+
+      await expect(cleared).rejects.toThrow(
+        'wl-copy not found — install with: apt install wl-clipboard',
+      );
     });
   });
 
@@ -252,11 +488,9 @@ describe('LinuxWaylandBackend', () => {
     it.each(INJECTION_PAYLOADS)(
       'write: MIME type comes from enum, not content (%s)',
       async (payload) => {
-        const child = fakeChild({ stdout: '' });
-        Object.assign(child, { unref: vi.fn() });
-        const origEmit = child.emit.bind(child);
+        const { child } = fakeWlCopyChild();
         mockSpawn.mockImplementationOnce(() => {
-          setImmediate(() => origEmit('spawn'));
+          setImmediate(() => child.emit('exit', 0, null));
           return child;
         });
 

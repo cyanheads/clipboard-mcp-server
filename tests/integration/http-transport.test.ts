@@ -112,6 +112,29 @@ describe('default HTTP launch', () => {
     expect(result.structuredContent).toMatchObject({ format: 'text', byteSize: WRITE_LIMIT });
   });
 
+  it.each([
+    ['neither content nor clear', {}],
+    ['an empty content string', { content: '' }],
+    ['content alongside clear', { content: 'hello', clear: true }],
+  ])('rejects %s as invalid arguments', async (_label, args) => {
+    const client = await connect(server.url);
+    const response = await client.call('tools/call', {
+      name: 'clipboard_write',
+      arguments: args,
+    });
+
+    expect(response.status).toBe(200);
+    const result = resultOf<{
+      content?: { text?: string; type: string }[];
+      isError?: boolean;
+      structuredContent?: { error?: { code?: number } };
+    }>(response);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.error?.code).toBe(-32602);
+    const text = result.content?.map((block) => block.text ?? '').join('\n') ?? '';
+    expect(text).toContain('clipboard_write');
+  });
+
   it('answers the first oversized write with the declared content_too_large envelope', async () => {
     const response = await callWrite(await connect(server.url), escapeHeavy(WRITE_LIMIT + 1));
     expect(response.status).toBe(200);
@@ -175,6 +198,18 @@ describe('read-only deployment', () => {
     const body = response.text.toLowerCase();
     expect(body).toMatch(/not found|unknown tool|-32601/);
     expect(body).not.toContain('"bytesize"');
+  });
+
+  it('refuses a clear call too — the read-only gate covers the whole tool', async () => {
+    const client = await connect(server.url);
+    const response = await client.call('tools/call', {
+      name: 'clipboard_write',
+      arguments: { clear: true },
+    });
+
+    const body = response.text.toLowerCase();
+    expect(body).toMatch(/not found|unknown tool|-32601/);
+    expect(body).not.toContain('"cleared"');
   });
 
   it('drops write guidance from the instructions', async () => {

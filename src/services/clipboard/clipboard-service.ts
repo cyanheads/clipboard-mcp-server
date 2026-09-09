@@ -13,6 +13,7 @@ import { LinuxWaylandBackend } from './linux-wayland-backend.js';
 import { LinuxX11Backend } from './linux-x11-backend.js';
 import { MacosBackend } from './macos-backend.js';
 import type {
+  ClearResult,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
@@ -85,15 +86,20 @@ async function detectBackend(): Promise<ClipboardBackend> {
     const xDisplay = process.env.DISPLAY;
 
     if (waylandDisplay) {
-      // Wayland session: require wl-clipboard
-      const available = await toolAvailable('wl-paste');
-      if (!available) {
+      // Wayland session: require both halves of wl-clipboard. Probing only the
+      // read tool lets a session missing wl-copy start and fail on first write
+      // with a bare ENOENT instead of this install guidance.
+      const required = ['wl-paste', 'wl-copy'] as const;
+      const availability = await Promise.all(required.map((tool) => toolAvailable(tool)));
+      const missing = required.filter((_tool, index) => !availability[index]);
+      if (missing.length > 0) {
         throw serviceUnavailable(
-          'Wayland session detected but wl-clipboard not found. Install with: apt install wl-clipboard',
+          `Wayland session detected but ${missing.join(' and ')} not found. Install with: apt install wl-clipboard`,
           {
             platform: 'linux',
             session: 'wayland',
             tool: 'wl-clipboard',
+            missing,
             recovery: {
               hint: 'Install wl-clipboard: apt install wl-clipboard (Debian/Ubuntu) or pacman -S wl-clipboard (Arch).',
             },
@@ -208,22 +214,45 @@ export class ClipboardService {
       });
     }
 
-    // Read through this.read() rather than the backend so SIZE_LIMITS.READ_TEXT
-    // applies. A failed pre-read never blocks the write the caller asked for:
-    // an empty clipboard, a clipboard with no text representation, and oversized
-    // prior text all simply leave previousContent absent.
-    let previousContent: string | undefined;
-    try {
-      const prior = await this.read('text', ctx);
-      if (prior.content.byteLength > 0) previousContent = prior.content.toString('utf8');
-    } catch (err) {
-      ctx.log.debug('clipboard write: no recoverable prior contents', {
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
+    const previousContent = await this.priorText(ctx);
 
     const result = await this.backend.write(content, format);
     return { ...result, ...(previousContent !== undefined && { previousContent }) };
+  }
+
+  /**
+   * Remove every representation from the clipboard, capturing the prior plain
+   * text first so an unintended clear stays recoverable.
+   */
+  async clear(ctx: Context): Promise<ClearResult> {
+    ctx.log.debug('clipboard clear');
+    const previousContent = await this.priorText(ctx);
+    await this.backend.clear();
+    return {
+      byteSize: 0,
+      cleared: true,
+      ...(previousContent !== undefined && { previousContent }),
+    };
+  }
+
+  /**
+   * Best-effort read of the clipboard's current plain text.
+   *
+   * Goes through this.read() rather than the backend so SIZE_LIMITS.READ_TEXT
+   * applies. A failed pre-read never blocks the mutation the caller asked for:
+   * an empty clipboard, a clipboard with no text representation, and oversized
+   * prior text all simply leave the result absent.
+   */
+  private async priorText(ctx: Context): Promise<string | undefined> {
+    try {
+      const prior = await this.read('text', ctx);
+      if (prior.content.byteLength > 0) return prior.content.toString('utf8');
+    } catch (err) {
+      ctx.log.debug('clipboard mutation: no recoverable prior contents', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return undefined;
   }
 }
 

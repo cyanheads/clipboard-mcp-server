@@ -11,7 +11,7 @@ import type {
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats, stripHtmlTags } from './types.js';
+import { buildInspectFormats, parseNativeTypeEntries, stripHtmlTags } from './types.js';
 
 /**
  * JXA script for inspecting pasteboard types.
@@ -32,6 +32,19 @@ if (types && types.count > 0) {
   }
 }
 JSON.stringify(result);
+`.trim();
+
+/**
+ * JXA script for emptying the pasteboard.
+ * `clearContents` alone leaves no representation behind — the write path's
+ * following `setStringForType` is what turns an empty write into a zero-byte
+ * text representation.
+ */
+const JXA_CLEAR = `
+ObjC.import('AppKit');
+const pb = $.NSPasteboard.generalPasteboard;
+pb.clearContents;
+'ok';
 `.trim();
 
 /**
@@ -213,13 +226,11 @@ function utiToFormat(uti: string): ClipboardFormat | null {
 /** macOS clipboard backend. */
 export class MacosBackend implements ClipboardBackend {
   async inspect(): Promise<InspectResult> {
+    // JXA always prints a JSON array — `[]` for an empty pasteboard. Anything
+    // else means the script failed, which is a reportable failure rather than
+    // an empty clipboard.
     const raw = await runJxa(JXA_INSPECT);
-    let entries: Array<{ type: string; bytes: number }> = [];
-    try {
-      entries = JSON.parse(raw) as Array<{ type: string; bytes: number }>;
-    } catch {
-      entries = [];
-    }
+    const entries = parseNativeTypeEntries(raw, 'macOS');
 
     const rawTypes: RawTypeEntry[] = entries.map((e) => ({ type: e.type, bytes: e.bytes }));
     const semanticSet = new Set<ClipboardFormat>();
@@ -296,5 +307,9 @@ export class MacosBackend implements ClipboardBackend {
     const script = buildJxaWriteHtml(htmlB64, ptB64);
     await runJxa(script);
     return { format: 'html', byteSize: htmlBuf.byteLength };
+  }
+
+  async clear(): Promise<void> {
+    await runJxa(JXA_CLEAR);
   }
 }

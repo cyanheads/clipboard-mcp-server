@@ -85,6 +85,40 @@ describe('WindowsBackend', () => {
       expect(result.primaryFormat).toBe('html');
     });
 
+    it('surfaces unparseable PowerShell output instead of reporting an empty clipboard (#23)', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'At line:1 char:1 + not json' }));
+      await expect(backend.inspect()).rejects.toThrow(/unreadable/i);
+    });
+
+    it.each([
+      ['a JSON string', '"Text"'],
+      ['entries missing a type', '[{"bytes":12}]'],
+      ['entries with a non-numeric size', '[{"type":"Text","bytes":"big"}]'],
+    ])('surfaces %s as unreadable rather than an empty clipboard (#23)', async (_label, stdout) => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout }));
+      await expect(backend.inspect()).rejects.toThrow(/unreadable/i);
+    });
+
+    it('names the platform on the thrown failure (#23)', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'not json' }));
+      await expect(backend.inspect()).rejects.toMatchObject({
+        _inspectUnreadable: true,
+        platform: 'Windows',
+      });
+    });
+
+    it.each([['null'], ['']])(
+      'still reports a genuinely empty clipboard (%s) as an empty success',
+      async (stdout) => {
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout }));
+        await expect(backend.inspect()).resolves.toEqual({
+          primaryFormat: 'empty',
+          availableFormats: [],
+          rawTypes: [],
+        });
+      },
+    );
+
     it('handles single-object JSON (not array) from PowerShell', async () => {
       // PowerShell may return a single object instead of array when there is only one format
       const format = JSON.stringify({ type: 'Text', bytes: 5 });
@@ -228,6 +262,27 @@ describe('WindowsBackend', () => {
       const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
       const script = args.at(-1) ?? '';
       expect(script).toContain(JSON.stringify(Buffer.from('Title Body').toString('base64')));
+    });
+  });
+
+  describe('clear() (#24)', () => {
+    it('clears via the .NET Clipboard::Clear API without setting data', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '' }));
+
+      await backend.clear();
+
+      const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
+      expect(cmd).toBe('powershell.exe');
+      const script = args.at(-1) ?? '';
+      expect(script).toContain('[System.Windows.Forms.Clipboard]::Clear()');
+      expect(script).not.toContain('SetText');
+      expect(script).not.toContain('SetDataObject');
+    });
+
+    it('propagates a PowerShell failure', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'CLIPBRD_E_CANT_OPEN' }));
+
+      await expect(backend.clear()).rejects.toThrow(/powershell exited 1/);
     });
   });
 

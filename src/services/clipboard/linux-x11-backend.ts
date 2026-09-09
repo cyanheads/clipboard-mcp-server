@@ -4,6 +4,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { readPngDimensions } from './png-dimensions.js';
 import type {
   ClipboardBackend,
   ClipboardFormat,
@@ -59,11 +60,58 @@ function runXclip(args: string[], stdin?: Buffer): Promise<Buffer> {
   });
 }
 
+/**
+ * xclip's wording when the CLIPBOARD selection has no owner at all — an empty
+ * clipboard, not a failure. It exits non-zero either way, so the message is
+ * what separates the two.
+ */
+const NO_OWNER_PATTERN = /there is no owner for the .* selection/i;
+
+/**
+ * Run xsel with the given args. Returns stdout as Buffer.
+ *
+ * xclip owns the read and write paths, but it has no way to give a selection
+ * back: `xclip -i` takes ownership unconditionally, so an empty write leaves a
+ * zero-byte representation that still reads as text. `xsel --clear` sets the
+ * selection owner to `None`, which is what actually empties the clipboard.
+ */
+function runXsel(args: string[]): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('xsel', args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`xsel exited ${code}: ${Buffer.concat(err).toString('utf8').trim()}`));
+      } else {
+        resolve(Buffer.concat(out));
+      }
+    });
+    child.on('error', (error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        reject(new Error('xsel not found — clearing the X11 clipboard needs it: apt install xsel'));
+      } else {
+        reject(error);
+      }
+    });
+  });
+}
+
 /** Linux X11 clipboard backend using xclip. */
 export class LinuxX11Backend implements ClipboardBackend {
   async inspect(): Promise<InspectResult> {
     // xclip -o -selection clipboard -t TARGETS lists available MIME types
-    const buf = await runXclip(['-o', '-selection', 'clipboard', '-t', 'TARGETS']);
+    let buf: Buffer;
+    try {
+      buf = await runXclip(['-o', '-selection', 'clipboard', '-t', 'TARGETS']);
+    } catch (error) {
+      if (error instanceof Error && NO_OWNER_PATTERN.test(error.message)) {
+        return { rawTypes: [], ...buildInspectFormats(new Set()) };
+      }
+      throw error;
+    }
     const targets = buf
       .toString('utf8')
       .split('\n')
@@ -89,7 +137,9 @@ export class LinuxX11Backend implements ClipboardBackend {
           const data = await runXclip(['-o', '-selection', 'clipboard', '-t', target]);
           rawTypes.push({ type: target, bytes: data.byteLength });
         } catch {
-          rawTypes.push({ type: target, bytes: 0 });
+          // TARGETS advertised this type but reading it failed — report the
+          // measurement as failed rather than as a zero-byte representation.
+          rawTypes.push({ type: target, measurementFailed: true });
         }
       } else {
         rawTypes.push({ type: target, bytes: 0 });
@@ -133,7 +183,9 @@ export class LinuxX11Backend implements ClipboardBackend {
       case 'image': {
         const buf = await runXclip(['-o', '-selection', 'clipboard', '-t', 'image/png']);
         if (buf.byteLength === 0) throw new Error('Image format not found on clipboard');
-        return { format: 'image', content: buf };
+        // xclip hands over opaque bytes with no dimension API — read them out of
+        // the PNG header so Linux reads carry what macOS and Windows report.
+        return { format: 'image', content: buf, ...readPngDimensions(buf) };
       }
     }
   }
@@ -149,5 +201,9 @@ export class LinuxX11Backend implements ClipboardBackend {
     }
     await runXclip(['-i', '-selection', 'clipboard', '-t', 'text/html'], buf);
     return { format: 'html', byteSize: buf.byteLength };
+  }
+
+  async clear(): Promise<void> {
+    await runXsel(['--clipboard', '--clear']);
   }
 }
