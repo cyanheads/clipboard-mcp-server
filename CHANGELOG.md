@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-09-09
+
+clipboard_read supports offset/limit slicing bounded in memory, Linux inspect measures type sizes without buffering them, and pbpaste/pbcopy pin UTF-8 locale
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-09-08 · ⚠️ Breaking
 
 clipboard_write gains an explicit clear mode (empty content is now rejected), clipboard_inspect surfaces unreadable/unmeasurable backend output, and Linux reads gain PNG dimensions and reliable wl-copy write completion
