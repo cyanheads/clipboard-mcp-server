@@ -3,7 +3,7 @@
  * @module tests/tools/clipboard-read.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getContentBlocks } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { clipboardRead } from '@/mcp-server/tools/definitions/clipboard-read.tool.js';
 import { SIZE_LIMITS } from '@/services/clipboard/clipboard-service.js';
@@ -379,5 +379,236 @@ describe('clipboardRead', () => {
       expect(text).not.toContain('ZmFrZWJhc2U2NA==');
       expect(text).toContain('structuredContent');
     });
+  });
+});
+
+describe('clipboardRead — response-surface characterization', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('format() invariants', () => {
+    it.each([
+      ['text' as const, 'plain payload'],
+      ['html' as const, '<table><tr><td>A &amp; B</td><td>*literal*</td></tr></table>'],
+      ['rtf' as const, '{\\rtf1\\ansi Hello}'],
+    ])('renders the %s payload in full alongside format and size', (format, content) => {
+      const output = { format, content, byteSize: Buffer.byteLength(content, 'utf8') };
+      const blocks = clipboardRead.format!(output);
+      const text = blocks.find((b) => b.type === 'text')?.text ?? '';
+      expect(text).toContain(`**Format:** ${format}`);
+      expect(text).toContain(String(output.byteSize));
+      expect(text).toContain(content);
+    });
+
+    it('emits exactly one text block', () => {
+      const blocks = clipboardRead.format!({ format: 'text', content: 'x', byteSize: 1 });
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0]?.type).toBe('text');
+    });
+  });
+
+  describe('handler structuredContent invariants', () => {
+    it('returns base64 content and dimensions for an image without altering structuredContent', async () => {
+      const png = Buffer.from('characterization-png-bytes');
+      const svc = mockService({
+        read: Promise.resolve({
+          format: 'image' as const,
+          content: png,
+          width: 10,
+          height: 20,
+        }),
+      });
+      mockGetService.mockReturnValueOnce(svc);
+
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const input = clipboardRead.input.parse({ format: 'image' });
+      const result = await clipboardRead.handler(input, ctx);
+      expect(result).toEqual({
+        format: 'image',
+        content: png.toString('base64'),
+        width: 10,
+        height: 20,
+        byteSize: png.byteLength,
+      });
+    });
+
+    it('attaches no content blocks for a text read', async () => {
+      const svc = mockService({
+        read: Promise.resolve({ format: 'text' as const, content: Buffer.from('plain') }),
+      });
+      mockGetService.mockReturnValueOnce(svc);
+
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const input = clipboardRead.input.parse({ format: 'text' });
+      await clipboardRead.handler(input, ctx);
+      expect(getContentBlocks(ctx)).toEqual([]);
+    });
+  });
+});
+
+/**
+ * Pull the fenced payload out of a rendered clipboard_read text block: the
+ * opening fence run, and the bytes between the fences.
+ */
+function fencedPayload(text: string): { fence: string; payload: string } | undefined {
+  const match = /(?:^|\n)(`{3,})[^\n]*\n([\s\S]*)\n\1(?:\n|$)/.exec(text);
+  if (!match?.[1] || match[2] === undefined) return undefined;
+  return { fence: match[1], payload: match[2] };
+}
+
+/** Longest run of consecutive backticks in a string. */
+function longestBacktickRun(s: string): number {
+  let longest = 0;
+  for (const [run] of s.matchAll(/`+/g)) longest = Math.max(longest, run.length);
+  return longest;
+}
+
+describe('clipboardRead format() — literal payload preservation (#22)', () => {
+  function render(format: 'text' | 'html' | 'rtf', content: string): string {
+    const blocks = clipboardRead.format!({
+      format,
+      content,
+      byteSize: Buffer.byteLength(content, 'utf8'),
+    });
+    return blocks.find((b) => b.type === 'text')?.text ?? '';
+  }
+
+  it('fences an HTML table so tags and emphasis markers cannot control rendering', () => {
+    const html = '<table><tr><td>A &amp; B</td><td>*literal*</td></tr></table>';
+    const fenced = fencedPayload(render('html', html));
+    expect(fenced?.payload).toBe(html);
+  });
+
+  it.each([
+    ['pipes and emphasis', 'a | b | c **bold** _under_ ~~strike~~'],
+    ['angle brackets', '<img src=x onerror=alert(1)> <b>hi</b>'],
+    ['markdown headings and lists', '# Heading\n- item\n> quote'],
+    ['multiline text', 'line one\nline two\nline three'],
+    ['leading and trailing whitespace', '   padded   '],
+  ])('preserves %s byte-for-byte inside the fence', (_label, content) => {
+    const fenced = fencedPayload(render('text', content));
+    expect(fenced?.payload).toBe(content);
+  });
+
+  it('outgrows a backtick run in the payload', () => {
+    const content = 'inline ```` four ```` ticks';
+    const fenced = fencedPayload(render('text', content));
+    expect(fenced?.payload).toBe(content);
+    expect(fenced!.fence.length).toBeGreaterThan(longestBacktickRun(content));
+  });
+
+  it('outgrows a nested code fence in the payload', () => {
+    const content = 'before\n```js\nconst x = 1;\n```\nafter';
+    const fenced = fencedPayload(render('html', content));
+    expect(fenced?.payload).toBe(content);
+    expect(fenced!.fence.length).toBeGreaterThan(3);
+  });
+
+  it('outgrows a payload that is nothing but backticks', () => {
+    const content = '`````';
+    const fenced = fencedPayload(render('rtf', content));
+    expect(fenced?.payload).toBe(content);
+    expect(fenced!.fence.length).toBe(6);
+  });
+
+  it.each(['text' as const, 'html' as const, 'rtf' as const])('fences the %s branch', (format) => {
+    const content = `payload for ${format}`;
+    const text = render(format, content);
+    expect(fencedPayload(text)?.payload).toBe(content);
+    expect(text).toContain(`**Format:** ${format}`);
+  });
+
+  it('leaves structuredContent-bound values untouched — format() stays pure', () => {
+    const output = { format: 'text' as const, content: '`tick`', byteSize: 6 };
+    const snapshot = { ...output };
+    clipboardRead.format!(output);
+    expect(output).toEqual(snapshot);
+  });
+});
+
+describe('clipboardRead handler — image block on content[] (#6)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('attaches the PNG bytes as an image block on an explicit image read', async () => {
+    const png = Buffer.from('fake-png-bytes-for-explicit-read');
+    const svc = mockService({
+      read: Promise.resolve({ format: 'image' as const, content: png, width: 10, height: 20 }),
+    });
+    mockGetService.mockReturnValueOnce(svc);
+
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    const input = clipboardRead.input.parse({ format: 'image' });
+    const result = await clipboardRead.handler(input, ctx);
+
+    // content[] carries the image block...
+    expect(getContentBlocks(ctx)).toEqual([
+      { type: 'image', data: png.toString('base64'), mimeType: 'image/png' },
+    ]);
+    // ...and structuredContent is unchanged, asserted independently.
+    expect(result).toEqual({
+      format: 'image',
+      content: png.toString('base64'),
+      width: 10,
+      height: 20,
+      byteSize: png.byteLength,
+    });
+  });
+
+  it('attaches the PNG bytes when auto resolves to image', async () => {
+    const png = Buffer.from('fake-png-bytes-for-auto-read');
+    const svc = {
+      inspect: vi.fn().mockResolvedValueOnce({
+        primaryFormat: 'image' as const,
+        availableFormats: ['text' as const, 'image' as const],
+        rawTypes: [],
+      }),
+      read: vi
+        .fn()
+        .mockResolvedValueOnce({ format: 'image' as const, content: png, width: 8, height: 6 }),
+    } as unknown as ReturnType<typeof getClipboardService>;
+    mockGetService.mockReturnValueOnce(svc);
+
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    const input = clipboardRead.input.parse({ format: 'auto' });
+    const result = await clipboardRead.handler(input, ctx);
+
+    expect(getContentBlocks(ctx)).toEqual([
+      { type: 'image', data: png.toString('base64'), mimeType: 'image/png' },
+    ]);
+    expect(result.content).toBe(png.toString('base64'));
+    expect(result.width).toBe(8);
+    expect(result.height).toBe(6);
+  });
+
+  it.each(['html' as const, 'rtf' as const])(
+    'attaches no content block for a %s read',
+    async (format) => {
+      const svc = mockService({
+        read: Promise.resolve({ format, content: Buffer.from('<p>x</p>') }),
+      });
+      mockGetService.mockReturnValueOnce(svc);
+
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const input = clipboardRead.input.parse({ format });
+      await clipboardRead.handler(input, ctx);
+      expect(getContentBlocks(ctx)).toEqual([]);
+    },
+  );
+
+  it('attaches no content block when the image read fails', async () => {
+    const svc = mockService({
+      read: Promise.reject(new Error('Image format not found on clipboard')),
+    });
+    mockGetService.mockReturnValueOnce(svc);
+
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    const input = clipboardRead.input.parse({ format: 'image' });
+    await expect(clipboardRead.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'format_unavailable' },
+    });
+    expect(getContentBlocks(ctx)).toEqual([]);
   });
 });

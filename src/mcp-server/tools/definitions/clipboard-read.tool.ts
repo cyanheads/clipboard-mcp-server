@@ -3,14 +3,33 @@
  * @module mcp-server/tools/definitions/clipboard-read.tool
  */
 
-import { tool, z } from '@cyanheads/mcp-ts-core';
+import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getClipboardService, isContentTooLarge } from '@/services/clipboard/clipboard-service.js';
-import type { ClipboardFormat } from '@/services/clipboard/types.js';
+import type { ClipboardFormat, ReadResult } from '@/services/clipboard/types.js';
 import { FORMAT_PRIORITY } from '@/services/clipboard/types.js';
 
 /** Auto-mode priority order: richest format wins (image > html > rtf > text). */
 const AUTO_PRIORITY: ClipboardFormat[] = [...FORMAT_PRIORITY].reverse();
+
+/**
+ * Shape a backend read into tool output. Image bytes are additionally attached
+ * to `content[]` as a real image block, so a client reading only `content[]`
+ * receives the same payload a `structuredContent` client does.
+ */
+function toOutput(result: ReadResult, ctx: Pick<Context, 'content'>) {
+  const content =
+    result.format === 'image' ? result.content.toString('base64') : result.content.toString('utf8');
+  if (result.format === 'image') ctx.content.image(content, 'image/png');
+  return {
+    format: result.format,
+    content,
+    ...(result.width !== undefined && { width: result.width }),
+    ...(result.height !== undefined && { height: result.height }),
+    byteSize: result.content.byteLength,
+  };
+}
 
 export const clipboardRead = tool('clipboard_read', {
   title: 'Read Clipboard',
@@ -93,18 +112,7 @@ export const clipboardRead = tool('clipboard_read', {
         });
       }
       try {
-        const result = await svc.read(target, ctx);
-        const content =
-          result.format === 'image'
-            ? result.content.toString('base64')
-            : result.content.toString('utf8');
-        return {
-          format: result.format,
-          content,
-          ...(result.width !== undefined && { width: result.width }),
-          ...(result.height !== undefined && { height: result.height }),
-          byteSize: result.content.byteLength,
-        };
+        return toOutput(await svc.read(target, ctx), ctx);
       } catch (err) {
         if (isContentTooLarge(err)) {
           throw ctx.fail(
@@ -124,18 +132,7 @@ export const clipboardRead = tool('clipboard_read', {
 
     // Explicit format request
     try {
-      const result = await svc.read(input.format, ctx);
-      const content =
-        result.format === 'image'
-          ? result.content.toString('base64')
-          : result.content.toString('utf8');
-      return {
-        format: result.format,
-        content,
-        ...(result.width !== undefined && { width: result.width }),
-        ...(result.height !== undefined && { height: result.height }),
-        byteSize: result.content.byteLength,
-      };
+      return toOutput(await svc.read(input.format, ctx), ctx);
     } catch (err) {
       if (isContentTooLarge(err)) {
         throw ctx.fail(
@@ -174,11 +171,14 @@ export const clipboardRead = tool('clipboard_read', {
     if (result.height !== undefined) lines.push(`**Height:** ${result.height} px`);
 
     if (result.format === 'image') {
-      // Don't dump base64 blob into content[] — render metadata only; base64 data is in structuredContent
-      lines.push('*(Image data available in structuredContent.content)*');
+      // The bytes ride content[] as an image block instead of a base64 blob in text.
+      lines.push('*(Image bytes attached as an image block; base64 in structuredContent.content)*');
     } else {
       lines.push('');
-      lines.push(result.content);
+      // Fence the payload: clipboard bytes this tool did not author must not be
+      // able to control how content[] renders. The fence outgrows any backtick
+      // run in the payload, and the payload is emitted byte-for-byte.
+      lines.push(markdown().codeBlock(result.content).build());
     }
 
     return [{ type: 'text', text: lines.join('\n') }];
