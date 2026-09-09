@@ -173,14 +173,51 @@ export function stripHtmlTags(html: string): string {
   return decoded.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * A byte range for a bounded clipboard read: `[offset, offset + limit)`.
+ * Backends stream at most `limit` bytes into memory regardless of how large
+ * the underlying representation is.
+ */
+export interface ByteRange {
+  /** Maximum number of bytes to retain in the window. */
+  limit: number;
+  /** Byte offset into the representation to start the window at. */
+  offset: number;
+}
+
 /** Result of reading clipboard content. */
 export interface ReadResult {
-  /** Content bytes — text is UTF-8, image is PNG. */
+  /** The byte window `[range.offset, range.offset + range.limit)` of the representation. */
   content: Buffer;
   /** The format that was actually read. */
   format: ClipboardFormat;
   /** Image height in pixels (present only for image format). */
   height?: number;
+  /** Total byte size of the full representation, regardless of how much of it `content` holds. */
+  totalByteSize: number;
+  /** Image width in pixels (present only for image format). */
+  width?: number;
+}
+
+/**
+ * Result of `ClipboardService.read()` — a UTF-8-trimmed byte window plus
+ * continuation metadata for resuming a chunked read.
+ */
+export interface RangedReadResult {
+  /** Bytes returned by this call (`content.byteLength`). */
+  byteSize: number;
+  /** True once this call's window reaches the end of the representation. */
+  complete: boolean;
+  /** The trimmed byte window. */
+  content: Buffer;
+  /** The format that was actually read. */
+  format: ClipboardFormat;
+  /** Image height in pixels (present only for image format). */
+  height?: number;
+  /** Offset to pass to the next call. Absent once `complete` is true. */
+  nextOffset?: number;
+  /** Total byte size of the full representation. */
+  totalByteSize: number;
   /** Image width in pixels (present only for image format). */
   width?: number;
 }
@@ -231,10 +268,10 @@ export interface ClipboardBackend {
   inspect(): Promise<InspectResult>;
 
   /**
-   * Read clipboard content in the specified format.
+   * Read clipboard content in the specified format, bounded to `range`.
    * Throws if the format is not present — callers should inspect first if unsure.
    */
-  read(format: ClipboardFormat): Promise<ReadResult>;
+  read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult>;
 
   /**
    * Write content to the clipboard.

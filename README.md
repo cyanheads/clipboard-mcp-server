@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -41,7 +41,9 @@ Read the current clipboard contents in a requested format.
 - `rtf` returns raw RTF markup
 - `text` returns plain text
 - Size limits: 512 KB for text/HTML/RTF, 5 MB for images (raw bytes before base64 expansion)
+- Content above the size limit is retrieved in slices with `offset`/`limit` instead of erroring outright: pass both to read a bounded window (`limit` is at least 4 and clamped to the format's size limit) and follow the returned `nextOffset` until `complete` is `true`. Every response carries `totalByteSize` and `complete`; text/HTML/RTF slices never split a multi-byte UTF-8 sequence. Omitting both reads the whole payload as before, still bounded by the size limit
 - Returns a typed `format_unavailable` error when the requested format is not on the clipboard — use `clipboard_inspect` first to check availability
+- Returns a typed `content_too_large` error only when no `offset`/`limit` was given and the content exceeds the size limit; the recovery hint points at the slicing parameters above
 
 ---
 

@@ -14,8 +14,11 @@ import { REAL_PNG_13x7 } from './png-fixtures.js';
 
 const mockSpawn = vi.mocked(spawn);
 
+/** Full-representation range: what the service passes for an unranged read. */
+const FULL = { offset: 0, limit: 8 * 1024 * 1024 } as const;
+
 function fakeChild(opts: {
-  stdout?: string | Buffer;
+  stdout?: string | Buffer | Buffer[];
   stderr?: string;
   exitCode?: number;
   errorCode?: string;
@@ -32,12 +35,14 @@ function fakeChild(opts: {
       child.emit('error', Object.assign(new Error('spawn error'), { code: opts.errorCode }));
       return;
     }
-    if (opts.stdout)
-      stdoutEmitter.emit(
-        'data',
-        Buffer.isBuffer(opts.stdout) ? opts.stdout : Buffer.from(opts.stdout),
-      );
+    const chunks = Array.isArray(opts.stdout)
+      ? opts.stdout
+      : opts.stdout
+        ? [Buffer.isBuffer(opts.stdout) ? opts.stdout : Buffer.from(opts.stdout)]
+        : [];
+    for (const chunk of chunks) stdoutEmitter.emit('data', chunk);
     if (opts.stderr) stderrEmitter.emit('data', Buffer.from(opts.stderr));
+    stdoutEmitter.emit('end');
     child.emit('close', opts.exitCode ?? 0);
   });
 
@@ -180,7 +185,7 @@ describe('LinuxX11Backend', () => {
   describe('read()', () => {
     it('reads text via xclip with UTF8_STRING target', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'clipboard text' }));
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
       expect(result.format).toBe('text');
       expect(result.content.toString('utf8')).toBe('clipboard text');
       const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
@@ -192,7 +197,7 @@ describe('LinuxX11Backend', () => {
     it('keeps UTF8_STRING as the first text read target', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'primary text' }));
 
-      await backend.read('text');
+      await backend.read('text', FULL);
 
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       expect(mockSpawn).toHaveBeenCalledWith(
@@ -218,7 +223,7 @@ describe('LinuxX11Backend', () => {
         }
         mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${target} content` }));
 
-        const result = await backend.read('text');
+        const result = await backend.read('text', FULL);
 
         expect(result.content.toString('utf8')).toBe(`${target} content`);
         expect(mockSpawn.mock.calls.map(([, args]) => (args as string[]).at(-1))).toEqual(
@@ -229,14 +234,14 @@ describe('LinuxX11Backend', () => {
 
     it('reads html via xclip with text/html target', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '<html>test</html>' }));
-      const result = await backend.read('html');
+      const result = await backend.read('html', FULL);
       expect(result.format).toBe('html');
       expect(result.content.toString('utf8')).toContain('<html>');
     });
 
     it('reads image/png via xclip and reports its dimensions', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: REAL_PNG_13x7 }));
-      const result = await backend.read('image');
+      const result = await backend.read('image', FULL);
       expect(result.format).toBe('image');
       expect(result.content).toEqual(REAL_PNG_13x7);
       expect(result.width).toBe(13);
@@ -247,7 +252,7 @@ describe('LinuxX11Backend', () => {
       const truncated = REAL_PNG_13x7.subarray(0, 16);
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: truncated }));
 
-      const result = await backend.read('image');
+      const result = await backend.read('image', FULL);
 
       expect(result.content).toEqual(truncated);
       expect(result.width).toBeUndefined();
@@ -256,7 +261,7 @@ describe('LinuxX11Backend', () => {
 
     it('throws when html buffer is empty', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '' }));
-      await expect(backend.read('html')).rejects.toThrow(/not found/i);
+      await expect(backend.read('html', FULL)).rejects.toThrow(/not found/i);
     });
   });
 
@@ -308,7 +313,7 @@ describe('LinuxX11Backend', () => {
   describe('missing xclip detection', () => {
     it('throws informative error when xclip is not found', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ errorCode: 'ENOENT' }));
-      await expect(backend.read('text')).rejects.toThrow(/xclip not found/i);
+      await expect(backend.read('text', FULL)).rejects.toThrow(/xclip not found/i);
     });
   });
 
@@ -355,5 +360,50 @@ describe('LinuxX11Backend', () => {
         }
       },
     );
+  });
+});
+
+describe('LinuxX11Backend — streamed measurement and windows (#26, #7)', () => {
+  let backend: LinuxX11Backend;
+  beforeEach(() => {
+    backend = new LinuxX11Backend();
+    vi.clearAllMocks();
+  });
+
+  it('inspect() counts a representation delivered in many chunks without buffering it', async () => {
+    const chunks = Array.from({ length: 5 }, () => Buffer.alloc(1000, 'x'));
+    mockSpawn
+      .mockReturnValueOnce(fakeChild({ stdout: 'UTF8_STRING\n' }))
+      .mockReturnValueOnce(fakeChild({ stdout: chunks }));
+    const result = await backend.inspect();
+    expect(result.rawTypes).toEqual([{ type: 'UTF8_STRING', bytes: 5000 }]);
+  });
+
+  it('read() returns only the requested window across chunk boundaries, with the true total', async () => {
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({ stdout: [Buffer.from('01234'), Buffer.from('56789'), Buffer.from('ABCDE')] }),
+    );
+    const result = await backend.read('text', { offset: 3, limit: 8 });
+    expect(result.content.toString()).toBe('3456789A');
+    expect(result.totalByteSize).toBe(15);
+  });
+
+  it('read() image reports PNG dimensions only for a window starting at byte 0', async () => {
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from([0, 0, 0, 13]),
+      Buffer.from('IHDR'),
+      Buffer.from([0, 0, 0, 16, 0, 0, 0, 8]),
+      Buffer.alloc(20, 1),
+    ]);
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: [png.subarray(0, 10), png.subarray(10)] }));
+    const head = await backend.read('image', { offset: 0, limit: 24 });
+    expect(head).toMatchObject({ width: 16, height: 8, totalByteSize: png.byteLength });
+    expect(head.content.byteLength).toBe(24);
+
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: png }));
+    const tail = await backend.read('image', { offset: 24, limit: 100 });
+    expect(tail.width).toBeUndefined();
+    expect(tail.content.equals(png.subarray(24))).toBe(true);
   });
 });

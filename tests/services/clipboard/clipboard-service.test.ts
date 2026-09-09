@@ -48,7 +48,11 @@ function fakeBackend(opts: { read?: ReadResult | Error; write: WriteResult }): C
   const read =
     opts.read instanceof Error
       ? vi.fn().mockRejectedValue(opts.read)
-      : vi.fn().mockResolvedValue(opts.read);
+      : vi
+          .fn()
+          .mockResolvedValue(
+            opts.read && { totalByteSize: opts.read.content.byteLength, ...opts.read },
+          );
   return {
     clear: vi.fn().mockResolvedValue(undefined),
     inspect: vi.fn(),
@@ -249,7 +253,10 @@ describe('ClipboardService.write — prior contents capture (#28)', () => {
     const result = await svc.write('new', 'text', createMockContext());
 
     expect(result).toEqual({ format: 'text', byteSize: 3, previousContent: 'the old note' });
-    expect(backend.read).toHaveBeenCalledWith('text');
+    expect(backend.read).toHaveBeenCalledWith('text', {
+      offset: 0,
+      limit: SIZE_LIMITS.READ_TEXT + 1,
+    });
   });
 
   it('reads the prior contents before overwriting them', async () => {
@@ -456,5 +463,130 @@ describe('ClipboardService.clear (#24)', () => {
     const svc = new ClipboardService(backend);
 
     await expect(svc.clear(createMockContext())).rejects.toThrow('xsel exited 1');
+  });
+});
+
+describe('ClipboardService.read — bounded ranged reads (#7)', () => {
+  /** A backend that honors the range the way the real ones do: slice + true total. */
+  function slicingBackend(full: Buffer, format: 'text' | 'image' = 'text') {
+    const read = vi
+      .fn()
+      .mockImplementation(async (_format: string, range: { offset: number; limit: number }) => ({
+        format,
+        content: full.subarray(range.offset, range.offset + range.limit),
+        totalByteSize: full.byteLength,
+      }));
+    return {
+      backend: {
+        clear: vi.fn(),
+        inspect: vi.fn(),
+        read,
+        write: vi.fn(),
+      } as unknown as ClipboardBackend,
+      read,
+    };
+  }
+
+  it('unranged: requests limit + 1 bytes and throws content_too_large from the total, not the buffer', async () => {
+    const { backend, read } = slicingBackend(Buffer.alloc(SIZE_LIMITS.READ_TEXT + 10, 'a'));
+    const svc = new ClipboardService(backend);
+
+    await expect(svc.read('text', createMockContext())).rejects.toMatchObject({
+      _contentTooLarge: true,
+      bytes: SIZE_LIMITS.READ_TEXT + 10,
+      limit: SIZE_LIMITS.READ_TEXT,
+    });
+    expect(read).toHaveBeenCalledWith('text', { offset: 0, limit: SIZE_LIMITS.READ_TEXT + 1 });
+  });
+
+  it('unranged: content within the limit is one complete slice', async () => {
+    const { backend } = slicingBackend(Buffer.from('hello world'));
+    const result = await new ClipboardService(backend).read('text', createMockContext());
+    expect(result).toEqual({
+      format: 'text',
+      content: Buffer.from('hello world'),
+      byteSize: 11,
+      totalByteSize: 11,
+      complete: true,
+    });
+  });
+
+  it('ranged: first, middle, and exact-boundary final slices carry continuation metadata', async () => {
+    const full = Buffer.from('0123456789ABCDEFGHIJ'); // 20 bytes
+    const svc = new ClipboardService(slicingBackend(full).backend);
+    const ctx = createMockContext();
+
+    const first = await svc.read('text', ctx, { offset: 0, limit: 8 });
+    expect(first.content.toString()).toBe('01234567');
+    expect(first).toMatchObject({ byteSize: 8, totalByteSize: 20, complete: false, nextOffset: 8 });
+
+    const middle = await svc.read('text', ctx, { offset: first.nextOffset ?? 0, limit: 8 });
+    expect(middle.content.toString()).toBe('89ABCDEF');
+    expect(middle).toMatchObject({ complete: false, nextOffset: 16 });
+
+    const last = await svc.read('text', ctx, { offset: middle.nextOffset ?? 0, limit: 4 });
+    expect(last.content.toString()).toBe('GHIJ');
+    expect(last.complete).toBe(true);
+    expect(last).not.toHaveProperty('nextOffset');
+  });
+
+  it('ranged: an offset at or past the end is an empty, complete slice with the real total', async () => {
+    const svc = new ClipboardService(slicingBackend(Buffer.from('abc')).backend);
+    for (const offset of [3, 999]) {
+      const result = await svc.read('text', createMockContext(), { offset, limit: 8 });
+      expect(result).toEqual({
+        format: 'text',
+        content: Buffer.alloc(0),
+        byteSize: 0,
+        totalByteSize: 3,
+        complete: true,
+      });
+    }
+  });
+
+  it('ranged: never splits a UTF-8 sequence and reassembles byte-identically', async () => {
+    const original = Buffer.from('aé😀b', 'utf8'); // 1 + 2 + 4 + 1 = 8 bytes
+    const svc = new ClipboardService(slicingBackend(original).backend);
+    const ctx = createMockContext();
+    const pieces: Buffer[] = [];
+    const offsets: number[] = [];
+    let offset = 0;
+    for (;;) {
+      const slice = await svc.read('text', ctx, { offset, limit: 4 });
+      expect(slice.content.toString('utf8')).not.toContain('�');
+      pieces.push(slice.content);
+      offsets.push(offset);
+      if (slice.complete) break;
+      expect(slice.nextOffset).toBeGreaterThan(offset);
+      offset = slice.nextOffset ?? offset;
+    }
+    // 'aé' | '😀' | 'b' — the 4-byte emoji is held back from the first window.
+    expect(offsets).toEqual([0, 3, 7]);
+    expect(Buffer.concat(pieces).equals(original)).toBe(true);
+  });
+
+  it('ranged: never throws content_too_large and clamps limit to the format size limit', async () => {
+    const { backend, read } = slicingBackend(Buffer.alloc(SIZE_LIMITS.READ_TEXT + 10, 'a'));
+    const svc = new ClipboardService(backend);
+    const result = await svc.read('text', createMockContext(), {
+      offset: 0,
+      limit: Number.MAX_SAFE_INTEGER,
+    });
+    expect(read).toHaveBeenCalledWith('text', { offset: 0, limit: SIZE_LIMITS.READ_TEXT });
+    expect(result.byteSize).toBe(SIZE_LIMITS.READ_TEXT);
+    expect(result).toMatchObject({
+      totalByteSize: SIZE_LIMITS.READ_TEXT + 10,
+      complete: false,
+      nextOffset: SIZE_LIMITS.READ_TEXT,
+    });
+  });
+
+  it('ranged image: bytes are sliced raw, never trimmed as UTF-8', async () => {
+    // 0x80-0xBF look like UTF-8 continuation bytes; an image window must keep them.
+    const full = Buffer.from([0x89, 0x50, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85]);
+    const svc = new ClipboardService(slicingBackend(full, 'image').backend);
+    const slice = await svc.read('image', createMockContext(), { offset: 2, limit: 4 });
+    expect([...slice.content]).toEqual([0x80, 0x81, 0x82, 0x83]);
+    expect(slice).toMatchObject({ byteSize: 4, totalByteSize: 8, complete: false, nextOffset: 6 });
   });
 });

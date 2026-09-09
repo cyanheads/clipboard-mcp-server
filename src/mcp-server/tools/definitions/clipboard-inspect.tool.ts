@@ -44,7 +44,8 @@ export const clipboardInspect = tool('clipboard_inspect', {
               .optional()
               .describe(
                 'Size of this representation in bytes. ' +
-                  'On Linux, sizes are measured by reading each format — may add latency for large items. ' +
+                  "On Linux, sizes are measured by streaming and counting each format's bytes without retaining them — " +
+                  'may still add latency for large items, but never buffers the full payload. ' +
                   'Absent when measurementFailed is true; 0 means a genuinely empty representation.',
               ),
             measurementFailed: z

@@ -4,7 +4,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import { assertByteRange } from './byte-window.js';
 import type {
+  ByteRange,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
@@ -69,8 +71,32 @@ if ($data) {
 $result | ConvertTo-Json -Compress
 `;
 
-/** Static PowerShell script to read plain text. */
-const PS_READ_TEXT = `
+/**
+ * Clamp-and-slice snippet shared by every ranged PowerShell read script,
+ * given a `[byte[]]`-valued `$bytesVar` already holding the full
+ * representation. Emits the `{ present, total, contentBase64 }` envelope
+ * every ranged read returns; `extraFields` appends more hashtable entries
+ * (e.g. `; width = $w; height = $h`) before the closing brace.
+ */
+function psSliceSnippet(bytesVar: string, range: ByteRange, extraFields = ''): string {
+  return `
+$total = ${bytesVar}.Length
+$offset = ${range.offset}
+$limit = ${range.limit}
+$sliceLen = [Math]::Max(0, [Math]::Min($limit, $total - $offset))
+if ($sliceLen -gt 0) {
+  [byte[]]$slice = ${bytesVar}[$offset..($offset + $sliceLen - 1)]
+} else {
+  [byte[]]$slice = @()
+}
+[PSCustomObject]@{ present = $true; total = $total; contentBase64 = [Convert]::ToBase64String($slice)${extraFields} } | ConvertTo-Json -Compress
+`;
+}
+
+/** PowerShell script builder to read plain text, bounded to `range`. */
+function buildPsReadText(range: ByteRange): string {
+  assertByteRange(range);
+  return `
 Add-Type -AssemblyName System.Windows.Forms
 $data = [System.Windows.Forms.Clipboard]::GetDataObject()
 $selectedFormat = $null
@@ -91,7 +117,7 @@ if ($selectedFormat) {
   $text = $data.GetData($selectedFormat, $false)
   if ($text -is [string]) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
-    [PSCustomObject]@{ present = $true; contentBase64 = [Convert]::ToBase64String($bytes) } | ConvertTo-Json -Compress
+    ${psSliceSnippet('$bytes', range)}
   } else {
     [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress
   }
@@ -99,9 +125,12 @@ if ($selectedFormat) {
   [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress
 }
 `;
+}
 
-/** Static PowerShell script to read HTML from clipboard. */
-const PS_READ_HTML = `
+/** PowerShell script builder to read HTML from the clipboard, bounded to `range`. */
+function buildPsReadHtml(range: ByteRange): string {
+  assertByteRange(range);
+  return `
 Add-Type -AssemblyName System.Windows.Forms
 $data = [System.Windows.Forms.Clipboard]::GetDataObject()
 if ($data -and $data.GetDataPresent('HTML Format')) {
@@ -112,26 +141,37 @@ if ($data -and $data.GetDataPresent('HTML Format')) {
     if ($startIdx -eq -1) { $startIdx = $html.IndexOf('<HTML') }
     if ($startIdx -ge 0) { $html = $html.Substring($startIdx) }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($html)
-    [PSCustomObject]@{ present = $true; contentBase64 = [Convert]::ToBase64String($bytes) } | ConvertTo-Json -Compress
+    ${psSliceSnippet('$bytes', range)}
   } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 `;
+}
 
-/** Static PowerShell script to read RTF from clipboard. */
-const PS_READ_RTF = `
+/** PowerShell script builder to read RTF from the clipboard, bounded to `range`. */
+function buildPsReadRtf(range: ByteRange): string {
+  assertByteRange(range);
+  return `
 Add-Type -AssemblyName System.Windows.Forms
 $data = [System.Windows.Forms.Clipboard]::GetDataObject()
 if ($data -and $data.GetDataPresent([System.Windows.Forms.DataFormats]::Rtf)) {
   $rtf = $data.GetData([System.Windows.Forms.DataFormats]::Rtf)
   if ($rtf -is [string]) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($rtf)
-    [PSCustomObject]@{ present = $true; contentBase64 = [Convert]::ToBase64String($bytes) } | ConvertTo-Json -Compress
+    ${psSliceSnippet('$bytes', range)}
   } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 `;
+}
 
-/** Static PowerShell script to read image from clipboard as base64-encoded PNG. */
-const PS_READ_IMAGE = `
+/**
+ * PowerShell script builder to read an image from the clipboard as
+ * base64-encoded PNG, bounded to `range`. Width/height are captured from the
+ * live `Image` object before it is disposed — always reported when an image
+ * is present, regardless of `range`.
+ */
+function buildPsReadImage(range: ByteRange): string {
+  assertByteRange(range);
+  return `
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $img = [System.Windows.Forms.Clipboard]::GetImage()
@@ -143,10 +183,10 @@ if ($img) {
   $bytes = $ms.ToArray()
   $ms.Dispose()
   $img.Dispose()
-  $b64 = [Convert]::ToBase64String($bytes)
-  ConvertTo-Json @{ base64 = $b64; width = $w; height = $h } -Compress
-} else { 'null' }
+  ${psSliceSnippet('$bytes', range, '; width = $w; height = $h')}
+} else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 `;
+}
 
 /**
  * Static PowerShell script that empties the clipboard.
@@ -158,23 +198,35 @@ Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.Clipboard]::Clear()
 `;
 
-interface StringReadEnvelope {
+/** Envelope every ranged PowerShell read script prints (see `psSliceSnippet`). */
+interface RangedReadEnvelope {
   contentBase64?: string;
+  height?: number;
   present: boolean;
+  total?: number;
+  width?: number;
 }
 
-/** Decode a JSON/base64 PowerShell string response without altering its content. */
-function decodeStringRead(buf: Buffer, formatName: string): Buffer {
+/** Decode a ranged JSON/base64 PowerShell read response without altering its content. */
+function decodeRangedRead(
+  buf: Buffer,
+  formatName: string,
+): { contentBase64: string; height?: number; total: number; width?: number } {
   const raw = buf.toString('utf8').trim();
-  const parsed = JSON.parse(raw) as StringReadEnvelope | null;
+  const parsed = JSON.parse(raw) as RangedReadEnvelope | null;
   if (!parsed || typeof parsed.present !== 'boolean') {
     throw new Error(`Invalid PowerShell response while reading ${formatName}`);
   }
   if (!parsed.present) throw new Error(`${formatName} format not found on clipboard`);
-  if (typeof parsed.contentBase64 !== 'string') {
+  if (typeof parsed.total !== 'number' || typeof parsed.contentBase64 !== 'string') {
     throw new Error(`Invalid PowerShell response while reading ${formatName}`);
   }
-  return Buffer.from(parsed.contentBase64, 'base64');
+  return {
+    total: parsed.total,
+    contentBase64: parsed.contentBase64,
+    ...(parsed.width !== undefined && { width: parsed.width }),
+    ...(parsed.height !== undefined && { height: parsed.height }),
+  };
 }
 
 /**
@@ -241,27 +293,45 @@ export class WindowsBackend implements ClipboardBackend {
     return { rawTypes, ...buildInspectFormats(semanticSet) };
   }
 
-  async read(format: ClipboardFormat): Promise<ReadResult> {
+  async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
     switch (format) {
       case 'text': {
-        const buf = await runPowershell(PS_READ_TEXT);
-        return { format: 'text', content: decodeStringRead(buf, 'Text') };
+        const buf = await runPowershell(buildPsReadText(range));
+        const { total, contentBase64 } = decodeRangedRead(buf, 'Text');
+        return {
+          format: 'text',
+          content: Buffer.from(contentBase64, 'base64'),
+          totalByteSize: total,
+        };
       }
       case 'html': {
-        const buf = await runPowershell(PS_READ_HTML);
-        return { format: 'html', content: decodeStringRead(buf, 'HTML') };
+        const buf = await runPowershell(buildPsReadHtml(range));
+        const { total, contentBase64 } = decodeRangedRead(buf, 'HTML');
+        return {
+          format: 'html',
+          content: Buffer.from(contentBase64, 'base64'),
+          totalByteSize: total,
+        };
       }
       case 'rtf': {
-        const buf = await runPowershell(PS_READ_RTF);
-        return { format: 'rtf', content: decodeStringRead(buf, 'RTF') };
+        const buf = await runPowershell(buildPsReadRtf(range));
+        const { total, contentBase64 } = decodeRangedRead(buf, 'RTF');
+        return {
+          format: 'rtf',
+          content: Buffer.from(contentBase64, 'base64'),
+          totalByteSize: total,
+        };
       }
       case 'image': {
-        const buf = await runPowershell(PS_READ_IMAGE);
-        const text = buf.toString('utf8').trim();
-        if (text === 'null' || text === '') throw new Error('Image format not found on clipboard');
-        const parsed = JSON.parse(text) as { base64: string; width: number; height: number };
-        const content = Buffer.from(parsed.base64, 'base64');
-        return { format: 'image', content, width: parsed.width, height: parsed.height };
+        const buf = await runPowershell(buildPsReadImage(range));
+        const { total, contentBase64, width, height } = decodeRangedRead(buf, 'Image');
+        return {
+          format: 'image',
+          content: Buffer.from(contentBase64, 'base64'),
+          totalByteSize: total,
+          ...(width !== undefined && { width }),
+          ...(height !== undefined && { height }),
+        };
       }
     }
   }

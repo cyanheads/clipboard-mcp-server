@@ -4,8 +4,11 @@
  */
 
 import { spawn } from 'node:child_process';
+import type { Readable } from 'node:stream';
+import { collectByteWindow, countBytes } from './byte-window.js';
 import { readPngDimensions } from './png-dimensions.js';
 import type {
+  ByteRange,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
@@ -62,6 +65,66 @@ function runWlPaste(args: string[]): Promise<Buffer> {
       }
     });
   });
+}
+
+/**
+ * Run wl-paste with `args`, streaming its stdout through `consume` instead of
+ * buffering it. `emptyResult` is what a "nothing is copied" non-zero exit
+ * resolves to — the empty-clipboard case, not a failure.
+ */
+function runWlPasteStream<T>(
+  args: string[],
+  consume: (stdout: Readable) => Promise<T>,
+  emptyResult: T,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('wl-paste', args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    const resultPromise = consume(child.stdout as Readable);
+    const err: Buffer[] = [];
+    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
+    child.on('close', (code) => {
+      resultPromise.then((result) => {
+        if (code === 0) {
+          resolve(result);
+          return;
+        }
+        const msg = Buffer.concat(err).toString('utf8').trim();
+        if (msg.includes('nothing is copied')) {
+          resolve(emptyResult);
+        } else {
+          reject(new Error(`wl-paste exited ${code}: ${msg}`));
+        }
+      }, reject);
+    });
+    child.on('error', (error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        reject(new Error('wl-paste not found — install with: apt install wl-clipboard'));
+      } else {
+        reject(error);
+      }
+    });
+  });
+}
+
+/**
+ * Run wl-paste and return the `[range.offset, range.offset + range.limit)`
+ * byte window plus the stream's total size — wl-paste has no native range
+ * support, so this streams stdout through `collectByteWindow` rather than
+ * buffering the whole representation before slicing.
+ */
+function runWlPasteWindow(
+  args: string[],
+  range: ByteRange,
+): Promise<{ totalByteSize: number; window: Buffer }> {
+  return runWlPasteStream(args, (stdout) => collectByteWindow(stdout, range), {
+    totalByteSize: 0,
+    window: Buffer.alloc(0),
+  });
+}
+
+/** Run wl-paste and count its stdout bytes without retaining any of them. */
+function runWlPasteCount(args: string[]): Promise<number> {
+  return runWlPasteStream(args, (stdout) => countBytes(stdout), 0);
 }
 
 /**
@@ -145,8 +208,10 @@ export class LinuxWaylandBackend implements ClipboardBackend {
         mime === 'image/png'
       ) {
         try {
-          const data = await runWlPaste(['-t', mime]);
-          rawTypes.push({ type: mime, bytes: data.byteLength });
+          // Stream and count — clipboard_inspect is metadata-only, so the
+          // representation is never retained just to report its size (#26).
+          const bytes = await runWlPasteCount(['-t', mime]);
+          rawTypes.push({ type: mime, bytes });
         } catch {
           // --list-types advertised this MIME type but reading it failed —
           // report the measurement as failed, not as a zero-byte payload.
@@ -160,14 +225,14 @@ export class LinuxWaylandBackend implements ClipboardBackend {
     return { rawTypes, ...buildInspectFormats(semanticSet) };
   }
 
-  async read(format: ClipboardFormat): Promise<ReadResult> {
+  async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
     switch (format) {
       case 'text': {
         let lastError: unknown;
         for (const mime of TEXT_MIME_TYPES) {
           try {
-            const content = await runWlPaste(['-t', mime]);
-            return { format: 'text', content };
+            const { window, totalByteSize } = await runWlPasteWindow(['-t', mime], range);
+            return { format: 'text', content: window, totalByteSize };
           } catch (error) {
             if (error instanceof Error && error.message.startsWith('wl-paste not found'))
               throw error;
@@ -177,26 +242,32 @@ export class LinuxWaylandBackend implements ClipboardBackend {
         throw lastError;
       }
       case 'html': {
-        const buf = await runWlPaste(['-t', 'text/html']);
-        if (buf.byteLength === 0) throw new Error('HTML format not found on clipboard');
-        return { format: 'html', content: buf };
+        const { window, totalByteSize } = await runWlPasteWindow(['-t', 'text/html'], range);
+        if (totalByteSize === 0) throw new Error('HTML format not found on clipboard');
+        return { format: 'html', content: window, totalByteSize };
       }
       case 'rtf': {
-        let buf: Buffer;
+        let result: { totalByteSize: number; window: Buffer };
         try {
-          buf = await runWlPaste(['-t', 'text/rtf']);
+          result = await runWlPasteWindow(['-t', 'text/rtf'], range);
         } catch {
-          buf = await runWlPaste(['-t', 'application/rtf']);
+          result = await runWlPasteWindow(['-t', 'application/rtf'], range);
         }
-        if (buf.byteLength === 0) throw new Error('RTF format not found on clipboard');
-        return { format: 'rtf', content: buf };
+        if (result.totalByteSize === 0) throw new Error('RTF format not found on clipboard');
+        return { format: 'rtf', content: result.window, totalByteSize: result.totalByteSize };
       }
       case 'image': {
-        const buf = await runWlPaste(['-t', 'image/png']);
-        if (buf.byteLength === 0) throw new Error('Image format not found on clipboard');
+        const { window, totalByteSize } = await runWlPasteWindow(['-t', 'image/png'], range);
+        if (totalByteSize === 0) throw new Error('Image format not found on clipboard');
         // wl-paste hands over opaque bytes with no dimension API — read them out
         // of the PNG header so Linux reads carry what macOS and Windows report.
-        return { format: 'image', content: buf, ...readPngDimensions(buf) };
+        // The header only lives in the window when the window starts at byte 0.
+        return {
+          format: 'image',
+          content: window,
+          totalByteSize,
+          ...(range.offset === 0 ? readPngDimensions(window) : {}),
+        };
       }
     }
   }

@@ -13,10 +13,26 @@ import { WindowsBackend } from '@/services/clipboard/windows-backend.js';
 
 const mockSpawn = vi.mocked(spawn);
 
+/** Full-representation range: what the service passes for an unranged read. */
+const FULL = { offset: 0, limit: 8 * 1024 * 1024 } as const;
+
 function stringEnvelope(content: string): string {
+  const bytes = Buffer.from(content, 'utf8');
   return JSON.stringify({
     present: true,
-    contentBase64: Buffer.from(content, 'utf8').toString('base64'),
+    total: bytes.byteLength,
+    contentBase64: bytes.toString('base64'),
+  });
+}
+
+/** The ranged-read envelope the image script prints for a present image, whole. */
+function imageEnvelope(bytes: Buffer, width: number, height: number): string {
+  return JSON.stringify({
+    present: true,
+    total: bytes.byteLength,
+    contentBase64: bytes.toString('base64'),
+    width,
+    height,
   });
 }
 
@@ -44,6 +60,7 @@ function fakeChild(opts: {
         Buffer.isBuffer(opts.stdout) ? opts.stdout : Buffer.from(opts.stdout),
       );
     if (opts.stderr) stderrEmitter.emit('data', Buffer.from(opts.stderr ?? ''));
+    stdoutEmitter.emit('end');
     child.emit('close', opts.exitCode ?? 0);
   });
 
@@ -131,7 +148,7 @@ describe('WindowsBackend', () => {
   describe('read() text', () => {
     it('reads text via PowerShell Get-Text', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('clipboard contents') }));
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
       expect(result.format).toBe('text');
       expect(result.content.toString('utf8')).toBe('clipboard contents');
       const [cmd] = mockSpawn.mock.calls[0] as [string];
@@ -140,14 +157,14 @@ describe('WindowsBackend', () => {
 
     it('throws when the text representation is absent', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
-      await expect(backend.read('text')).rejects.toThrow(/not found/i);
+      await expect(backend.read('text', FULL)).rejects.toThrow(/not found/i);
     });
 
     it('preserves leading and trailing whitespace and embedded newlines exactly', async () => {
       const text = '  padded text\r\nsecond line\n';
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${stringEnvelope(text)}\r\n` }));
 
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
 
       expect(result.content.toString('utf8')).toBe(text);
     });
@@ -155,9 +172,9 @@ describe('WindowsBackend', () => {
     it('returns an empty buffer when an empty text representation is present', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('') }));
 
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
 
-      expect(result).toEqual({ format: 'text', content: Buffer.alloc(0) });
+      expect(result).toEqual({ format: 'text', content: Buffer.alloc(0), totalByteSize: 0 });
     });
   });
 
@@ -166,7 +183,7 @@ describe('WindowsBackend', () => {
       mockSpawn.mockReturnValueOnce(
         fakeChild({ stdout: stringEnvelope('<html><body>test</body></html>') }),
       );
-      const result = await backend.read('html');
+      const result = await backend.read('html', FULL);
       expect(result.format).toBe('html');
       expect(result.content.toString('utf8')).toContain('<html>');
     });
@@ -175,7 +192,7 @@ describe('WindowsBackend', () => {
       const html = '  <div>first line</div>\r\n<div>second line</div>  \n';
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope(html) }));
 
-      const result = await backend.read('html');
+      const result = await backend.read('html', FULL);
 
       expect(result.content.toString('utf8')).toBe(html);
     });
@@ -186,7 +203,7 @@ describe('WindowsBackend', () => {
       const rtf = '  {\\rtf1\r\n padded }  \n';
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope(rtf) }));
 
-      const result = await backend.read('rtf');
+      const result = await backend.read('rtf', FULL);
 
       expect(result.content.toString('utf8')).toBe(rtf);
     });
@@ -195,13 +212,9 @@ describe('WindowsBackend', () => {
   describe('read() image', () => {
     it('reads image as base64 PNG with dimensions', async () => {
       const pngData = Buffer.from('fakepngdata');
-      const psResult = JSON.stringify({
-        base64: pngData.toString('base64'),
-        width: 800,
-        height: 600,
-      });
+      const psResult = imageEnvelope(pngData, 800, 600);
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: psResult }));
-      const result = await backend.read('image');
+      const result = await backend.read('image', FULL);
       expect(result.format).toBe('image');
       expect(result.width).toBe(800);
       expect(result.height).toBe(600);
@@ -212,15 +225,11 @@ describe('WindowsBackend', () => {
       const pngData = Buffer.from('fakepngdata');
       mockSpawn.mockReturnValueOnce(
         fakeChild({
-          stdout: JSON.stringify({
-            base64: pngData.toString('base64'),
-            width: 800,
-            height: 600,
-          }),
+          stdout: imageEnvelope(pngData, 800, 600),
         }),
       );
 
-      await backend.read('image');
+      await backend.read('image', FULL);
 
       const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
       const script = args.at(-1) ?? '';
@@ -289,7 +298,7 @@ describe('WindowsBackend', () => {
   describe('missing PowerShell detection', () => {
     it('throws when powershell.exe not found', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ errorCode: 'ENOENT' }));
-      await expect(backend.read('text')).rejects.toThrow(/powershell/i);
+      await expect(backend.read('text', FULL)).rejects.toThrow(/powershell/i);
     });
   });
 
@@ -346,4 +355,49 @@ describe('WindowsBackend write() html — numeric entity fallback (#25)', () => 
       expect(script).toContain(JSON.stringify(Buffer.from(expected, 'utf8').toString('base64')));
     },
   );
+});
+
+describe('WindowsBackend — ranged helper scripts (#7)', () => {
+  let backend: WindowsBackend;
+  beforeEach(() => {
+    backend = new WindowsBackend();
+    vi.clearAllMocks();
+  });
+
+  it('interpolates offset and limit into every PowerShell read script', async () => {
+    for (const format of ['text', 'html', 'rtf', 'image'] as const) {
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: imageEnvelope(Buffer.from('payload'), 1, 1) }),
+      );
+      await backend.read(format, { offset: 5, limit: 7 });
+      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+      const script = args.at(-1) ?? '';
+      expect(script).toContain('$offset = 5');
+      expect(script).toContain('$limit = 7');
+      expect(script).toContain('total = $total');
+    }
+  });
+
+  it('refuses to build a script from an unsafe range', async () => {
+    await expect(backend.read('text', { offset: 1.5, limit: 4 })).rejects.toThrow(
+      /Invalid read range offset/,
+    );
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it('decodes the windowed envelope and its total', async () => {
+    const full = Buffer.from('0123456789');
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({
+        stdout: JSON.stringify({
+          present: true,
+          total: full.byteLength,
+          contentBase64: full.subarray(2, 6).toString('base64'),
+        }),
+      }),
+    );
+    const result = await backend.read('text', { offset: 2, limit: 4 });
+    expect(result.content.toString()).toBe('2345');
+    expect(result.totalByteSize).toBe(10);
+  });
 });

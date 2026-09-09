@@ -16,6 +16,19 @@ import { MacosBackend } from '@/services/clipboard/macos-backend.js';
 
 const mockSpawn = vi.mocked(spawn);
 
+/** Full-representation range: what the service passes for an unranged read. */
+const FULL = { offset: 0, limit: 8 * 1024 * 1024 } as const;
+
+/** The ranged-read envelope a JXA read script prints for a present representation, whole. */
+function jxaEnvelope(bytes: Buffer, extra: Record<string, number> = {}): string {
+  return JSON.stringify({
+    present: true,
+    total: bytes.byteLength,
+    contentBase64: bytes.toString('base64'),
+    ...extra,
+  });
+}
+
 /** Create a fake child process that emits given stdout/stderr and closes with code. */
 function fakeChild(opts: {
   stdout?: string | Buffer;
@@ -43,6 +56,7 @@ function fakeChild(opts: {
         Buffer.isBuffer(opts.stdout) ? opts.stdout : Buffer.from(opts.stdout),
       );
     if (opts.stderr) stderrEmitter.emit('data', Buffer.from(opts.stderr));
+    stdoutEmitter.emit('end');
     child.emit('close', opts.exitCode ?? 0);
   });
 
@@ -169,7 +183,7 @@ describe('MacosBackend', () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: types }));
       // pbpaste returns the text content
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'hello world' }));
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
       expect(result.format).toBe('text');
       expect(result.content.toString('utf8')).toBe('hello world');
       // Verify pbpaste was called second (not osascript for the actual read)
@@ -185,36 +199,34 @@ describe('MacosBackend', () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: types }));
       // pbpaste returns content
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: Buffer.from(text, 'utf8') }));
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
       expect(result.content.toString('utf8')).toBe(text);
     });
   });
 
   describe('read() html', () => {
     it('reads HTML via osascript JXA', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '<html><body><b>bold</b></body></html>' }));
-      const result = await backend.read('html');
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: jxaEnvelope(Buffer.from('<html><body><b>bold</b></body></html>')) }),
+      );
+      const result = await backend.read('html', FULL);
       expect(result.format).toBe('html');
       expect(result.content.toString('utf8')).toContain('<html>');
       expect(mockSpawn).toHaveBeenCalledWith('osascript', expect.any(Array), expect.any(Object));
     });
 
     it('throws when HTML not present (osascript returns null)', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'null' }));
-      await expect(backend.read('html')).rejects.toThrow(/not found/i);
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
+      await expect(backend.read('html', FULL)).rejects.toThrow(/not found/i);
     });
   });
 
   describe('read() image', () => {
     it('reads image and returns PNG base64 with dimensions', async () => {
       const pngData = Buffer.from('fakepngdata');
-      const jxaResult = JSON.stringify({
-        base64: pngData.toString('base64'),
-        width: 1920,
-        height: 1080,
-      });
+      const jxaResult = jxaEnvelope(pngData, { width: 1920, height: 1080 });
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaResult }));
-      const result = await backend.read('image');
+      const result = await backend.read('image', FULL);
       expect(result.format).toBe('image');
       expect(result.width).toBe(1920);
       expect(result.height).toBe(1080);
@@ -222,36 +234,33 @@ describe('MacosBackend', () => {
     });
 
     it('throws when image not present', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'null' }));
-      await expect(backend.read('image')).rejects.toThrow(/not found/i);
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
+      await expect(backend.read('image', FULL)).rejects.toThrow(/not found/i);
     });
   });
 
   describe('read() rtf', () => {
     it('reads RTF via osascript JXA', async () => {
       const rtfContent = '{\\rtf1 Hello}';
-      const jxaResult = JSON.stringify({ type: 'string', value: rtfContent });
+      const jxaResult = jxaEnvelope(Buffer.from(rtfContent));
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaResult }));
-      const result = await backend.read('rtf');
+      const result = await backend.read('rtf', FULL);
       expect(result.format).toBe('rtf');
       expect(result.content.toString('utf8')).toBe(rtfContent);
     });
 
     it('reads RTF via base64 encoding', async () => {
       const rtfContent = '{\\rtf1 Hello}';
-      const jxaResult = JSON.stringify({
-        type: 'base64',
-        value: Buffer.from(rtfContent).toString('base64'),
-      });
+      const jxaResult = jxaEnvelope(Buffer.from(rtfContent));
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaResult }));
-      const result = await backend.read('rtf');
+      const result = await backend.read('rtf', FULL);
       expect(result.content.toString('utf8')).toBe(rtfContent);
     });
 
     it('throws when RTF not present (osascript returns null)', async () => {
       // JXA returns 'null' string when public.rtf and com.apple.flat-rtfd are absent
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'null' }));
-      await expect(backend.read('rtf')).rejects.toThrow(/not found/i);
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
+      await expect(backend.read('rtf', FULL)).rejects.toThrow(/not found/i);
     });
   });
 
@@ -260,7 +269,7 @@ describe('MacosBackend', () => {
       // inspect returns empty → text not in availableFormats → should throw
       const emptyInspect = JSON.stringify([]);
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: emptyInspect }));
-      await expect(backend.read('text')).rejects.toThrow(/not found/i);
+      await expect(backend.read('text', FULL)).rejects.toThrow(/not found/i);
     });
 
     it('returns empty buffer when text type is present but content is empty', async () => {
@@ -269,7 +278,7 @@ describe('MacosBackend', () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: types }));
       // pbpaste: returns empty string
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '' }));
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
       expect(result.format).toBe('text');
       expect(result.content.toString('utf8')).toBe('');
     });
@@ -407,6 +416,79 @@ describe('MacosBackend', () => {
         // The literal injection payload must not appear in the JXA script source
         expect(script).not.toContain(payload.slice(0, 10));
       },
+    );
+  });
+});
+
+describe('MacosBackend — ranged helper scripts (#7)', () => {
+  let backend: MacosBackend;
+  beforeEach(() => {
+    backend = new MacosBackend();
+    vi.clearAllMocks();
+  });
+
+  it('interpolates offset and limit into the JXA read scripts as literal integers', async () => {
+    for (const format of ['html', 'rtf', 'image'] as const) {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('payload')) }));
+      await backend.read(format, { offset: 5, limit: 7 });
+      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+      const script = args.at(-1) ?? '';
+      expect(script).toContain('const offset = 5;');
+      expect(script).toContain('Math.min(7, total - offset)');
+      expect(script).toContain('subdataWithRange');
+    }
+  });
+
+  it('refuses to build a script from an unsafe range', async () => {
+    await expect(backend.read('html', { offset: -1, limit: 4 })).rejects.toThrow(
+      /Invalid read range offset/,
+    );
+    await expect(backend.read('html', { offset: 0, limit: Number.NaN })).rejects.toThrow(
+      /Invalid read range limit/,
+    );
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it('pbpaste text reads stream the window and report the total', async () => {
+    mockSpawn
+      .mockReturnValueOnce(
+        fakeChild({ stdout: JSON.stringify([{ type: 'public.utf8-plain-text', bytes: 10 }]) }),
+      )
+      .mockReturnValueOnce(fakeChild({ stdout: '0123456789' }));
+    const result = await backend.read('text', { offset: 6, limit: 8 });
+    expect(result.content.toString()).toBe('6789');
+    expect(result.totalByteSize).toBe(10);
+  });
+});
+
+describe('MacosBackend — pbpaste/pbcopy run under an explicit UTF-8 locale', () => {
+  let backend: MacosBackend;
+  beforeEach(() => {
+    backend = new MacosBackend();
+    vi.clearAllMocks();
+  });
+
+  it('spawns pbpaste with LC_ALL=en_US.UTF-8 so text bytes do not depend on the parent locale', async () => {
+    mockSpawn
+      .mockReturnValueOnce(
+        fakeChild({ stdout: JSON.stringify([{ type: 'public.utf8-plain-text', bytes: 3 }]) }),
+      )
+      .mockReturnValueOnce(fakeChild({ stdout: 'abc' }));
+    await backend.read('text', FULL);
+    expect(mockSpawn).toHaveBeenLastCalledWith(
+      'pbpaste',
+      [],
+      expect.objectContaining({ env: expect.objectContaining({ LC_ALL: 'en_US.UTF-8' }) }),
+    );
+  });
+
+  it('spawns pbcopy with LC_ALL=en_US.UTF-8 so stored text is the UTF-8 bytes it was given', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({}));
+    await backend.write('café', 'text');
+    expect(mockSpawn).toHaveBeenLastCalledWith(
+      'pbcopy',
+      [],
+      expect.objectContaining({ env: expect.objectContaining({ LC_ALL: 'en_US.UTF-8' }) }),
     );
   });
 });

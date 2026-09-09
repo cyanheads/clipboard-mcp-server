@@ -21,6 +21,16 @@ import { getClipboardService } from '@/services/clipboard/clipboard-service.js';
 
 const mockGetService = vi.mocked(getClipboardService);
 
+/** Shape a bare backend-style result the way ClipboardService.read() returns it: one complete slice. */
+function asRangedRead<T extends { content: Buffer }>(r: T) {
+  return {
+    byteSize: r.content.byteLength,
+    totalByteSize: r.content.byteLength,
+    complete: true,
+    ...r,
+  };
+}
+
 /** Build a mock ClipboardService with inspect and read. */
 function mockService(opts: {
   inspect?: ReturnType<ReturnType<typeof getClipboardService>['inspect']>;
@@ -28,7 +38,7 @@ function mockService(opts: {
 }) {
   return {
     inspect: opts.inspect ? vi.fn().mockReturnValue(opts.inspect) : vi.fn(),
-    read: opts.read ? vi.fn().mockReturnValue(opts.read) : vi.fn(),
+    read: opts.read ? vi.fn().mockImplementation(() => opts.read?.then(asRangedRead)) : vi.fn(),
   } as unknown as ReturnType<typeof getClipboardService>;
 }
 
@@ -343,7 +353,13 @@ describe('clipboardRead', () => {
 
   describe('format()', () => {
     it('renders text format with content and size', () => {
-      const output = { format: 'text' as const, content: 'hello world', byteSize: 11 };
+      const output = {
+        format: 'text' as const,
+        content: 'hello world',
+        byteSize: 11,
+        totalByteSize: 11,
+        complete: true,
+      };
       const blocks = clipboardRead.format!(output);
       const text = blocks.find((b) => b.type === 'text')?.text ?? '';
       expect(text).toContain('text');
@@ -356,6 +372,8 @@ describe('clipboardRead', () => {
         format: 'rtf' as const,
         content: '{\\rtf1 Hello}',
         byteSize: 13,
+        totalByteSize: 13,
+        complete: true,
       };
       const blocks = clipboardRead.format!(output);
       const text = blocks.find((b) => b.type === 'text')?.text ?? '';
@@ -370,6 +388,8 @@ describe('clipboardRead', () => {
         width: 1920,
         height: 1080,
         byteSize: 51200,
+        totalByteSize: 51200,
+        complete: true,
       };
       const blocks = clipboardRead.format!(output);
       const text = blocks.find((b) => b.type === 'text')?.text ?? '';
@@ -393,7 +413,13 @@ describe('clipboardRead — response-surface characterization', () => {
       ['html' as const, '<table><tr><td>A &amp; B</td><td>*literal*</td></tr></table>'],
       ['rtf' as const, '{\\rtf1\\ansi Hello}'],
     ])('renders the %s payload in full alongside format and size', (format, content) => {
-      const output = { format, content, byteSize: Buffer.byteLength(content, 'utf8') };
+      const output = {
+        format,
+        content,
+        byteSize: Buffer.byteLength(content, 'utf8'),
+        totalByteSize: Buffer.byteLength(content, 'utf8'),
+        complete: true,
+      };
       const blocks = clipboardRead.format!(output);
       const text = blocks.find((b) => b.type === 'text')?.text ?? '';
       expect(text).toContain(`**Format:** ${format}`);
@@ -402,7 +428,13 @@ describe('clipboardRead — response-surface characterization', () => {
     });
 
     it('emits exactly one text block', () => {
-      const blocks = clipboardRead.format!({ format: 'text', content: 'x', byteSize: 1 });
+      const blocks = clipboardRead.format!({
+        format: 'text',
+        content: 'x',
+        byteSize: 1,
+        totalByteSize: 1,
+        complete: true,
+      });
       expect(blocks).toHaveLength(1);
       expect(blocks[0]?.type).toBe('text');
     });
@@ -430,6 +462,8 @@ describe('clipboardRead — response-surface characterization', () => {
         width: 10,
         height: 20,
         byteSize: png.byteLength,
+        totalByteSize: png.byteLength,
+        complete: true,
       });
     });
 
@@ -470,6 +504,8 @@ describe('clipboardRead format() — literal payload preservation (#22)', () => 
       format,
       content,
       byteSize: Buffer.byteLength(content, 'utf8'),
+      totalByteSize: Buffer.byteLength(content, 'utf8'),
+      complete: true,
     });
     return blocks.find((b) => b.type === 'text')?.text ?? '';
   }
@@ -520,7 +556,13 @@ describe('clipboardRead format() — literal payload preservation (#22)', () => 
   });
 
   it('leaves structuredContent-bound values untouched — format() stays pure', () => {
-    const output = { format: 'text' as const, content: '`tick`', byteSize: 6 };
+    const output = {
+      format: 'text' as const,
+      content: '`tick`',
+      byteSize: 6,
+      totalByteSize: 6,
+      complete: true,
+    };
     const snapshot = { ...output };
     clipboardRead.format!(output);
     expect(output).toEqual(snapshot);
@@ -554,6 +596,8 @@ describe('clipboardRead handler — image block on content[] (#6)', () => {
       width: 10,
       height: 20,
       byteSize: png.byteLength,
+      totalByteSize: png.byteLength,
+      complete: true,
     });
   });
 
@@ -610,5 +654,139 @@ describe('clipboardRead handler — image block on content[] (#6)', () => {
       data: { reason: 'format_unavailable' },
     });
     expect(getContentBlocks(ctx)).toEqual([]);
+  });
+});
+
+describe('clipboardRead — bounded retrieval (#7)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    [{ format: 'text', offset: -1 }],
+    [{ format: 'text', offset: 1.5 }],
+    [{ format: 'text', limit: 0 }],
+    [{ format: 'text', limit: 3 }],
+    [{ format: 'text', limit: -8 }],
+  ])('rejects %j at the input schema', (input) => {
+    expect(() => clipboardRead.input.parse(input)).toThrow();
+  });
+
+  it('accepts the smallest progress-guaranteeing limit and an offset on its own', () => {
+    expect(clipboardRead.input.parse({ format: 'text', limit: 4 })).toMatchObject({ limit: 4 });
+    expect(clipboardRead.input.parse({ format: 'text', offset: 0 })).toMatchObject({ offset: 0 });
+  });
+
+  it('passes no range to the service when neither offset nor limit is given', async () => {
+    const svc = mockService({
+      read: Promise.resolve({ format: 'text' as const, content: Buffer.from('x') }),
+    });
+    mockGetService.mockReturnValueOnce(svc);
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await clipboardRead.handler(clipboardRead.input.parse({ format: 'text' }), ctx);
+    expect(svc.read).toHaveBeenCalledWith('text', ctx, undefined);
+  });
+
+  it('passes the caller range through, defaulting a missing side so the service clamp applies', async () => {
+    const svc = mockService({
+      read: Promise.resolve({ format: 'text' as const, content: Buffer.from('x') }),
+    });
+    mockGetService.mockReturnValue(svc);
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await clipboardRead.handler(
+      clipboardRead.input.parse({ format: 'text', offset: 8, limit: 16 }),
+      ctx,
+    );
+    expect(svc.read).toHaveBeenLastCalledWith('text', ctx, { offset: 8, limit: 16 });
+    await clipboardRead.handler(clipboardRead.input.parse({ format: 'text', offset: 8 }), ctx);
+    expect(svc.read).toHaveBeenLastCalledWith('text', ctx, {
+      offset: 8,
+      limit: Number.MAX_SAFE_INTEGER,
+    });
+    await clipboardRead.handler(clipboardRead.input.parse({ format: 'text', limit: 4 }), ctx);
+    expect(svc.read).toHaveBeenLastCalledWith('text', ctx, { offset: 0, limit: 4 });
+  });
+
+  it('applies the range to the format auto resolves to', async () => {
+    const svc = mockService({
+      inspect: Promise.resolve({
+        primaryFormat: 'html',
+        availableFormats: ['html', 'text'],
+        rawTypes: [],
+      }),
+      read: Promise.resolve({ format: 'html' as const, content: Buffer.from('<p>x</p>') }),
+    });
+    mockGetService.mockReturnValueOnce(svc);
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await clipboardRead.handler(
+      clipboardRead.input.parse({ format: 'auto', offset: 0, limit: 64 }),
+      ctx,
+    );
+    expect(svc.read).toHaveBeenCalledWith('html', ctx, { offset: 0, limit: 64 });
+  });
+
+  it('a partial slice carries the same bytes and continuation metadata on both surfaces', async () => {
+    const content = 'slice-of-`code`-payload';
+    const slice = {
+      format: 'text' as const,
+      content: Buffer.from(content),
+      byteSize: Buffer.byteLength(content),
+      totalByteSize: 4096,
+      complete: false,
+      nextOffset: 512,
+    };
+    mockGetService.mockReturnValueOnce(mockService({ read: Promise.resolve(slice) }));
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    const result = await clipboardRead.handler(
+      clipboardRead.input.parse({ format: 'text', offset: 489, limit: 23 }),
+      ctx,
+    );
+
+    expect(result).toEqual({
+      format: 'text',
+      content,
+      byteSize: 23,
+      totalByteSize: 4096,
+      complete: false,
+      nextOffset: 512,
+    });
+    const text = clipboardRead.format!(result).find((b) => b.type === 'text')?.text ?? '';
+    expect(text).toContain('23 of 4,096 bytes');
+    expect(text).toContain('**Complete:** false');
+    expect(text).toContain('**Next offset:** 512');
+    expect(fencedPayload(text)?.payload).toBe(content);
+  });
+
+  it('a final slice renders complete with no next offset', () => {
+    const text =
+      clipboardRead.format!({
+        format: 'text',
+        content: 'tail',
+        byteSize: 4,
+        totalByteSize: 4096,
+        complete: true,
+      }).find((b) => b.type === 'text')?.text ?? '';
+    expect(text).toContain('**Complete:** true');
+    expect(text).not.toContain('Next offset');
+  });
+
+  it('an empty past-the-end slice renders as complete with an empty fence', () => {
+    const output = {
+      format: 'text' as const,
+      content: '',
+      byteSize: 0,
+      totalByteSize: 10,
+      complete: true,
+    };
+    const text = clipboardRead.format!(output).find((b) => b.type === 'text')?.text ?? '';
+    expect(text).toContain('0 of 10 bytes');
+    expect(text).toContain('**Complete:** true');
+  });
+
+  it('content_too_large recovery points at offset/limit', () => {
+    const entry = clipboardRead.errors?.find((e) => e.reason === 'content_too_large');
+    expect(entry?.recovery).toMatch(/offset/);
+    expect(entry?.recovery).toMatch(/limit/);
+    expect(entry?.recovery).toMatch(/nextOffset/);
   });
 });

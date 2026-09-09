@@ -9,15 +9,17 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
+import { trimToUtf8Boundaries } from './byte-window.js';
 import { LinuxWaylandBackend } from './linux-wayland-backend.js';
 import { LinuxX11Backend } from './linux-x11-backend.js';
 import { MacosBackend } from './macos-backend.js';
 import type {
+  ByteRange,
   ClearResult,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
-  ReadResult,
+  RangedReadResult,
   WriteResult,
 } from './types.js';
 import { WindowsBackend } from './windows-backend.js';
@@ -181,21 +183,52 @@ export class ClipboardService {
 
   /**
    * Read clipboard content in the requested format.
-   * Enforces size limits before returning content.
+   *
+   * Without `range`, requests one byte more than the format's size limit —
+   * bounding memory to `limit + 1` — and throws `content_too_large` when the
+   * representation's true size (`totalByteSize`, always measured in full by
+   * the backend) exceeds the limit, without ever holding the full oversized
+   * payload. With `range`, the caller's `limit` is clamped to the format's
+   * size limit and `content_too_large` is never thrown — the caller owns
+   * paging through the representation via `nextOffset`.
    */
-  async read(format: ClipboardFormat, ctx: Context): Promise<ReadResult> {
-    ctx.log.debug('clipboard read', { format });
-    const result = await this.backend.read(format);
+  async read(format: ClipboardFormat, ctx: Context, range?: ByteRange): Promise<RangedReadResult> {
+    ctx.log.debug('clipboard read', { format, range });
     const limit = format === 'image' ? SIZE_LIMITS.READ_IMAGE : SIZE_LIMITS.READ_TEXT;
-    if (result.content.byteLength > limit) {
+    const effectiveRange: ByteRange = range
+      ? { offset: range.offset, limit: Math.min(range.limit, limit) }
+      : { offset: 0, limit: limit + 1 };
+
+    const result = await this.backend.read(format, effectiveRange);
+
+    if (!range && result.totalByteSize > limit) {
       throw Object.assign(new Error('content_too_large'), {
         _contentTooLarge: true,
-        bytes: result.content.byteLength,
+        bytes: result.totalByteSize,
         limit,
         format,
       });
     }
-    return result;
+
+    const isFinalSlice = effectiveRange.offset + result.content.byteLength >= result.totalByteSize;
+    const trimmed =
+      format === 'image'
+        ? { content: result.content, consumed: result.content.byteLength }
+        : trimToUtf8Boundaries(result.content, isFinalSlice);
+
+    const nextOffset = effectiveRange.offset + trimmed.consumed;
+    const complete = nextOffset >= result.totalByteSize;
+
+    return {
+      format: result.format,
+      content: trimmed.content,
+      ...(result.width !== undefined && { width: result.width }),
+      ...(result.height !== undefined && { height: result.height }),
+      byteSize: trimmed.content.byteLength,
+      totalByteSize: result.totalByteSize,
+      complete,
+      ...(complete ? {} : { nextOffset }),
+    };
   }
 
   /**

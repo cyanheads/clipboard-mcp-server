@@ -14,8 +14,11 @@ import { REAL_PNG_13x7 } from './png-fixtures.js';
 
 const mockSpawn = vi.mocked(spawn);
 
+/** Full-representation range: what the service passes for an unranged read. */
+const FULL = { offset: 0, limit: 8 * 1024 * 1024 } as const;
+
 function fakeChild(opts: {
-  stdout?: string | Buffer;
+  stdout?: string | Buffer | Buffer[];
   stderr?: string;
   exitCode?: number;
   errorCode?: string;
@@ -32,12 +35,14 @@ function fakeChild(opts: {
       child.emit('error', Object.assign(new Error('spawn error'), { code: opts.errorCode }));
       return;
     }
-    if (opts.stdout)
-      stdoutEmitter.emit(
-        'data',
-        Buffer.isBuffer(opts.stdout) ? opts.stdout : Buffer.from(opts.stdout),
-      );
+    const chunks = Array.isArray(opts.stdout)
+      ? opts.stdout
+      : opts.stdout
+        ? [Buffer.isBuffer(opts.stdout) ? opts.stdout : Buffer.from(opts.stdout)]
+        : [];
+    for (const chunk of chunks) stdoutEmitter.emit('data', chunk);
     if (opts.stderr) stderrEmitter.emit('data', Buffer.from(opts.stderr ?? ''));
+    stdoutEmitter.emit('end');
     child.emit('close', opts.exitCode ?? 0);
   });
 
@@ -181,7 +186,7 @@ describe('LinuxWaylandBackend', () => {
   describe('read()', () => {
     it('reads text via wl-paste with -t text/plain', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'wayland text' }));
-      const result = await backend.read('text');
+      const result = await backend.read('text', FULL);
       expect(result.format).toBe('text');
       expect(result.content.toString('utf8')).toBe('wayland text');
       const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
@@ -192,7 +197,7 @@ describe('LinuxWaylandBackend', () => {
     it('keeps text/plain as the first text read MIME type', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'primary text' }));
 
-      await backend.read('text');
+      await backend.read('text', FULL);
 
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       expect(mockSpawn).toHaveBeenCalledWith('wl-paste', ['-t', 'text/plain'], expect.any(Object));
@@ -214,7 +219,7 @@ describe('LinuxWaylandBackend', () => {
         }
         mockSpawn.mockReturnValueOnce(fakeChild({ stdout: `${mime} content` }));
 
-        const result = await backend.read('text');
+        const result = await backend.read('text', FULL);
 
         expect(result.content.toString('utf8')).toBe(`${mime} content`);
         expect(mockSpawn.mock.calls.map(([, args]) => (args as string[]).at(-1))).toEqual(
@@ -225,7 +230,7 @@ describe('LinuxWaylandBackend', () => {
 
     it('reads html via wl-paste with -t text/html', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '<html><body>wayland</body></html>' }));
-      const result = await backend.read('html');
+      const result = await backend.read('html', FULL);
       expect(result.format).toBe('html');
       expect(result.content.toString('utf8')).toContain('<html>');
       const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
@@ -235,13 +240,13 @@ describe('LinuxWaylandBackend', () => {
 
     it('throws when html buffer is empty (format not present)', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '' }));
-      await expect(backend.read('html')).rejects.toThrow(/not found/i);
+      await expect(backend.read('html', FULL)).rejects.toThrow(/not found/i);
     });
 
     it('reads rtf via wl-paste with -t text/rtf', async () => {
       const rtf = '{\\rtf1 test}';
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: rtf }));
-      const result = await backend.read('rtf');
+      const result = await backend.read('rtf', FULL);
       expect(result.format).toBe('rtf');
       expect(result.content.toString('utf8')).toBe(rtf);
     });
@@ -252,7 +257,7 @@ describe('LinuxWaylandBackend', () => {
       mockSpawn
         .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'no such type' }))
         .mockReturnValueOnce(fakeChild({ stdout: rtf }));
-      const result = await backend.read('rtf');
+      const result = await backend.read('rtf', FULL);
       expect(result.format).toBe('rtf');
       expect(result.content.toString('utf8')).toBe(rtf);
     });
@@ -260,12 +265,12 @@ describe('LinuxWaylandBackend', () => {
     it('throws when rtf returns empty buffer (format not present)', async () => {
       // text/rtf returns empty — no fallback needed, empty = not found
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '' }));
-      await expect(backend.read('rtf')).rejects.toThrow(/not found/i);
+      await expect(backend.read('rtf', FULL)).rejects.toThrow(/not found/i);
     });
 
     it('reads image/png via wl-paste and reports its dimensions', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: REAL_PNG_13x7 }));
-      const result = await backend.read('image');
+      const result = await backend.read('image', FULL);
       expect(result.format).toBe('image');
       expect(result.content).toEqual(REAL_PNG_13x7);
       expect(result.width).toBe(13);
@@ -276,7 +281,7 @@ describe('LinuxWaylandBackend', () => {
       const truncated = REAL_PNG_13x7.subarray(0, 16);
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: truncated }));
 
-      const result = await backend.read('image');
+      const result = await backend.read('image', FULL);
 
       expect(result.content).toEqual(truncated);
       expect(result.width).toBeUndefined();
@@ -478,7 +483,7 @@ describe('LinuxWaylandBackend', () => {
   describe('missing wl-paste detection', () => {
     it('throws informative error when wl-paste is not found', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ errorCode: 'ENOENT' }));
-      await expect(backend.read('text')).rejects.toThrow(/wl-paste not found/i);
+      await expect(backend.read('text', FULL)).rejects.toThrow(/wl-paste not found/i);
     });
   });
 
@@ -506,5 +511,31 @@ describe('LinuxWaylandBackend', () => {
         }
       },
     );
+  });
+});
+
+describe('LinuxWaylandBackend — streamed measurement and windows (#26, #7)', () => {
+  let backend: LinuxWaylandBackend;
+  beforeEach(() => {
+    backend = new LinuxWaylandBackend();
+    vi.clearAllMocks();
+  });
+
+  it('inspect() counts a representation delivered in many chunks without buffering it', async () => {
+    const chunks = Array.from({ length: 4 }, () => Buffer.alloc(2048, 'y'));
+    mockSpawn
+      .mockReturnValueOnce(fakeChild({ stdout: 'text/plain\n' }))
+      .mockReturnValueOnce(fakeChild({ stdout: chunks }));
+    const result = await backend.inspect();
+    expect(result.rawTypes).toEqual([{ type: 'text/plain', bytes: 8192 }]);
+  });
+
+  it('read() returns only the requested window across chunk boundaries, with the true total', async () => {
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({ stdout: [Buffer.from('abcdef'), Buffer.from('ghijkl')] }),
+    );
+    const result = await backend.read('html', { offset: 4, limit: 5 });
+    expect(result.content.toString()).toBe('efghi');
+    expect(result.totalByteSize).toBe(12);
   });
 });
