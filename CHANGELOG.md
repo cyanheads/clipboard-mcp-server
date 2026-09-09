@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-09-08
+
+clipboard_read fences text payloads and attaches image reads to content[]; clipboard_write returns previousContent and decodes numeric HTML entities
+
 ## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-09-08
 
 Add CLIPBOARD_READ_ONLY read-only mode; default HTTP body cap to 7 MiB and session mode to stateless.

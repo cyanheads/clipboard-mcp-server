@@ -6,14 +6,14 @@
     "url": "https://github.com/cyanheads/clipboard-mcp-server",
     "source": "github"
   },
-  "version": "0.1.9",
+  "version": "0.1.10",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/clipboard-mcp-server",
       "runtimeHint": "node",
-      "version": "0.1.9",
+      "version": "0.1.10",
       "packageArguments": [
         {
           "type": "positional",
@@ -49,7 +49,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/clipboard-mcp-server",
       "runtimeHint": "node",
-      "version": "0.1.9",
+      "version": "0.1.10",
       "packageArguments": [
         {
           "type": "positional",
