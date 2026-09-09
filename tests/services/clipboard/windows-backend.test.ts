@@ -266,3 +266,29 @@ describe('WindowsBackend', () => {
     );
   });
 });
+
+describe('WindowsBackend write() html — numeric entity fallback (#25)', () => {
+  let backend: WindowsBackend;
+
+  beforeEach(() => {
+    backend = new WindowsBackend();
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    ['decimal', '<p>&#169; 2026</p>', '© 2026'],
+    ['hexadecimal', '<p>&#xA9; 2026</p>', '© 2026'],
+    ['astral', '<p>Smile &#128512;</p>', 'Smile 😀'],
+  ])(
+    'publishes the decoded %s reference in the plain-text fallback',
+    async (_label, html, expected) => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '' }));
+
+      await backend.write(html, 'html');
+
+      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+      const script = args.at(-1) ?? '';
+      expect(script).toContain(JSON.stringify(Buffer.from(expected, 'utf8').toString('base64')));
+    },
+  );
+});

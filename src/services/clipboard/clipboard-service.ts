@@ -194,7 +194,8 @@ export class ClipboardService {
 
   /**
    * Write content to the clipboard.
-   * Enforces write size limit.
+   * Enforces write size limit, and captures the prior plain text so an
+   * unintended overwrite stays recoverable.
    */
   async write(content: string, format: 'text' | 'html', ctx: Context): Promise<WriteResult> {
     ctx.log.debug('clipboard write', { format, bytes: Buffer.byteLength(content, 'utf8') });
@@ -206,7 +207,23 @@ export class ClipboardService {
         limit: SIZE_LIMITS.WRITE,
       });
     }
-    return await this.backend.write(content, format);
+
+    // Read through this.read() rather than the backend so SIZE_LIMITS.READ_TEXT
+    // applies. A failed pre-read never blocks the write the caller asked for:
+    // an empty clipboard, a clipboard with no text representation, and oversized
+    // prior text all simply leave previousContent absent.
+    let previousContent: string | undefined;
+    try {
+      const prior = await this.read('text', ctx);
+      if (prior.content.byteLength > 0) previousContent = prior.content.toString('utf8');
+    } catch (err) {
+      ctx.log.debug('clipboard write: no recoverable prior contents', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    const result = await this.backend.write(content, format);
+    return { ...result, ...(previousContent !== undefined && { previousContent }) };
   }
 }
 

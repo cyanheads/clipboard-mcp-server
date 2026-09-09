@@ -289,6 +289,26 @@ describe('MacosBackend', () => {
     });
   });
 
+  describe('write() html — numeric entity fallback (#25)', () => {
+    it.each([
+      ['decimal', '<p>&#169; 2026</p>', '© 2026'],
+      ['hexadecimal', '<p>&#xA9; 2026</p>', '© 2026'],
+      ['astral', '<p>Smile &#x1F600;</p>', 'Smile 😀'],
+      ['nested in block elements', '<div><p>Caf&#233;</p><p>&#8212; open</p></div>', 'Café — open'],
+    ])(
+      'publishes the decoded %s reference in the plain-text fallback',
+      async (_label, html, expected) => {
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
+
+        await backend.write(html, 'html');
+
+        const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+        const script = args.at(-1) ?? '';
+        expect(script).toContain(JSON.stringify(Buffer.from(expected, 'utf8').toString('base64')));
+      },
+    );
+  });
+
   describe('security — injection prevention', () => {
     const INJECTION_PAYLOADS = [
       '"; $(whoami); "',

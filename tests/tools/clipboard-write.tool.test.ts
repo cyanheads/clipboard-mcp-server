@@ -181,3 +181,120 @@ describe('clipboardWrite', () => {
     });
   });
 });
+
+describe('clipboardWrite — response-surface characterization', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns the service result unchanged', async () => {
+    const writeMock = vi.fn().mockResolvedValueOnce({ format: 'html' as const, byteSize: 12 });
+    mockGetService.mockReturnValueOnce({ write: writeMock } as ReturnType<
+      typeof getClipboardService
+    >);
+
+    const ctx = createMockContext({ errors: clipboardWrite.errors });
+    const input = clipboardWrite.input.parse({ content: '<p>Hello</p>', format: 'html' });
+    await expect(clipboardWrite.handler(input, ctx)).resolves.toEqual({
+      format: 'html',
+      byteSize: 12,
+    });
+  });
+
+  it('rethrows an unrecognized backend failure unchanged', async () => {
+    const writeMock = vi.fn().mockRejectedValueOnce(new Error('pbcopy exited 1'));
+    mockGetService.mockReturnValueOnce({ write: writeMock } as ReturnType<
+      typeof getClipboardService
+    >);
+
+    const ctx = createMockContext({ errors: clipboardWrite.errors });
+    const input = clipboardWrite.input.parse({ content: 'x', format: 'text' });
+    await expect(clipboardWrite.handler(input, ctx)).rejects.toThrow('pbcopy exited 1');
+  });
+
+  it('format() emits exactly one text block carrying the format and size labels', () => {
+    const blocks = clipboardWrite.format!({ format: 'text', byteSize: 1234 });
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]?.type).toBe('text');
+    const text = blocks[0]?.type === 'text' ? blocks[0].text : '';
+    expect(text).toContain('**Format written:** text');
+    expect(text).toContain('1,234');
+  });
+});
+
+describe('clipboardWrite — previous clipboard contents (#28)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns previousContent supplied by the service', async () => {
+    const writeMock = vi.fn().mockResolvedValueOnce({
+      format: 'text' as const,
+      byteSize: 3,
+      previousContent: 'the old note',
+    });
+    mockGetService.mockReturnValueOnce({ write: writeMock } as ReturnType<
+      typeof getClipboardService
+    >);
+
+    const ctx = createMockContext({ errors: clipboardWrite.errors });
+    const input = clipboardWrite.input.parse({ content: 'new', format: 'text' });
+    const result = await clipboardWrite.handler(input, ctx);
+
+    expect(result.previousContent).toBe('the old note');
+  });
+
+  it('omits previousContent when the service reports none', async () => {
+    const writeMock = vi.fn().mockResolvedValueOnce({ format: 'text' as const, byteSize: 3 });
+    mockGetService.mockReturnValueOnce({ write: writeMock } as ReturnType<
+      typeof getClipboardService
+    >);
+
+    const ctx = createMockContext({ errors: clipboardWrite.errors });
+    const input = clipboardWrite.input.parse({ content: 'new', format: 'text' });
+    const result = await clipboardWrite.handler(input, ctx);
+
+    expect(result).not.toHaveProperty('previousContent');
+  });
+
+  it('declares previousContent as an optional string on the output schema', () => {
+    const parsed = clipboardWrite.output.parse({ format: 'text', byteSize: 1 });
+    expect(parsed).not.toHaveProperty('previousContent');
+    expect(
+      clipboardWrite.output.parse({ format: 'text', byteSize: 1, previousContent: 'x' }),
+    ).toMatchObject({
+      previousContent: 'x',
+    });
+  });
+
+  describe('format()', () => {
+    function render(previousContent?: string): string {
+      const blocks = clipboardWrite.format!({
+        format: 'text',
+        byteSize: 3,
+        ...(previousContent !== undefined && { previousContent }),
+      });
+      return blocks.find((b) => b.type === 'text')?.text ?? '';
+    }
+
+    it('renders the previous contents when present', () => {
+      const text = render('the old note');
+      expect(text).toContain('the old note');
+      expect(text.toLowerCase()).toContain('previous');
+    });
+
+    it('omits the previous-contents line cleanly when absent', () => {
+      const text = render();
+      expect(text.toLowerCase()).not.toContain('previous');
+      expect(text.trimEnd()).toBe(text);
+    });
+
+    it('fences prior contents so markdown metacharacters cannot control rendering', () => {
+      const prior = 'a ``` fence | *emphasis* <b>tag</b>';
+      const text = render(prior);
+      const match = /(`{3,})[^\n]*\n([\s\S]*)\n\1/.exec(text);
+      expect(match?.[2]).toBe(prior);
+      expect(match![1]!.length).toBeGreaterThan(3);
+    });
+  });
+});

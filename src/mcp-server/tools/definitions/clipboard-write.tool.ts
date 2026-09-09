@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getClipboardService, isContentTooLarge } from '@/services/clipboard/clipboard-service.js';
 
 export const clipboardWrite = tool('clipboard_write', {
@@ -23,6 +24,14 @@ export const clipboardWrite = tool('clipboard_write', {
   output: z.object({
     format: z.enum(['text', 'html']).describe('Format written.'),
     byteSize: z.number().int().describe('Byte size of the written content.'),
+    previousContent: z
+      .string()
+      .optional()
+      .describe(
+        'Plain-text content that was on the clipboard before this write, if any and within size limits. ' +
+          'Write it back with clipboard_write to undo an unintended overwrite. Absent if the clipboard was ' +
+          'empty, held no text representation, or the prior content exceeded the read size limit.',
+      ),
   }),
   errors: [
     {
@@ -70,6 +79,13 @@ export const clipboardWrite = tool('clipboard_write', {
     const lines: string[] = [];
     lines.push(`**Format written:** ${result.format}`);
     lines.push(`**Byte size:** ${result.byteSize.toLocaleString()} bytes`);
+    if (result.previousContent !== undefined) {
+      lines.push('');
+      lines.push('**Previous content:**');
+      // Fence the payload: prior clipboard bytes this tool did not author must
+      // not be able to control how content[] renders.
+      lines.push(markdown().codeBlock(result.previousContent).build());
+    }
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

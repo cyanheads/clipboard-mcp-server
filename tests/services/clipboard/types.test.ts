@@ -93,6 +93,23 @@ describe('stripHtmlTags', () => {
     });
   });
 
+  describe('entity pass-through characterization', () => {
+    it('leaves a bare ampersand untouched', () => {
+      expect(stripHtmlTags('<p>Salt &amp; pepper &amp; more</p>')).toBe('Salt & pepper & more');
+      expect(stripHtmlTags('<p>AT&T</p>')).toBe('AT&T');
+    });
+
+    it('passes an unknown named entity through unchanged', () => {
+      expect(stripHtmlTags('<p>&notanentity; &copy;</p>')).toBe('&notanentity; &copy;');
+    });
+
+    it('decodes named entities nested several levels deep', () => {
+      const html =
+        '<div><section><blockquote><p>a &lt; b &amp;&amp; c &gt; d</p></blockquote></section></div>';
+      expect(stripHtmlTags(html)).toBe('a < b && c > d');
+    });
+  });
+
   describe('combined scenarios', () => {
     it('handles complex document with scripts, styles, and block elements', () => {
       const html = `
@@ -146,5 +163,63 @@ describe('buildInspectFormats', () => {
   it('returns html as primary over rtf and text', () => {
     const result = buildInspectFormats(new Set(['text' as const, 'rtf' as const, 'html' as const]));
     expect(result.primaryFormat).toBe('html');
+  });
+});
+
+describe('stripHtmlTags — numeric character references (#25)', () => {
+  it('decodes decimal references', () => {
+    expect(stripHtmlTags('<p>Caf&#233;</p>')).toBe('Café');
+    expect(stripHtmlTags('<p>&#169; 2026</p>')).toBe('© 2026');
+  });
+
+  it('decodes lowercase hexadecimal references', () => {
+    expect(stripHtmlTags('<p>Caf&#xe9;</p>')).toBe('Café');
+    expect(stripHtmlTags('<p>&#xA9; 2026</p>')).toBe('© 2026');
+  });
+
+  it('decodes uppercase-X hexadecimal references', () => {
+    expect(stripHtmlTags('<p>Caf&#Xe9;</p>')).toBe('Café');
+  });
+
+  it('decodes astral code points to the correct surrogate pair', () => {
+    const result = stripHtmlTags('<p>Smile &#x1F600; and &#128512;</p>');
+    expect(result).toBe('Smile 😀 and 😀');
+    // Astral code points occupy two UTF-16 units — the pair must be well-formed.
+    expect(result.codePointAt(result.indexOf('\u{1F600}'))).toBe(0x1f600);
+  });
+
+  it('decodes references nested several levels deep inside tags', () => {
+    const html =
+      '<div><section><blockquote><p>&#8220;Caf&#233; &#x2014; open&#8221;</p></blockquote></section></div>';
+    expect(stripHtmlTags(html)).toBe('“Café — open”');
+  });
+
+  it('decodes references inside a list, one per item', () => {
+    const html = '<ul><li>&#8364;5</li><li>&#xa3;3</li></ul>';
+    expect(stripHtmlTags(html)).toBe('€5 £3');
+  });
+
+  it('passes an out-of-range code point through unchanged', () => {
+    expect(stripHtmlTags('<p>&#1114112; &#x110000;</p>')).toBe('&#1114112; &#x110000;');
+    expect(stripHtmlTags('<p>&#99999999999;</p>')).toBe('&#99999999999;');
+  });
+
+  it('passes a lone surrogate through unchanged', () => {
+    expect(stripHtmlTags('<p>&#xD800; &#55296;</p>')).toBe('&#xD800; &#55296;');
+  });
+
+  it('passes malformed references through unchanged', () => {
+    expect(stripHtmlTags('<p>&#; &#x; &#xZZ; &#12</p>')).toBe('&#; &#x; &#xZZ; &#12');
+  });
+
+  it('keeps the six named entities working alongside numeric decoding', () => {
+    expect(stripHtmlTags('&amp; &lt; &gt; &quot; &#39; &nbsp;')).toBe('& < > " \'');
+  });
+
+  it('still removes script content before decoding references in it', () => {
+    const html = '<p>&#65;</p><script>var s = "&#66;";</script><p>&#67;</p>';
+    const result = stripHtmlTags(html);
+    expect(result).toBe('A C');
+    expect(result).not.toContain('B');
   });
 });

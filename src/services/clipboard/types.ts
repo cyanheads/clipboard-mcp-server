@@ -48,9 +48,28 @@ export function buildInspectFormats(semanticSet: Set<ClipboardFormat>): {
   return { availableFormats, primaryFormat };
 }
 
+/**
+ * Decode decimal (`&#169;`) and hexadecimal (`&#xA9;`, `&#XA9;`) character
+ * references. `String.fromCodePoint` emits the correct surrogate pair for
+ * astral code points. A reference outside the Unicode range, or one naming a
+ * lone surrogate or NUL — none of which have a standalone text representation —
+ * passes through as written rather than throwing.
+ */
+function decodeNumericReferences(text: string): string {
+  return text.replace(/&#(x[0-9a-f]+|[0-9]+);/gi, (reference, digits: string) => {
+    const codePoint =
+      digits[0] === 'x' || digits[0] === 'X'
+        ? Number.parseInt(digits.slice(1), 16)
+        : Number.parseInt(digits, 10);
+    if (codePoint <= 0 || codePoint > 0x10ffff) return reference;
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) return reference;
+    return String.fromCodePoint(codePoint);
+  });
+}
+
 /** Strip HTML tags to produce plain text, decoding common entities. */
 export function stripHtmlTags(html: string): string {
-  return (
+  const decoded = decodeNumericReferences(
     html
       // Remove script and style blocks entirely (content, not just tags)
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
@@ -69,10 +88,9 @@ export function stripHtmlTags(html: string): string {
       .replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'")
-      .replace(/&nbsp;/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
+      .replace(/&nbsp;/g, ' '),
   );
+  return decoded.replace(/\s+/g, ' ').trim();
 }
 
 /** Result of reading clipboard content. */
@@ -93,6 +111,12 @@ export interface WriteResult {
   byteSize: number;
   /** The format that was written. */
   format: 'text' | 'html';
+  /**
+   * Plain text that was on the clipboard immediately before this write, for
+   * recovery from an unintended overwrite. Absent when the clipboard was empty,
+   * held no text representation, or its text exceeded the read size limit.
+   */
+  previousContent?: string;
 }
 
 /**
