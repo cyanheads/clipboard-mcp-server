@@ -1,6 +1,6 @@
 # clipboard-mcp-server - Directory Structure
 
-Generated on: 2026-08-30 22:11:04
+Generated on: 2026-09-09 05:08:45
 
 ```text
 clipboard-mcp-server/
@@ -30,7 +30,6 @@ clipboard-mcp-server/
 ├── scripts/
 │   ├── audit-open-index-signatures.ts
 │   ├── build-changelog.ts
-│   ├── build-inputs.ts
 │   ├── build.ts
 │   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
@@ -40,18 +39,11 @@ clipboard-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
-│   ├── devdocs.ts
-│   ├── fetch-openapi-spec.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
-│   ├── public-api-contract-update.ts
-│   ├── public-api-contract.ts
 │   ├── release-github.ts
-│   ├── split-changelog.ts
-│   ├── tree.ts
-│   ├── update-coverage.ts
-│   └── verify-package.ts
+│   └── tree.ts
 ├── skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
@@ -138,6 +130,8 @@ clipboard-mcp-server/
 │   └── tool-defs-analysis/
 │       └── SKILL.md
 ├── src/
+│   ├── config/
+│   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
 │   │   │   └── definitions/
@@ -158,6 +152,11 @@ clipboard-mcp-server/
 │   │       └── windows-backend.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
+│   ├── integration/
+│   │   ├── harness.ts
+│   │   └── http-transport.test.ts
 │   ├── prompts/
 │   ├── resources/
 │   ├── security/

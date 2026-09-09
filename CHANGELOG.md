@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-09-08
+
+Add CLIPBOARD_READ_ONLY read-only mode; default HTTP body cap to 7 MiB and session mode to stateless.
+
 ## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-08-30
 
 Align clipboard format behavior across macOS, Linux, and Windows.
