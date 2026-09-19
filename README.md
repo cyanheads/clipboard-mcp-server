@@ -21,9 +21,11 @@
 
 ---
 
-## Tools
+## Overview
 
-3 tools for reading, writing, and inspecting the system clipboard:
+The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write, and inspect text, HTML, RTF, and image content from any MCP client. Runs as a stdio process or a local Streamable HTTP server.
+
+### Tools
 
 | Tool | Description |
 |:---|:---|
@@ -31,66 +33,56 @@
 | `clipboard_write` | Write plain text or HTML to the clipboard, replacing current contents, or clear it outright |
 | `clipboard_inspect` | List available clipboard formats and byte sizes without reading full content |
 
-### `clipboard_read`
+---
 
-Read the current clipboard contents in a requested format.
+## Capability reference
 
-- `auto` mode returns the richest format explicitly present — priority: image > html > rtf > text
-- `image` returns base64-encoded PNG data, with pixel dimensions on every platform whenever the capture carries a readable PNG header
-- `html` returns raw HTML source as copied from a browser
-- `rtf` returns raw RTF markup
-- `text` returns plain text
+### `clipboard_read` <sub>tool</sub>
+
+- `auto` returns the richest format explicitly present — priority: image > html > rtf > text; `format` requests a specific one instead
 - Size limits: 512 KB for text/HTML/RTF, 5 MB for images (raw bytes before base64 expansion)
-- Content above the size limit is retrieved in slices with `offset`/`limit` instead of erroring outright: pass both to read a bounded window (`limit` is at least 4 and clamped to the format's size limit) and follow the returned `nextOffset` until `complete` is `true`. Every response carries `totalByteSize` and `complete`; text/HTML/RTF slices never split a multi-byte UTF-8 sequence. Omitting both reads the whole payload as before, still bounded by the size limit
-- Returns a typed `format_unavailable` error when the requested format is not on the clipboard — use `clipboard_inspect` first to check availability
-- Returns a typed `content_too_large` error only when no `offset`/`limit` was given and the content exceeds the size limit; the recovery hint points at the slicing parameters above
+- Content above the limit reads via `offset`/`limit` slicing — pass both to read a bounded window (`limit` is at least 4, clamped to the format's size limit) and follow the returned `nextOffset` until `complete` is `true`
+- `image` returns base64-encoded PNG data, with `width`/`height` whenever the capture carries a readable PNG header
+- Typed errors: `format_unavailable` when the requested format isn't on the clipboard, `content_too_large` when no `offset`/`limit` was given and content exceeds the size limit
 
 ---
 
-### `clipboard_write`
+### `clipboard_write` <sub>tool</sub>
 
-Write content to the clipboard, replacing current contents — or clear it.
-
-- `text` writes plain text
-- `html` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback, while Linux X11 and Wayland publish only `text/html`
-- `clear: true` removes every representation instead of writing, so a following `clipboard_inspect` reports `primaryFormat: "empty"`. It returns `cleared: true`, `byteSize: 0`, and no `format`. On Linux X11 this needs `xsel` alongside `xclip` — see [Prerequisites](#prerequisites)
-- Supply exactly one of `content` or `clear: true`. Omitting both, sending an empty `content`, or combining the two is rejected as invalid arguments rather than silently writing a zero-byte representation
-- Returns `previousContent` — the plain text that was on the clipboard immediately before the write or clear, so an unintended overwrite can be undone by writing it back. Absent when the clipboard was empty, held no text representation, or its text exceeded the 512 KB read limit
-- Size limit: 1 MB
-- `destructiveHint: true` — replaces or removes whatever is currently on the clipboard
-- Not registered when `CLIPBOARD_READ_ONLY` is set, which gates clearing along with writing — see [Configuration](#configuration)
+- Exactly one of `content` or `clear: true` — an empty `content`, both, or neither is rejected as invalid input
+- `format: "html"` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback, while Linux X11 and Wayland publish only `text/html`
+- `clear: true` removes every representation instead of writing (needs `xsel` alongside `xclip` on Linux X11) and returns `cleared: true`, `byteSize: 0`, no `format`
+- Returns `previousContent` — the plain text on the clipboard immediately before the write or clear, for undoing an unintended overwrite — absent when the clipboard was empty, held no text representation, or that text exceeded the 512 KB read limit
+- Size limit: 1 MB, past which a typed `content_too_large` error is returned
+- Not registered when `CLIPBOARD_READ_ONLY` is set, which gates clearing along with writing
 
 ---
 
-### `clipboard_inspect`
+### `clipboard_inspect` <sub>tool</sub>
 
-List the formats and byte sizes of what is currently on the clipboard without reading the full content.
-
-- Returns `primaryFormat` — the richest format present (image > html > rtf > text), or `empty`
-- Returns `availableFormats` — all semantic formats present, for deciding which format to pass to `clipboard_read`
-- Returns `rawTypes` — all raw platform type identifiers with byte sizes (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows). An entry whose size could not be measured carries `measurementFailed: true` and no `bytes`, so a failed measurement is never reported as a zero-byte representation
-- Returns a typed `inspect_unreadable` error when the platform helper's output cannot be read, instead of reporting an empty clipboard
-- Use this before `clipboard_read` to avoid `format_unavailable` errors and to check content size before reading
+- Returns `primaryFormat` (richest present — image > html > rtf > text — or `empty`) and `availableFormats`, the formats available to pass to `clipboard_read`
+- Returns `rawTypes` — every raw platform type identifier with byte size (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows); an entry whose size couldn't be measured carries `measurementFailed: true` and no `bytes`, never a false zero
+- Typed `inspect_unreadable` error when the platform helper's output cannot be read, instead of reporting an empty clipboard
 
 ---
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core):
-
-- Declarative tool definitions — single file per tool, framework handles registration and validation
-- Unified error handling across all tools
-- Pluggable auth (`none`, `jwt`, `oauth`)
-- Structured logging with optional OpenTelemetry tracing
-- Runs locally via stdio or HTTP from the same codebase
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Clipboard-specific:
 
 - Cross-platform backend detection at startup — macOS (pbcopy/pbpaste + osascript), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
 - Semantic format mapping — platform-native type identifiers (UTIs, TARGETS, Windows format names) mapped to `text`, `html`, `rtf`, `image` across all backends
-- Size-guarded reads and writes — typed `ContentTooLargeError` with byte/limit metadata before content returns
-- Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; Linux X11 and Wayland publish `text/html`
+- Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; Linux X11 and Wayland publish `text/html` only
 - Image support — macOS and Windows backends decode PNG bytes and return width/height alongside base64 content
+
+Agent-friendly output:
+
+- Size-guarded I/O — reads and writes over the format limit fail with a typed `content_too_large` error carrying byte/limit metadata, rather than truncating silently
+- Bounded continuation — `clipboard_read` slices oversized content with `offset`/`limit` and `nextOffset` instead of forcing a single all-or-nothing read
+- Undo support — `clipboard_write` returns `previousContent` so an unintended overwrite can be reverted
+- Discriminated failure — `format_unavailable`, `content_too_large`, and `inspect_unreadable` are typed reasons with recovery hints, not generic errors
 
 ---
 
@@ -140,6 +132,8 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 ```
 
 ### Prerequisites
+
+Bun 1.4.0+ or Node.js 24+.
 
 **macOS:** No additional tools required — `pbcopy`, `pbpaste`, and `osascript` are built in.
 
@@ -211,19 +205,28 @@ bun run test       # Vitest test suite
 | `src/mcp-server/tools/definitions/` | Tool definitions: `clipboard_read`, `clipboard_write`, `clipboard_inspect` |
 | `src/services/clipboard/` | Platform backends (macOS, Linux X11, Wayland, Windows) and service facade |
 | `tests/` | Vitest tests for tools and backends |
-| `skills/` | Agent workflow skills (add-tool, field-test, polish-docs-meta, etc.) |
+| `framework-skills/` | Agent workflow skills (add-tool, field-test, polish-docs-meta, etc.) |
 
 ---
 
 ## Development guide
 
-See [`CLAUDE.md`](./CLAUDE.md) for the full developer protocol — tool patterns, service patterns, error handling, logging conventions, and the checklist for shipping changes.
+See [`CLAUDE.md`](./CLAUDE.md) for the full developer protocol — tool patterns, service patterns, error handling, logging conventions, and the checklist for shipping changes. The short version:
+
+- Handlers throw, framework catches — no `try/catch` in tool logic
+- Use `ctx.log` for request-scoped logging
+- No Docker — this server needs direct host OS access (pbcopy/pbpaste, JXA/NSPasteboard, xclip, wl-clipboard, PowerShell), none of which work inside a container
 
 ---
 
 ## Contributing
 
-Issues and pull requests welcome at [github.com/cyanheads/clipboard-mcp-server](https://github.com/cyanheads/clipboard-mcp-server).
+Issues welcome at [github.com/cyanheads/clipboard-mcp-server](https://github.com/cyanheads/clipboard-mcp-server). Run checks and tests before submitting:
+
+```sh
+bun run devcheck
+bun run test
+```
 
 ---
 
