@@ -7,6 +7,43 @@ import { describe, expect, it } from 'vitest';
 import { buildInspectFormats, stripHtmlTags } from '@/services/clipboard/types.js';
 
 describe('stripHtmlTags', () => {
+  describe('HTML fallback correctness (#34)', () => {
+    it('removes document declarations', () => {
+      expect(stripHtmlTags('<!DOCTYPE html><html><body>kept</body></html>')).toBe('kept');
+    });
+
+    it.each(['script', 'style'])('treats %s contents as raw text', (tag) => {
+      expect(stripHtmlTags(`<${tag}><x title="</${tag}><p>kept</p>`)).toBe('kept');
+    });
+    it('decodes each reference only once', () => {
+      expect(stripHtmlTags('&amp;lt; &amp;#169; &amp;amp;')).toBe('&lt; &#169; &amp;');
+      expect(stripHtmlTags('&#38;lt; &#x26;#169;')).toBe('&lt; &#169;');
+    });
+
+    it('keeps quoted angle brackets inside attributes', () => {
+      expect(stripHtmlTags('<p title="1 > 0">kept</p>')).toBe('kept');
+      expect(stripHtmlTags("<p title='1 > 0'>kept</p>")).toBe('kept');
+    });
+
+    it.each(['script', 'style'])('drops %s content with whitespace in its closing tag', (tag) => {
+      expect(stripHtmlTags(`<${tag}>hidden</${tag} ><p>kept</p>`)).toBe('kept');
+    });
+
+    it('preserves block separators with whitespace in closing tags', () => {
+      expect(stripHtmlTags('<p>first</p ><p>second</p>')).toBe('first second');
+    });
+
+    it('preserves comparison text and escaped markup as text', () => {
+      expect(stripHtmlTags('1 < 2 and 3 > 2 &lt;b&gt;literal&lt;/b&gt;')).toBe(
+        '1 < 2 and 3 > 2 <b>literal</b>',
+      );
+    });
+
+    it('handles deeply nested tags without recursive traversal', () => {
+      expect(stripHtmlTags(`${'<div>'.repeat(10000)}kept${'</div>'.repeat(10000)}`)).toBe('kept');
+    });
+  });
+
   describe('basic tag stripping', () => {
     it('removes simple tags', () => {
       expect(stripHtmlTags('<p>Hello</p>')).toBe('Hello');

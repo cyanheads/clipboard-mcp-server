@@ -129,48 +129,84 @@ export function buildInspectFormats(semanticSet: Set<ClipboardFormat>): {
 }
 
 /**
- * Decode decimal (`&#169;`) and hexadecimal (`&#xA9;`, `&#XA9;`) character
- * references. `String.fromCodePoint` emits the correct surrogate pair for
+ * Decode common named, decimal (`&#169;`), and hexadecimal (`&#xA9;`, `&#XA9;`)
+ * references in one pass. `String.fromCodePoint` emits the correct surrogate pair for
  * astral code points. A reference outside the Unicode range, or one naming a
  * lone surrogate or NUL — none of which have a standalone text representation —
  * passes through as written rather than throwing.
  */
-function decodeNumericReferences(text: string): string {
-  return text.replace(/&#(x[0-9a-f]+|[0-9]+);/gi, (reference, digits: string) => {
-    const codePoint =
-      digits[0] === 'x' || digits[0] === 'X'
-        ? Number.parseInt(digits.slice(1), 16)
-        : Number.parseInt(digits, 10);
-    if (codePoint <= 0 || codePoint > 0x10ffff) return reference;
-    if (codePoint >= 0xd800 && codePoint <= 0xdfff) return reference;
-    return String.fromCodePoint(codePoint);
-  });
+function decodeReferences(text: string): string {
+  const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', nbsp: ' ' };
+  return text.replace(
+    /&(?:#(x[0-9a-f]+|[0-9]+)|(amp|lt|gt|quot|nbsp));/gi,
+    (reference, digits: string | undefined, name: string | undefined) => {
+      if (digits === undefined) return named[name ?? ''] ?? reference;
+      const codePoint =
+        digits[0] === 'x' || digits[0] === 'X'
+          ? Number.parseInt(digits.slice(1), 16)
+          : Number.parseInt(digits, 10);
+      if (codePoint <= 0 || codePoint > 0x10ffff) return reference;
+      if (codePoint >= 0xd800 && codePoint <= 0xdfff) return reference;
+      return String.fromCodePoint(codePoint);
+    },
+  );
 }
 
 /** Strip HTML tags to produce plain text, decoding common entities. */
 export function stripHtmlTags(html: string): string {
-  const decoded = decodeNumericReferences(
-    html
-      // Remove script and style blocks entirely (content, not just tags)
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
-      // Insert a space before block-level closing tags so adjacent blocks don't merge
-      .replace(
-        /<\/(p|h[1-6]|div|li|td|tr|blockquote|pre|article|section|header|footer|aside|nav|main|figure|figcaption)>/gi,
-        ' ',
-      )
-      // Also insert a space before self-closing <br> tags
-      .replace(/<br\s*\/?>/gi, ' ')
-      // Strip remaining tags
-      .replace(/<[^>]+>/g, '')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&nbsp;/g, ' '),
-  );
-  return decoded.replace(/\s+/g, ' ').trim();
+  const parts: string[] = [];
+  const block =
+    /^(?:p|h[1-6]|div|li|td|tr|blockquote|pre|article|section|header|footer|aside|nav|main|figure|figcaption)$/;
+  let hidden: string | undefined;
+  let cursor = 0;
+  while (cursor < html.length) {
+    if (hidden) {
+      const close = new RegExp(`</${hidden}\\s*>`, 'gi');
+      close.lastIndex = cursor;
+      const match = close.exec(html);
+      if (!match) break;
+      cursor = close.lastIndex;
+      hidden = undefined;
+      continue;
+    }
+    const start = html.indexOf('<', cursor);
+    if (start === -1) {
+      parts.push(html.slice(cursor));
+      break;
+    }
+    parts.push(html.slice(cursor, start));
+    if (html.startsWith('<!--', start)) {
+      const end = html.indexOf('-->', start + 4);
+      cursor = end === -1 ? html.length : end + 3;
+      continue;
+    }
+    const tag = /^<[!/]?([a-z][a-z0-9:-]*)(?=[\s/>])/i.exec(html.slice(start));
+    if (!tag?.[1]) {
+      parts.push('<');
+      cursor = start + 1;
+      continue;
+    }
+    const name = tag[1].toLowerCase();
+    const closing = html[start + 1] === '/';
+    let end = start + tag[0].length;
+    let quote: string | undefined;
+    for (; end < html.length; end++) {
+      const char = html[end];
+      if (quote) {
+        if (char === quote) quote = undefined;
+      } else if (char === '"' || char === "'") {
+        quote = char;
+      } else if (char === '>') break;
+    }
+    if (!closing && (name === 'script' || name === 'style')) {
+      hidden = name;
+    } else if (name === 'br' || (closing && block.test(name))) {
+      parts.push(' ');
+    }
+    cursor = end + 1;
+  }
+  // Decode after tokenization, once: escaped markup remains literal text.
+  return decodeReferences(parts.join('')).replace(/\s+/g, ' ').trim();
 }
 
 /**
