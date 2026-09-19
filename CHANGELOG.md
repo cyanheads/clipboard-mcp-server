@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-09-19
 
-HTML clipboard writes preserve correct plain-text fallbacks while framework configuration treats untouched client placeholders as unset.
+HTML clipboard writes preserve plain-text fidelity; whole-value configuration placeholders use defaults.
 
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-09-09
 
