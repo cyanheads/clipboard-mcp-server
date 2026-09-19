@@ -22,7 +22,8 @@
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
         "NODE_ENV": "production",
-        "CLIPBOARD_READ_ONLY": "${user_config.CLIPBOARD_READ_ONLY}"
+        "CLIPBOARD_READ_ONLY": "${user_config.CLIPBOARD_READ_ONLY}",
+        "MCP_LOG_LEVEL": "${user_config.MCP_LOG_LEVEL}"
       }
     }
   },
