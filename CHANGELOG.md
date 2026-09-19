@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-09-19
+
+HTML clipboard writes preserve correct plain-text fallbacks while framework configuration treats untouched client placeholders as unset.
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-09-09
 
 clipboard_read supports offset/limit slicing bounded in memory, Linux inspect measures type sizes without buffering them, and pbpaste/pbcopy pin UTF-8 locale
