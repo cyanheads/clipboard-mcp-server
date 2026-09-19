@@ -70,13 +70,6 @@ export const clipboardInspect = tool('clipboard_inspect', {
       recovery:
         'Retry clipboard_inspect once; if it fails again, copy the content afresh — the application holding the clipboard published metadata this server cannot decode.',
     },
-    {
-      reason: 'clipboard_unavailable',
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Required clipboard tool not found on this platform.',
-      recovery:
-        'Install the platform clipboard tool: macOS (built-in), Linux X11 (apt install xclip), Linux Wayland (apt install wl-clipboard), Windows (PowerShell 5.1+).',
-    },
   ],
 
   async handler(_input, ctx) {

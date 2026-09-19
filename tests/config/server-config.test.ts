@@ -29,6 +29,11 @@ describe('getServerConfig', () => {
     expect(getServerConfig().readOnly).toBe(false);
   });
 
+  it('treats an unsubstituted CLIPBOARD_READ_ONLY placeholder as unset', () => {
+    vi.stubEnv('CLIPBOARD_READ_ONLY', `\${CLIPBOARD_READ_ONLY}`);
+    expect(getServerConfig().readOnly).toBe(false);
+  });
+
   it.each(['true', '1', 'yes', 'on', 'TRUE', 'On'])('parses %s as true', (value) => {
     vi.stubEnv('CLIPBOARD_READ_ONLY', value);
     expect(getServerConfig().readOnly).toBe(true);

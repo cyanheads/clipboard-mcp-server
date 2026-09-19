@@ -13,7 +13,7 @@ import { clipboardWrite } from './mcp-server/tools/definitions/clipboard-write.t
 import { initClipboardService } from './services/clipboard/clipboard-service.js';
 
 /**
- * Server-chosen defaults for two framework settings, applied the way the
+ * Server-chosen default for the HTTP body cap, applied the way the
  * framework applies its own `name`/`version` overrides: write to `process.env`,
  * then re-parse.
  *
@@ -33,13 +33,6 @@ void config.mcpTransportType;
  * `content_too_large` error.
  */
 process.env.MCP_HTTP_MAX_BODY_BYTES ??= '7340032';
-
-/**
- * Nothing here keys on a session: `ctx.state` is tenant-scoped and every call
- * reads the live OS clipboard. Stateless drops the session store and the
- * per-session `McpServer` allocation.
- */
-process.env.MCP_SESSION_MODE ??= 'stateless';
 
 resetConfig();
 
@@ -72,6 +65,8 @@ function buildInstructions(writeEnabled: boolean): string {
 await createApp({
   name: 'clipboard-mcp-server',
   title: 'clipboard-mcp-server',
+  // Each call reads the live OS clipboard; no handler requires a session.
+  sessionMode: 'stateless',
   instructions: buildInstructions(!readOnly),
   tools: [clipboardInspect, clipboardRead, writeTool],
   resources: [],

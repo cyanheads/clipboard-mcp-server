@@ -158,6 +158,20 @@ describe('default HTTP launch', () => {
 });
 
 describe('operator-selected stateful sessions', () => {
+  it.each(['', `\${MCP_SESSION_MODE}`])(
+    'uses the server default for unset session value %s',
+    async (value) => {
+      const instance = await startServer({ env: { MCP_SESSION_MODE: value } });
+      try {
+        const response = await initialize(instance.url);
+        expect(response.status).toBe(200);
+        expect(response.headers.get('mcp-session-id')).toBeNull();
+      } finally {
+        await instance.stop();
+      }
+    },
+  );
+
   let server: RunningServer;
 
   beforeAll(async () => {

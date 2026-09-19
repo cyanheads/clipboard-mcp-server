@@ -79,13 +79,6 @@ export const clipboardWrite = tool('clipboard_write', {
       recovery:
         'Content is too large to write to the clipboard. Truncate or summarize before writing.',
     },
-    {
-      reason: 'clipboard_unavailable',
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Required clipboard tool not found on this platform.',
-      recovery:
-        'Install the platform clipboard tool: macOS (built-in), Linux X11 (apt install xclip), Linux Wayland (apt install wl-clipboard), Windows (PowerShell 5.1+).',
-    },
   ],
 
   async handler(input, ctx) {

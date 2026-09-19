@@ -134,13 +134,6 @@ export const clipboardRead = tool('clipboard_read', {
         'Retry with offset: 0 and a limit at or under the format size limit to read a bounded slice, then follow nextOffset ' +
         'until complete is true — or call clipboard_inspect and request a smaller format instead.',
     },
-    {
-      reason: 'clipboard_unavailable',
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Required clipboard tool not found on this platform.',
-      recovery:
-        'Install the platform clipboard tool: macOS (built-in), Linux X11 (apt install xclip), Linux Wayland (apt install wl-clipboard), Windows (PowerShell 5.1+).',
-    },
   ],
 
   async handler(input, ctx) {

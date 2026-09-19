@@ -14,18 +14,14 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
  * would turn the string `"false"` into `true`, leaving the flag impossible to
  * switch off from the environment.
  *
- * A blank value is normalized to unset so it takes the default, matching how the
- * framework's core config treats the variables sitting beside this one in a
- * `.env`. `z.stringbool()` alone rejects `''`, which would turn a blanked-out
- * line into a startup failure. A genuinely unrecognized value still fails loudly.
+ * parseEnvConfig normalizes blank and unsubstituted placeholder values to unset;
+ * z.stringbool() itself rejects those values.
  */
 const envBoolean = z.union([z.boolean(), z.stringbool()]);
-const blankAsUndefined = (value: unknown): unknown =>
-  typeof value === 'string' && value.trim() === '' ? undefined : value;
 
 const ServerConfigSchema = z.object({
-  readOnly: z
-    .preprocess(blankAsUndefined, envBoolean.default(false))
+  readOnly: envBoolean
+    .default(false)
     .describe(
       'Serve the clipboard read-only. When true, clipboard_write is not registered: it stays visible on the manifest and landing page but is absent from tools/list and uncallable. Defaults to false.',
     ),
