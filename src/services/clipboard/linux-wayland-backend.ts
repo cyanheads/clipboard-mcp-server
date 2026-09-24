@@ -15,7 +15,9 @@ import type {
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats } from './types.js';
+import { buildInspectFormats, clipboardOutcome, isClipboardOutcome } from './types.js';
+
+const PLATFORM = 'Linux Wayland';
 
 const TEXT_MIME_TYPES: readonly string[] = [
   'text/plain',
@@ -24,6 +26,20 @@ const TEXT_MIME_TYPES: readonly string[] = [
   'TEXT',
   'STRING',
 ];
+
+/** MIME types each semantic format is read from, in preference order. */
+const FORMAT_MIME_TYPES: Record<ClipboardFormat, readonly string[]> = {
+  text: TEXT_MIME_TYPES,
+  html: ['text/html'],
+  rtf: ['text/rtf', 'application/rtf'],
+  image: ['image/png'],
+};
+
+const INSTALL_HINT =
+  'Install wl-clipboard (apt install wl-clipboard on Debian/Ubuntu, pacman -S wl-clipboard on Arch, dnf install wl-clipboard on Fedora), then retry.';
+
+const SESSION_HINT =
+  'Run the server inside the Wayland desktop session so WAYLAND_DISPLAY (with XDG_RUNTIME_DIR) names a running compositor socket, then retry.';
 
 /** Map MIME type → semantic format. */
 function mimeToFormat(mime: string): ClipboardFormat | null {
@@ -34,48 +50,56 @@ function mimeToFormat(mime: string): ClipboardFormat | null {
   return null;
 }
 
-/** Run wl-paste with the given args. Returns stdout as Buffer. */
-function runWlPaste(args: string[]): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('wl-paste', args, {
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+/**
+ * Classify a non-zero wl-paste/wl-copy exit from its diagnostic. wl-clipboard
+ * 2.1 and earlier print "No selection" / "No suitable type of content copied";
+ * 2.2 and later print "Nothing is copied" / "Clipboard content is not
+ * available as requested type …". A diagnostic matching neither generation
+ * stays an ordinary error.
+ */
+function helperFailure(
+  helper: 'wl-paste' | 'wl-copy',
+  code: number | string | null,
+  stderr: string,
+): Error {
+  const message = `${helper} exited ${code}: ${stderr}`;
+  if (/^(?:Nothing is copied|No selection)$/m.test(stderr)) {
+    return clipboardOutcome(PLATFORM, message, { category: 'empty' });
+  }
+  if (
+    /Clipboard content is not available as requested type|No suitable type of content copied/.test(
+      stderr,
+    )
+  ) {
+    return clipboardOutcome(PLATFORM, message, { category: 'format_unavailable' });
+  }
+  if (/Failed to connect to a Wayland server/.test(stderr)) {
+    return clipboardOutcome(PLATFORM, message, {
+      category: 'clipboard_unavailable',
+      recoveryHint: SESSION_HINT,
     });
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => out.push(chunk));
-    child.stderr.on('data', (chunk: Buffer) => err.push(chunk));
-    child.on('close', (code) => {
-      if (code !== 0) {
-        const msg = Buffer.concat(err).toString('utf8').trim();
-        if (msg.includes('nothing is copied')) {
-          resolve(Buffer.alloc(0));
-        } else {
-          reject(new Error(`wl-paste exited ${code}: ${msg}`));
-        }
-      } else {
-        resolve(Buffer.concat(out));
-      }
-    });
-    child.on('error', (err) => {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('wl-paste not found — install with: apt install wl-clipboard'));
-      } else {
-        reject(err);
-      }
-    });
-  });
+  }
+  return new Error(message);
+}
+
+/** Classify a spawn failure: a missing helper binary makes the clipboard unavailable. */
+function spawnFailure(helper: 'wl-paste' | 'wl-copy', error: Error): Error {
+  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return error;
+  return clipboardOutcome(
+    PLATFORM,
+    `${helper} not found — install with: apt install wl-clipboard`,
+    { category: 'clipboard_unavailable', recoveryHint: INSTALL_HINT },
+    error,
+  );
 }
 
 /**
  * Run wl-paste with `args`, streaming its stdout through `consume` instead of
- * buffering it. `emptyResult` is what a "nothing is copied" non-zero exit
- * resolves to — the empty-clipboard case, not a failure.
+ * buffering it — `consume` decides how much (if any) of the stream to retain.
  */
 function runWlPasteStream<T>(
   args: string[],
   consume: (stdout: Readable) => Promise<T>,
-  emptyResult: T,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const child = spawn('wl-paste', args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -84,47 +108,41 @@ function runWlPasteStream<T>(
     child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
     child.on('close', (code) => {
       resultPromise.then((result) => {
-        if (code === 0) {
-          resolve(result);
-          return;
-        }
-        const msg = Buffer.concat(err).toString('utf8').trim();
-        if (msg.includes('nothing is copied')) {
-          resolve(emptyResult);
-        } else {
-          reject(new Error(`wl-paste exited ${code}: ${msg}`));
-        }
+        if (code === 0) resolve(result);
+        else reject(helperFailure('wl-paste', code, Buffer.concat(err).toString('utf8').trim()));
       }, reject);
     });
-    child.on('error', (error) => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('wl-paste not found — install with: apt install wl-clipboard'));
-      } else {
-        reject(error);
-      }
-    });
+    child.on('error', (error) => reject(spawnFailure('wl-paste', error)));
   });
+}
+
+/** A range covering a whole stream — for the type listing, which is always small. */
+const WHOLE_STREAM: ByteRange = { offset: 0, limit: Number.MAX_SAFE_INTEGER };
+
+/** The MIME types on offer — empty when nothing is copied. */
+async function listTypes(): Promise<string[]> {
+  let listing: Buffer;
+  try {
+    ({ window: listing } = await runWlPasteStream(['--list-types'], (stdout) =>
+      collectByteWindow(stdout, WHOLE_STREAM),
+    ));
+  } catch (error) {
+    if (isClipboardOutcome(error) && error.category === 'empty') return [];
+    throw error;
+  }
+  return listing
+    .toString('utf8')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /**
- * Run wl-paste and return the `[range.offset, range.offset + range.limit)`
- * byte window plus the stream's total size — wl-paste has no native range
- * support, so this streams stdout through `collectByteWindow` rather than
- * buffering the whole representation before slicing.
+ * Args reading one representation's exact bytes. Without `--no-newline`,
+ * wl-paste appends "\n" to every type it treats as text (#35).
  */
-function runWlPasteWindow(
-  args: string[],
-  range: ByteRange,
-): Promise<{ totalByteSize: number; window: Buffer }> {
-  return runWlPasteStream(args, (stdout) => collectByteWindow(stdout, range), {
-    totalByteSize: 0,
-    window: Buffer.alloc(0),
-  });
-}
-
-/** Run wl-paste and count its stdout bytes without retaining any of them. */
-function runWlPasteCount(args: string[]): Promise<number> {
-  return runWlPasteStream(args, (stdout) => countBytes(stdout), 0);
+function payloadArgs(mime: string): string[] {
+  return ['--no-newline', '-t', mime];
 }
 
 /**
@@ -135,7 +153,11 @@ function runWlPasteCount(args: string[]): Promise<number> {
  * wl-copy drains stdin into a temp file, issues `set_selection`, and only once
  * that has gone through does it fork and let the process Node spawned exit 0.
  * That exit therefore proves both halves of the write; a non-zero exit, a spawn
- * failure, or a broken stdin pipe all mean the selection was never set.
+ * failure, or a broken stdin pipe all mean the selection was never set. A
+ * failed run never forks, so its outcome waits for `close`, by which point the
+ * whole diagnostic has been read. A broken stdin pipe means wl-copy exited
+ * before draining it — it connects to the compositor first — so its exit
+ * status, not the EPIPE, says why.
  */
 function runWlCopy(args: string[], content?: Buffer): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -145,6 +167,7 @@ function runWlCopy(args: string[], content?: Buffer): Promise<void> {
       detached: true,
     });
     const err: Buffer[] = [];
+    let stdinError: Error | undefined;
     let settled = false;
     const settle = (error?: Error) => {
       if (settled) return;
@@ -156,25 +179,18 @@ function runWlCopy(args: string[], content?: Buffer): Promise<void> {
     };
 
     child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
-    child.on('error', (error) => {
-      settle(
-        (error as NodeJS.ErrnoException).code === 'ENOENT'
-          ? new Error('wl-copy not found — install with: apt install wl-clipboard')
-          : error,
-      );
-    });
-    // Without this listener a broken pipe raises an unhandled 'error' event
-    // while the write promise sits pending forever.
+    child.on('error', (error) => settle(spawnFailure('wl-copy', error)));
+    // Without this listener a broken pipe raises an unhandled 'error' event.
     child.stdin?.on('error', (error: Error) => {
-      settle(new Error(`wl-copy stdin write failed: ${error.message}`));
+      stdinError = error;
     });
-    child.on('exit', (code, signal) => {
-      if (code === 0) {
-        settle();
-        return;
-      }
-      const detail = Buffer.concat(err).toString('utf8').trim();
-      settle(new Error(`wl-copy exited ${code ?? signal}: ${detail}`));
+    child.on('exit', (code) => {
+      if (code !== 0) return;
+      settle(stdinError && new Error(`wl-copy stdin write failed: ${stdinError.message}`));
+    });
+    child.on('close', (code, signal) => {
+      if (code === 0) return;
+      settle(helperFailure('wl-copy', code ?? signal, Buffer.concat(err).toString('utf8').trim()));
     });
 
     // stdin is a pipe exactly when there is content to send.
@@ -185,13 +201,7 @@ function runWlCopy(args: string[], content?: Buffer): Promise<void> {
 /** Linux Wayland clipboard backend using wl-paste/wl-copy. */
 export class LinuxWaylandBackend implements ClipboardBackend {
   async inspect(): Promise<InspectResult> {
-    // wl-paste --list-types lists available MIME types
-    const buf = await runWlPaste(['--list-types']);
-    const mimes = buf
-      .toString('utf8')
-      .split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const mimes = await listTypes();
 
     const rawTypes: RawTypeEntry[] = [];
     const semanticSet = new Set<ClipboardFormat>();
@@ -200,17 +210,11 @@ export class LinuxWaylandBackend implements ClipboardBackend {
       const fmt = mimeToFormat(mime);
       if (fmt) semanticSet.add(fmt);
       // Read each recognized MIME type to measure size
-      if (
-        TEXT_MIME_TYPES.includes(mime) ||
-        mime === 'text/html' ||
-        mime === 'text/rtf' ||
-        mime === 'application/rtf' ||
-        mime === 'image/png'
-      ) {
+      if (fmt) {
         try {
           // Stream and count — clipboard_inspect is metadata-only, so the
           // representation is never retained just to report its size (#26).
-          const bytes = await runWlPasteCount(['-t', mime]);
+          const bytes = await runWlPasteStream(payloadArgs(mime), countBytes);
           rawTypes.push({ type: mime, bytes });
         } catch {
           // --list-types advertised this MIME type but reading it failed —
@@ -225,51 +229,42 @@ export class LinuxWaylandBackend implements ClipboardBackend {
     return { rawTypes, ...buildInspectFormats(semanticSet) };
   }
 
+  /**
+   * Presence is decided from `--list-types`; a listed representation is read
+   * as-is, so a zero-byte one is an empty success rather than an absent one.
+   */
   async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
-    switch (format) {
-      case 'text': {
-        let lastError: unknown;
-        for (const mime of TEXT_MIME_TYPES) {
-          try {
-            const { window, totalByteSize } = await runWlPasteWindow(['-t', mime], range);
-            return { format: 'text', content: window, totalByteSize };
-          } catch (error) {
-            if (error instanceof Error && error.message.startsWith('wl-paste not found'))
-              throw error;
-            lastError = error;
-          }
-        }
-        throw lastError;
-      }
-      case 'html': {
-        const { window, totalByteSize } = await runWlPasteWindow(['-t', 'text/html'], range);
-        if (totalByteSize === 0) throw new Error('HTML format not found on clipboard');
-        return { format: 'html', content: window, totalByteSize };
-      }
-      case 'rtf': {
-        let result: { totalByteSize: number; window: Buffer };
-        try {
-          result = await runWlPasteWindow(['-t', 'text/rtf'], range);
-        } catch {
-          result = await runWlPasteWindow(['-t', 'application/rtf'], range);
-        }
-        if (result.totalByteSize === 0) throw new Error('RTF format not found on clipboard');
-        return { format: 'rtf', content: result.window, totalByteSize: result.totalByteSize };
-      }
-      case 'image': {
-        const { window, totalByteSize } = await runWlPasteWindow(['-t', 'image/png'], range);
-        if (totalByteSize === 0) throw new Error('Image format not found on clipboard');
+    const offered = await listTypes();
+    if (offered.length === 0) {
+      throw clipboardOutcome(PLATFORM, 'The clipboard is empty.', { category: 'empty' });
+    }
+    const candidates = FORMAT_MIME_TYPES[format].filter((mime) => offered.includes(mime));
+    if (candidates.length === 0) {
+      throw clipboardOutcome(
+        PLATFORM,
+        `No ${format} representation on the clipboard (offered: ${offered.join(', ')}).`,
+        { category: 'format_unavailable' },
+      );
+    }
+
+    let lastError: unknown;
+    for (const mime of candidates) {
+      try {
+        const { window, totalByteSize } = await runWlPasteStream(payloadArgs(mime), (stdout) =>
+          collectByteWindow(stdout, range),
+        );
         // wl-paste hands over opaque bytes with no dimension API — read them out
         // of the PNG header so Linux reads carry what macOS and Windows report.
         // The header only lives in the window when the window starts at byte 0.
-        return {
-          format: 'image',
-          content: window,
-          totalByteSize,
-          ...(range.offset === 0 ? readPngDimensions(window) : {}),
-        };
+        const dimensions =
+          format === 'image' && range.offset === 0 ? readPngDimensions(window) : {};
+        return { format, content: window, totalByteSize, ...dimensions };
+      } catch (error) {
+        if (isClipboardOutcome(error) && error.category === 'clipboard_unavailable') throw error;
+        lastError = error;
       }
     }
+    throw lastError;
   }
 
   async write(
