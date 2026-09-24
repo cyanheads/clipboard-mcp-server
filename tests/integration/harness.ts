@@ -100,7 +100,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
     LOGS_DIR: createTempDir('clipboard-mcp-logs-'),
     MCP_TRANSPORT_TYPE: 'http',
     MCP_HTTP_HOST: '127.0.0.1',
-    MCP_HTTP_PORT: String(3100 + Math.floor(Math.random() * 700)),
+    /** Port 0 takes a free ephemeral port, never a fetch-blocked one like 3659; the listen line reports it. */
+    MCP_HTTP_PORT: '0',
     MCP_LOG_LEVEL: 'info',
     DISPLAY: process.env.DISPLAY ?? ':0',
     ...env,
