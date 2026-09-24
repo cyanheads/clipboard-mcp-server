@@ -79,7 +79,7 @@ async function detectBackend(): Promise<ClipboardBackend> {
   const platform = process.platform;
 
   if (platform === 'darwin') {
-    // pbcopy/pbpaste and osascript are built-in on macOS — no detection needed.
+    // pbpaste and osascript are built-in on macOS — no detection needed.
     return new MacosBackend();
   }
 

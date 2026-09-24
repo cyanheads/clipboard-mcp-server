@@ -1,5 +1,6 @@
 /**
- * @fileoverview macOS clipboard backend using pbcopy/pbpaste (text) and JXA/NSPasteboard (rich types).
+ * @fileoverview macOS clipboard backend: pbpaste for text reads, and JXA/NSPasteboard
+ * (via osascript) for inspection, rich-format reads, every write, and clear.
  * @module services/clipboard/macos-backend
  */
 
@@ -10,10 +11,17 @@ import type {
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
+  RangedReadWindow,
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats, parseNativeTypeEntries, stripHtmlTags } from './types.js';
+import {
+  buildInspectFormats,
+  clipboardOutcome,
+  parseNativeTypeEntries,
+  parseRangedReadEnvelope,
+  stripHtmlTags,
+} from './types.js';
 
 /**
  * JXA script for inspecting pasteboard types.
@@ -25,11 +33,11 @@ ObjC.import('AppKit');
 const pb = $.NSPasteboard.generalPasteboard;
 const types = pb.types;
 const result = [];
-if (types && types.count > 0) {
+if (!types.isNil()) {
   for (let i = 0; i < types.count; i++) {
     const t = ObjC.unwrap(types.objectAtIndex(i));
     const data = pb.dataForType(t);
-    const bytes = data && data.length ? Number(data.length) : 0;
+    const bytes = data.isNil() ? 0 : Number(data.length);
     result.push({ type: t, bytes: bytes });
   }
 }
@@ -50,30 +58,20 @@ pb.clearContents;
 `.trim();
 
 /**
- * Envelope every ranged JXA read script prints: `present` mirrors whether the
- * type exists on the pasteboard at all, `total` is the full representation's
- * byte size, and `contentBase64` is only the `[offset, offset + limit)`
- * window — the JXA process holds the full representation in its own memory
- * (unavoidable — that's how NSPasteboard works), but Node never receives more
- * than the requested window.
+ * Clamp-and-slice snippet shared by every ranged JXA read script, given a
+ * non-nil NSData `dataVar`. Prints the `{ present, total, contentBase64 }`
+ * envelope `parseRangedReadEnvelope` reads: `total` is the full
+ * representation's byte size and `contentBase64` only the `[offset, offset +
+ * limit)` window — the JXA process holds the full representation (that is how
+ * NSPasteboard works), but Node never receives more than the window. The slice
+ * location is clamped to `total`, so one `subdataWithRange` covers every
+ * offset: past the end it is a valid empty range at `total`.
  */
-interface JxaRangedReadEnvelope {
-  contentBase64?: string;
-  height?: number;
-  present: boolean;
-  total?: number;
-  width?: number;
-}
-
-/** Clamp-and-slice snippet shared by every ranged JXA read script, given an NSData-ish `dataVar`. */
 function jxaSliceSnippet(dataVar: string, range: ByteRange, extraFields = ''): string {
   return `
 const total = Number(${dataVar}.length);
-const offset = ${range.offset};
-const sliceLen = Math.max(0, Math.min(${range.limit}, total - offset));
-const slice = offset <= total
-  ? ${dataVar}.subdataWithRange({ location: offset, length: sliceLen })
-  : $.NSData.alloc.initWithLength(0);
+const location = Math.min(${range.offset}, total);
+const slice = ${dataVar}.subdataWithRange({ location: location, length: Math.min(${range.limit}, total - location) });
 const b64 = ObjC.unwrap(slice.base64EncodedStringWithOptions(0));
 JSON.stringify({ present: true, total: total, contentBase64: b64${extraFields} });
 `;
@@ -81,8 +79,12 @@ JSON.stringify({ present: true, total: total, contentBase64: b64${extraFields} }
 
 /**
  * JXA script builder for reading HTML from the pasteboard, bounded to `range`.
- * Emits a `JxaRangedReadEnvelope`. The HTML string is re-encoded as UTF-8 so
- * the byte range the service trims to UTF-8 boundaries matches this response.
+ * Prints the ranged-read envelope (see `jxaSliceSnippet`). The HTML string is re-encoded as UTF-8 so
+ * the byte range the service trims to UTF-8 boundaries matches this response;
+ * a `public.html` AppKit cannot decode as a string is sliced as its raw bytes.
+ *
+ * Every nil test in the JXA read scripts uses `.isNil()`: a nil Objective-C
+ * return is a truthy wrapper in JXA, so `!value` never detects it.
  */
 function buildJxaReadHtml(range: ByteRange): string {
   assertByteRange(range);
@@ -90,10 +92,12 @@ function buildJxaReadHtml(range: ByteRange): string {
 ObjC.import('AppKit');
 const pb = $.NSPasteboard.generalPasteboard;
 const html = pb.stringForType($.NSPasteboardTypeHTML);
-if (!html) {
+const data = html.isNil()
+  ? pb.dataForType($.NSPasteboardTypeHTML)
+  : html.dataUsingEncoding($.NSUTF8StringEncoding);
+if (data.isNil()) {
   JSON.stringify({ present: false });
 } else {
-  const data = html.dataUsingEncoding($.NSUTF8StringEncoding);
   ${jxaSliceSnippet('data', range)}
 }
 `.trim();
@@ -111,14 +115,14 @@ ObjC.import('AppKit');
 const pb = $.NSPasteboard.generalPasteboard;
 const rtfType = 'com.apple.flat-rtfd';
 const publicRtf = 'public.rtf';
+const hasBytes = (d) => !d.isNil() && Number(d.length) > 0;
 let data = pb.dataForType(rtfType);
-if (!data || !data.length) data = pb.dataForType(publicRtf);
-if (!data || !data.length) {
-  const s = pb.stringForType(publicRtf);
-  const sv = s ? ObjC.unwrap(s) : null;
-  data = sv != null ? $.NSString.alloc.initWithString(sv).dataUsingEncoding($.NSUTF8StringEncoding) : null;
+if (!hasBytes(data)) data = pb.dataForType(publicRtf);
+if (!hasBytes(data)) {
+  const str = pb.stringForType(publicRtf);
+  data = str.isNil() ? str : str.dataUsingEncoding($.NSUTF8StringEncoding);
 }
-if (!data) {
+if (data.isNil()) {
   JSON.stringify({ present: false });
 } else {
   ${jxaSliceSnippet('data', range)}
@@ -141,21 +145,21 @@ const imgTypes = ['public.png', 'public.tiff', 'com.apple.pict'];
 let imgData = null;
 for (const t of imgTypes) {
   const d = pb.dataForType(t);
-  if (d && d.length) { imgData = d; break; }
+  if (!d.isNil() && Number(d.length) > 0) { imgData = d; break; }
 }
-if (!imgData) {
+if (imgData === null) {
   JSON.stringify({ present: false });
 } else {
   const img = $.NSImage.alloc.initWithData(imgData);
-  if (!img || !img.isValid) {
+  if (img.isNil() || !img.isValid) {
     JSON.stringify({ present: false });
   } else {
     const rep = $.NSBitmapImageRep.imageRepWithData(imgData);
-    if (!rep) {
+    if (rep.isNil()) {
       JSON.stringify({ present: false });
     } else {
       const pngData = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, {});
-      if (!pngData || !pngData.length) {
+      if (pngData.isNil() || Number(pngData.length) === 0) {
         JSON.stringify({ present: false });
       } else {
         const w = Math.round(ObjC.unwrap(rep.pixelsWide));
@@ -169,39 +173,57 @@ if (!imgData) {
 }
 
 /**
- * JXA script for writing HTML + plain-text fallback to the pasteboard.
- * Receives both representations as JSON-quoted base64 literals so raw user content
- * is never interpolated into the script source.
+ * Static JXA writer for every text and HTML write. The payload arrives on
+ * stdin as a JSON envelope of base64 UTF-8 fields — `{ text, html? }` — and is
+ * parsed as data, so no payload byte reaches the command line or the script
+ * source, and argv is identical for every write. Text is published with
+ * `setStringForType` as `public.utf8-plain-text` (pbcopy would re-type input
+ * that starts with an RTF or EPS header). Every set is checked; a failure
+ * throws, which exits osascript non-zero.
  */
-function buildJxaWriteHtml(htmlBase64: string, plaintextBase64: string): string {
-  // Values are base64-encoded bytes passed as literals — no user content in script source.
-  return `
+const JXA_WRITE = `
 ObjC.import('AppKit');
-const htmlB64 = ${JSON.stringify(htmlBase64)};
-const ptB64 = ${JSON.stringify(plaintextBase64)};
-const htmlData = $.NSData.alloc.initWithBase64EncodedStringOptions(htmlB64, 0);
-const htmlStr = $.NSString.alloc.initWithDataEncoding(htmlData, $.NSUTF8StringEncoding);
-const ptData = $.NSData.alloc.initWithBase64EncodedStringOptions(ptB64, 0);
-const ptStr = $.NSString.alloc.initWithDataEncoding(ptData, $.NSUTF8StringEncoding);
+const input = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+const envelope = JSON.parse(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(input, $.NSUTF8StringEncoding)));
+function decode(field) {
+  const bytes = $.NSData.alloc.initWithBase64EncodedStringOptions(envelope[field], 0);
+  if (bytes.isNil()) throw new Error('payload field ' + field + ' is not base64');
+  // initWithData drops a leading byte-order mark, so decode behind a one-byte
+  // ASCII sentinel and cut it off again: every payload byte survives.
+  const guarded = $.NSMutableData.dataWithData($.NSData.alloc.initWithBase64EncodedStringOptions('YQ==', 0));
+  guarded.appendData(bytes);
+  const str = $.NSString.alloc.initWithDataEncoding(guarded, $.NSUTF8StringEncoding);
+  if (str.isNil()) throw new Error('payload field ' + field + ' is not UTF-8');
+  return str.substringFromIndex(1);
+}
+const text = decode('text');
+const html = envelope.html === undefined ? null : decode('html');
 const pb = $.NSPasteboard.generalPasteboard;
 pb.clearContents;
-pb.setStringForType(htmlStr, $.NSPasteboardTypeHTML);
-pb.setStringForType(ptStr, $.NSPasteboardTypeString);
-'ok';
-`.trim();
+if (html !== null) {
+  if (!pb.setStringForType(html, $.NSPasteboardTypeHTML)) throw new Error('setting public.html failed');
 }
+if (!pb.setStringForType(text, $.NSPasteboardTypeString)) throw new Error('setting public.utf8-plain-text failed');
+'written';
+`.trim();
 
-/** Run a JXA script via osascript and return stdout as a string. */
-function runJxa(script: string): Promise<string> {
+/** Run a JXA script via osascript, optionally feeding `stdin`, and return stdout as a string. */
+function runJxa(script: string, stdin?: Buffer): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn('osascript', ['-l', 'JavaScript', '-e', script], {
       shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
+    if (stdin) {
+      // A script that exits before draining stdin surfaces as its exit code; the
+      // resulting EPIPE on the pipe must not become an unhandled stream error.
+      child.stdin?.on('error', () => undefined);
+      child.stdin?.end(stdin);
+    }
     const out: Buffer[] = [];
     const err: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => out.push(chunk));
-    child.stderr.on('data', (chunk: Buffer) => err.push(chunk));
+    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
     child.on('close', (code) => {
       if (code !== 0) {
         reject(
@@ -216,10 +238,11 @@ function runJxa(script: string): Promise<string> {
 }
 
 /**
- * Environment for pbpaste/pbcopy. Both transcode through the process locale, so a
- * parent with no UTF-8 locale (launchd, `env -i`, some client launchers) would make
- * pbpaste emit one byte for `é` and pbcopy store mojibake. Pinning LC_ALL keeps
- * text bytes equal to the clipboard's UTF-8 bytes on every launch path.
+ * Environment for pbpaste. It transcodes through the process locale, so a parent
+ * with no UTF-8 locale (launchd, `env -i`, some client launchers) would make it
+ * emit one byte for `é`. Pinning LC_ALL keeps text bytes equal to the
+ * clipboard's UTF-8 bytes on every launch path. The JXA writer decodes UTF-8
+ * itself and needs no locale.
  */
 const UTF8_ENV = { ...process.env, LC_ALL: 'en_US.UTF-8' };
 
@@ -247,40 +270,9 @@ function runPbpasteWindow(range: ByteRange): Promise<{ totalByteSize: number; wi
   });
 }
 
-/** Run a ranged JXA read script and decode its `JxaRangedReadEnvelope`. */
-async function runJxaRangedRead(
-  script: string,
-  formatName: string,
-): Promise<{ contentBase64: string; height?: number; total: number; width?: number }> {
-  const raw = await runJxa(script);
-  const parsed = JSON.parse(raw) as JxaRangedReadEnvelope;
-  if (!parsed.present) throw new Error(`${formatName} format not found on clipboard`);
-  if (typeof parsed.total !== 'number' || typeof parsed.contentBase64 !== 'string') {
-    throw new Error(`Invalid JXA response while reading ${formatName}`);
-  }
-  return {
-    total: parsed.total,
-    contentBase64: parsed.contentBase64,
-    ...(parsed.width !== undefined && { width: parsed.width }),
-    ...(parsed.height !== undefined && { height: parsed.height }),
-  };
-}
-
-/** Run pbcopy with content on stdin. */
-function runPbcopy(content: Buffer): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('pbcopy', [], {
-      shell: false,
-      stdio: ['pipe', 'ignore', 'pipe'],
-      env: UTF8_ENV,
-    });
-    child.stdin.end(content);
-    child.on('close', (code) => {
-      if (code !== 0) reject(new Error(`pbcopy exited ${code}`));
-      else resolve();
-    });
-    child.on('error', reject);
-  });
+/** Run a ranged JXA read script and decode the envelope it prints (see `jxaSliceSnippet`). */
+async function runJxaRangedRead(script: string, formatName: string): Promise<RangedReadWindow> {
+  return parseRangedReadEnvelope(await runJxa(script), 'macOS', formatName);
 }
 
 /** Map macOS UTI/pasteboard type → semantic ClipboardFormat. */
@@ -329,7 +321,9 @@ export class MacosBackend implements ClipboardBackend {
         // Inspect first so an empty clipboard gets a proper "not found" error.
         const inspection = await this.inspect();
         if (!inspection.availableFormats.includes('text')) {
-          throw new Error('text format not found on clipboard');
+          throw clipboardOutcome('macOS', 'text format not found on clipboard', {
+            category: 'format_unavailable',
+          });
         }
         const { window, totalByteSize } = await runPbpasteWindow(range);
         return { format: 'text', content: window, totalByteSize };
@@ -373,21 +367,17 @@ export class MacosBackend implements ClipboardBackend {
     content: string,
     format: 'text' | 'html',
   ): Promise<{ format: 'text' | 'html'; byteSize: number }> {
-    if (format === 'text') {
-      const buf = Buffer.from(content, 'utf8');
-      await runPbcopy(buf);
-      return { format: 'text', byteSize: buf.byteLength };
-    }
-
-    // HTML: write both HTML and stripped plain-text fallback via JXA
-    const htmlBuf = Buffer.from(content, 'utf8');
-    const plaintext = stripHtmlTags(content);
-    const ptBuf = Buffer.from(plaintext, 'utf8');
-    const htmlB64 = htmlBuf.toString('base64');
-    const ptB64 = ptBuf.toString('base64');
-    const script = buildJxaWriteHtml(htmlB64, ptB64);
-    await runJxa(script);
-    return { format: 'html', byteSize: htmlBuf.byteLength };
+    const buf = Buffer.from(content, 'utf8');
+    // HTML also publishes a tag-stripped plain-text fallback.
+    const envelope =
+      format === 'text'
+        ? { text: buf.toString('base64') }
+        : {
+            text: Buffer.from(stripHtmlTags(content), 'utf8').toString('base64'),
+            html: buf.toString('base64'),
+          };
+    await runJxa(JXA_WRITE, Buffer.from(JSON.stringify(envelope), 'utf8'));
+    return { format, byteSize: buf.byteLength };
   }
 
   async clear(): Promise<void> {

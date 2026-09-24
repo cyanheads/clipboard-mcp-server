@@ -13,8 +13,15 @@ vi.mock('node:child_process', () => ({
 
 import { spawn } from 'node:child_process';
 import { MacosBackend } from '@/services/clipboard/macos-backend.js';
+import { scriptedSpawn } from './scripted-spawn.js';
 
 const mockSpawn = vi.mocked(spawn);
+
+/** Decode the JSON envelope a writer received on stdin. */
+function envelopeOf(stdin: Buffer | undefined): { html?: string; text?: string } {
+  if (!stdin) throw new Error('writer received no stdin');
+  return JSON.parse(stdin.toString('utf8')) as { html?: string; text?: string };
+}
 
 /** Full-representation range: what the service passes for an unranged read. */
 const FULL = { offset: 0, limit: 8 * 1024 * 1024 } as const;
@@ -68,7 +75,7 @@ describe('MacosBackend', () => {
 
   beforeEach(() => {
     backend = new MacosBackend();
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   describe('inspect()', () => {
@@ -284,46 +291,101 @@ describe('MacosBackend', () => {
     });
   });
 
-  describe('write() text', () => {
-    it('writes text via pbcopy with content on stdin', async () => {
-      const child = fakeChild({ stdout: '' });
-      const stdinEnd = vi.fn();
-      Object.assign(child, { stdin: { end: stdinEnd } });
-      mockSpawn.mockReturnValueOnce(child);
+  describe('write() text (#30)', () => {
+    it('writes text through the stdin-fed JXA writer, never pbcopy', async () => {
+      const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
 
       const result = await backend.write('hello', 'text');
-      expect(result.format).toBe('text');
-      expect(result.byteSize).toBe(Buffer.byteLength('hello', 'utf8'));
-      // Content goes to stdin, not command args
-      expect(mockSpawn).toHaveBeenCalledWith('pbcopy', [], expect.any(Object));
+
+      expect(result).toEqual({ format: 'text', byteSize: 5 });
+      expect(fake.calls).toHaveLength(1);
+      const [call] = fake.calls;
+      expect(call?.command).toBe('osascript');
+      expect(call?.args.slice(0, 3)).toEqual(['-l', 'JavaScript', '-e']);
+      expect(envelopeOf(call?.stdin)).toEqual({
+        text: Buffer.from('hello').toString('base64'),
+      });
+    });
+
+    it('publishes text with setStringForType as public.utf8-plain-text', async () => {
+      const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+
+      await backend.write('{\\rtf1 literal}', 'text');
+
+      const script = fake.calls[0]?.args.at(-1) ?? '';
+      expect(script).toContain('fileHandleWithStandardInput');
+      expect(script).toContain('setStringForType(text, $.NSPasteboardTypeString)');
+    });
+
+    it('reports byteSize as the UTF-8 length', async () => {
+      const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+      const text = 'café 😀 世界';
+
+      const result = await backend.write(text, 'text');
+
+      expect(result.byteSize).toBe(Buffer.byteLength(text, 'utf8'));
+      expect(Buffer.from(envelopeOf(fake.calls[0]?.stdin).text ?? '', 'base64').toString()).toBe(
+        text,
+      );
+    });
+
+    it('fails when the writer exits non-zero (a pasteboard set failed)', async () => {
+      const fake = scriptedSpawn(() => ({
+        exitCode: 1,
+        stderr: 'execution error: Error: setting public.utf8-plain-text failed (-2700)',
+      }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+
+      await expect(backend.write('hello', 'text')).rejects.toThrow(
+        /osascript exited 1: .*public\.utf8-plain-text failed/,
+      );
+    });
+
+    it('checks every set in the writer script and throws on failure', async () => {
+      const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+
+      await backend.write('<p>x</p>', 'html');
+
+      const script = fake.calls[0]?.args.at(-1) ?? '';
+      expect(script).toMatch(
+        /if \(!pb\.setStringForType\(html, \$\.NSPasteboardTypeHTML\)\) throw/,
+      );
+      expect(script).toMatch(
+        /if \(!pb\.setStringForType\(text, \$\.NSPasteboardTypeString\)\) throw/,
+      );
+      expect(script).not.toMatch(/^'ok';$/m);
     });
   });
 
   describe('write() html', () => {
-    it('writes HTML via osascript JXA — content never in command args', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
+    it('writes HTML via osascript JXA — content only on stdin', async () => {
+      const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
       const html = '<html><body><p>Test <script>alert(1)</script></p></body></html>';
+
       const result = await backend.write(html, 'html');
-      expect(result.format).toBe('html');
-      expect(result.byteSize).toBe(Buffer.byteLength(html, 'utf8'));
-      // Verify osascript was called
-      expect(mockSpawn).toHaveBeenCalledWith('osascript', expect.any(Array), expect.any(Object));
-      // The actual HTML content must NOT appear literally in the command arguments array
-      const callArgs = mockSpawn.mock.calls[0];
-      const scriptArg =
-        (callArgs[1] as string[]).find((a) => typeof a === 'string' && a.length > 50) ?? '';
-      expect(scriptArg).not.toContain('<script>alert(1)</script>');
+
+      expect(result).toEqual({ format: 'html', byteSize: Buffer.byteLength(html, 'utf8') });
+      const [call] = fake.calls;
+      expect(call?.command).toBe('osascript');
+      expect(call?.args.join('\n')).not.toContain('alert(1)');
+      expect(call?.args.join('\n')).not.toContain(Buffer.from(html).toString('base64'));
+      expect(envelopeOf(call?.stdin).html).toBe(Buffer.from(html).toString('base64'));
     });
 
     it('writes the tag-stripped plain-text fallback alongside HTML', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
-      const html = '<h1>Title</h1><script>alert(1)</script><p>Body</p>';
+      const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
 
-      await backend.write(html, 'html');
+      await backend.write('<h1>Title</h1><script>alert(1)</script><p>Body</p>', 'html');
 
-      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
-      const script = args.at(-1) ?? '';
-      expect(script).toContain(JSON.stringify(Buffer.from('Title Body').toString('base64')));
+      expect(envelopeOf(fake.calls[0]?.stdin).text).toBe(
+        Buffer.from('Title Body').toString('base64'),
+      );
     });
   });
 
@@ -336,13 +398,14 @@ describe('MacosBackend', () => {
     ])(
       'publishes the decoded %s reference in the plain-text fallback',
       async (_label, html, expected) => {
-        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
+        const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+        mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
 
         await backend.write(html, 'html');
 
-        const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
-        const script = args.at(-1) ?? '';
-        expect(script).toContain(JSON.stringify(Buffer.from(expected, 'utf8').toString('base64')));
+        expect(envelopeOf(fake.calls[0]?.stdin).text).toBe(
+          Buffer.from(expected, 'utf8').toString('base64'),
+        );
       },
     );
   });
@@ -382,39 +445,35 @@ describe('MacosBackend', () => {
       '\x00',
     ];
 
-    it.each(INJECTION_PAYLOADS)(
-      'write text: payload goes to stdin, not args (%s)',
-      async (payload) => {
-        const child = fakeChild({ stdout: '' });
-        const stdinEnd = vi.fn();
-        Object.assign(child, { stdin: { end: stdinEnd } });
-        mockSpawn.mockReturnValueOnce(child);
+    /** argv and decoded stdin for one write of `payload` in `format`. */
+    async function writeCall(payload: string, format: 'text' | 'html') {
+      const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+      await backend.write(payload, format);
+      expect(fake.calls).toHaveLength(1);
+      const [call] = fake.calls;
+      return { command: call?.command, args: call?.args, envelope: envelopeOf(call?.stdin) };
+    }
 
-        await backend.write(payload, 'text').catch(() => {
-          /* ignore */
-        });
-        const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
-        expect(cmd).toBe('pbcopy');
-        // None of the injection payload should appear in the args array
-        for (const arg of args) {
-          expect(arg).not.toContain('$(');
-          expect(arg).not.toContain('`id`');
-        }
+    it.each(INJECTION_PAYLOADS)(
+      'write text: argv is constant and the payload travels only on stdin (%j)',
+      async (payload) => {
+        const baseline = await writeCall('x', 'text');
+        const injected = await writeCall(payload, 'text');
+        expect(injected.command).toBe('osascript');
+        expect(injected.args).toEqual(baseline.args);
+        expect(Buffer.from(injected.envelope.text ?? '', 'base64').toString('utf8')).toBe(payload);
       },
     );
 
     it.each(INJECTION_PAYLOADS)(
-      'write html: payload base64-encoded, not in script source (%s)',
+      'write html: argv is constant and the payload travels only on stdin (%j)',
       async (payload) => {
-        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'ok' }));
-        await backend.write(payload, 'html').catch(() => {
-          /* ignore */
-        });
-        const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
-        expect(cmd).toBe('osascript');
-        const script = (args as string[]).find((a) => a.includes('base64')) ?? '';
-        // The literal injection payload must not appear in the JXA script source
-        expect(script).not.toContain(payload.slice(0, 10));
+        const baseline = await writeCall('<p>x</p>', 'html');
+        const injected = await writeCall(payload, 'html');
+        expect(injected.command).toBe('osascript');
+        expect(injected.args).toEqual(baseline.args);
+        expect(Buffer.from(injected.envelope.html ?? '', 'base64').toString('utf8')).toBe(payload);
       },
     );
   });
@@ -424,7 +483,7 @@ describe('MacosBackend — ranged helper scripts (#7)', () => {
   let backend: MacosBackend;
   beforeEach(() => {
     backend = new MacosBackend();
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   it('interpolates offset and limit into the JXA read scripts as literal integers', async () => {
@@ -433,9 +492,34 @@ describe('MacosBackend — ranged helper scripts (#7)', () => {
       await backend.read(format, { offset: 5, limit: 7 });
       const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
       const script = args.at(-1) ?? '';
-      expect(script).toContain('const offset = 5;');
-      expect(script).toContain('Math.min(7, total - offset)');
+      expect(script).toContain('const location = Math.min(5, total);');
+      expect(script).toContain('Math.min(7, total - location)');
       expect(script).toContain('subdataWithRange');
+    }
+  });
+
+  it('clamps the slice location to the total instead of allocating an empty NSData (#33)', async () => {
+    for (const format of ['html', 'rtf', 'image'] as const) {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('payload')) }));
+      await backend.read(format, { offset: 5, limit: 7 });
+      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+      const script = args.at(-1) ?? '';
+      expect(script).not.toContain('initWithLength');
+      expect(script.match(/subdataWithRange/g)).toHaveLength(1);
+    }
+  });
+
+  it('tests every Objective-C nil with .isNil(), never JS truthiness (#33)', async () => {
+    for (const format of ['html', 'rtf', 'image'] as const) {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('payload')) }));
+      await backend.read(format, { offset: 0, limit: 7 });
+      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+      const script = args.at(-1) ?? '';
+      expect(script).toContain('.isNil()');
+      // A nil wrapper is truthy in JXA: `!x` and `x && …` never see it.
+      expect(script).not.toMatch(/!(html|data|d|img|rep|pngData|s)\b(?!\.)/);
+      expect(script).not.toMatch(/\b(html|data|d|img|rep|pngData|s) &&/);
+      expect(script).not.toMatch(/\b(html|data|d|img|rep|pngData|s) \?/);
     }
   });
 
@@ -461,11 +545,11 @@ describe('MacosBackend — ranged helper scripts (#7)', () => {
   });
 });
 
-describe('MacosBackend — pbpaste/pbcopy run under an explicit UTF-8 locale', () => {
+describe('MacosBackend — pbpaste runs under an explicit UTF-8 locale', () => {
   let backend: MacosBackend;
   beforeEach(() => {
     backend = new MacosBackend();
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   it('spawns pbpaste with LC_ALL=en_US.UTF-8 so text bytes do not depend on the parent locale', async () => {
@@ -481,14 +565,34 @@ describe('MacosBackend — pbpaste/pbcopy run under an explicit UTF-8 locale', (
       expect.objectContaining({ env: expect.objectContaining({ LC_ALL: 'en_US.UTF-8' }) }),
     );
   });
+});
 
-  it('spawns pbcopy with LC_ALL=en_US.UTF-8 so stored text is the UTF-8 bytes it was given', async () => {
-    mockSpawn.mockReturnValueOnce(fakeChild({}));
-    await backend.write('café', 'text');
-    expect(mockSpawn).toHaveBeenLastCalledWith(
-      'pbcopy',
-      [],
-      expect.objectContaining({ env: expect.objectContaining({ LC_ALL: 'en_US.UTF-8' }) }),
-    );
+describe('MacosBackend — typed absent-format outcome (#36)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it.each(['html', 'rtf', 'image'] as const)(
+    'an absent %s representation is format_unavailable',
+    async (format) => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
+      await expect(new MacosBackend().read(format, FULL)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    },
+  );
+
+  it('text on a pasteboard with no text type is format_unavailable', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '[]' }));
+    await expect(new MacosBackend().read('text', FULL)).rejects.toMatchObject({
+      category: 'format_unavailable',
+    });
+  });
+
+  it('a failed osascript run is not mistaken for an absent format', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'execution error: -1728' }));
+    const failure = new MacosBackend().read('html', FULL);
+    await expect(failure).rejects.toThrow(/osascript exited 1/);
+    await expect(failure).rejects.not.toHaveProperty('category');
   });
 });

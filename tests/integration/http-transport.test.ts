@@ -7,7 +7,7 @@
  * @module tests/integration/http-transport.test
  */
 
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -18,6 +18,7 @@ import {
   type InitializeResult,
   initialize,
   type JsonRpcResponse,
+  OSASCRIPT_STDIN_LOG,
   type RunningServer,
   resultOf,
   startServer,
@@ -110,6 +111,14 @@ describe('default HTTP launch', () => {
     }>(response);
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({ format: 'text', byteSize: WRITE_LIMIT });
+    if (process.platform === 'darwin') {
+      // The macOS writer is osascript: the stub, not the real one, got the payload.
+      const received = readFileSync(join(server.stubBin, OSASCRIPT_STDIN_LOG), 'utf8')
+        .trim()
+        .split('\n')
+        .map(Number);
+      expect(Math.max(...received)).toBeGreaterThan(WRITE_LIMIT);
+    }
   });
 
   it.each([

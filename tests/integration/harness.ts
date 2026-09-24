@@ -4,9 +4,10 @@
  *
  * The child gets an explicit environment (never the runner's inherited one) so a
  * stray `MCP_*` variable in the developer's shell cannot decide what a test
- * observes. `PATH` is prefixed with a stub bin directory whose `pbcopy`/`xclip`
- * scripts swallow stdin, so clipboard writes exercised here never touch the real
- * system clipboard.
+ * observes. `PATH` is prefixed with a stub bin directory that shadows every
+ * clipboard helper the backends spawn — including `osascript`, which performs
+ * macOS writes — so nothing exercised here reads or touches the real system
+ * clipboard.
  *
  * @module tests/integration/harness
  */
@@ -29,19 +30,28 @@ function writeScript(path: string, body: string): void {
   chmodSync(path, 0o755);
 }
 
+/** File in the stub bin where the `osascript` stub records each call's stdin byte count. */
+export const OSASCRIPT_STDIN_LOG = 'osascript-stdin.log';
+
 /**
  * Create a bin directory of clipboard stubs. Writers swallow stdin, readers
- * emit nothing — enough for every backend this suite exercises without
- * mutating the developer's real clipboard.
+ * emit nothing, and the `osascript` stub swallows any stdin payload (logging
+ * its byte count to `OSASCRIPT_STDIN_LOG`) and prints an empty type listing
+ * (`[]`) — enough for every backend this suite exercises
+ * without reading or mutating the developer's real clipboard.
  */
 export function createClipboardStubBin(): string {
   const dir = mkdtempSync(join(tmpdir(), 'clipboard-mcp-stub-'));
-  for (const writer of ['pbcopy', 'xclip', 'wl-copy']) {
+  for (const writer of ['xclip', 'xsel', 'wl-copy']) {
     writeScript(join(dir, writer), 'cat > /dev/null');
   }
   for (const reader of ['pbpaste', 'wl-paste']) {
     writeScript(join(dir, reader), "printf ''");
   }
+  writeScript(
+    join(dir, 'osascript'),
+    `wc -c | tr -d ' ' >> "${join(dir, OSASCRIPT_STDIN_LOG)}"\nprintf '[]'`,
+  );
   return dir;
 }
 
@@ -64,6 +74,8 @@ export interface RunningServer {
   log: () => string;
   /** Terminate the child and wait for it to exit. */
   stop: () => Promise<void>;
+  /** The stub bin directory shadowing the clipboard helpers on the child's PATH. */
+  stubBin: string;
   /** Bound MCP endpoint, read off the child's own listen line. */
   url: string;
 }
@@ -143,7 +155,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
     });
   });
 
-  return { url, log: () => output, stop };
+  return { url, log: () => output, stop, stubBin };
 }
 
 export interface JsonRpcResponse {
