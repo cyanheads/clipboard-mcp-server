@@ -216,7 +216,7 @@ bun run test       # Vitest test suite
 
 See [`CLAUDE.md`](./CLAUDE.md) for the full developer protocol — tool patterns, service patterns, error handling, logging conventions, and the checklist for shipping changes. The short version:
 
-- Handlers throw, framework catches — tool logic catches only to map a backend's typed outcome to a declared error reason
+- Handlers throw, framework catches — tool logic catches only to act on a backend's typed outcome: map it to a declared error reason, or move `auto` on to the next format
 - Use `ctx.log` for request-scoped logging
 - No Docker — this server needs direct host OS access (JXA/NSPasteboard, xclip, wl-clipboard, PowerShell), none of which work inside a container
 
