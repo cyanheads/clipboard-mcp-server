@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-09-24
+
+The integration test harness binds an OS-assigned port instead of a random one that could land on fetch-blocked port 3659. Test-only release; the published runtime is unchanged.
+
 ## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-09-24
 
 clipboard_read slices carry a representationId that fails a continuation over a changed clipboard, image slices travel as PNG byte chunks instead of broken images, and clipboard_inspect lists only formats clipboard_read can return.
