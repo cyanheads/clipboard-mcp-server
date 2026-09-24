@@ -1,17 +1,92 @@
 /**
- * @fileoverview Tests for shared domain utilities in types.ts — stripHtmlTags, buildInspectFormats,
- * and the classified-outcome sentinel.
+ * @fileoverview Tests for shared domain utilities in types.ts — stripHtmlTags, buildInspectResult,
+ * the classified-outcome sentinel, and the ranged-read envelope parser.
  * @module tests/services/clipboard/types.test
  */
 
 import { describe, expect, it } from 'vitest';
 import {
-  buildInspectFormats,
+  buildInspectResult,
+  type ClipboardFormat,
   clipboardOutcome,
   inspectUnreadable,
   isClipboardOutcome,
+  isInspectUnreadable,
+  parseNativeTypeEntries,
+  parseRangedReadEnvelope,
   stripHtmlTags,
 } from '@/services/clipboard/types.js';
+
+describe('parseNativeTypeEntries', () => {
+  describe('characterization: measured listings', () => {
+    it('parses a list of measured entries, zero bytes included', () => {
+      expect(
+        parseNativeTypeEntries(
+          '[{"type":"public.html","bytes":12},{"type":"public.utf8-plain-text","bytes":0}]',
+          'macOS',
+        ),
+      ).toEqual([
+        { type: 'public.html', bytes: 12 },
+        { type: 'public.utf8-plain-text', bytes: 0 },
+      ]);
+    });
+
+    it('parses a single object as a one-entry listing, and null as an empty one', () => {
+      expect(parseNativeTypeEntries('{"type":"Text","bytes":5}', 'Windows')).toEqual([
+        { type: 'Text', bytes: 5 },
+      ]);
+      expect(parseNativeTypeEntries('null', 'Windows')).toEqual([]);
+    });
+
+    it.each([
+      ['non-JSON output', 'not json'],
+      ['entries missing a type', '[{"bytes":12}]'],
+      ['entries with a non-numeric size', '[{"type":"public.html","bytes":"big"}]'],
+      ['a bare string', '"public.html"'],
+    ])('rejects %s as unreadable', (_label, raw) => {
+      expect(() => parseNativeTypeEntries(raw, 'macOS')).toThrow(/unreadable/);
+    });
+  });
+
+  describe('#41 — unmeasured and failed entries', () => {
+    it('accepts an entry the helper did not size, keeping bytes absent', () => {
+      const [entry] = parseNativeTypeEntries('[{"type":"Bitmap"}]', 'Windows');
+      expect(entry).toEqual({ type: 'Bitmap' });
+      expect(entry).not.toHaveProperty('bytes');
+    });
+
+    it('accepts a failed measurement, keeping bytes absent', () => {
+      expect(
+        parseNativeTypeEntries(
+          '[{"type":"public.utf8-plain-text","measurementFailed":true},{"type":"public.rtf","bytes":9}]',
+          'macOS',
+        ),
+      ).toEqual([
+        { type: 'public.utf8-plain-text', measurementFailed: true },
+        { type: 'public.rtf', bytes: 9 },
+      ]);
+    });
+
+    it.each([
+      [
+        'a failed measurement that also carries a size',
+        '[{"type":"x","bytes":3,"measurementFailed":true}]',
+      ],
+      ['a failure flag that is not true', '[{"type":"x","measurementFailed":false}]'],
+      ['a non-boolean failure flag', '[{"type":"x","measurementFailed":"yes"}]'],
+      ['a negative size', '[{"type":"x","bytes":-1}]'],
+      ['a fractional size', '[{"type":"x","bytes":1.5}]'],
+    ])('still rejects %s as unreadable', (_label, raw) => {
+      let caught: unknown;
+      try {
+        parseNativeTypeEntries(raw, 'Windows');
+      } catch (error) {
+        caught = error;
+      }
+      expect(isInspectUnreadable(caught)).toBe(true);
+    });
+  });
+});
 
 describe('clipboardOutcome (#36)', () => {
   it('builds an Error carrying its category, platform, and cause', () => {
@@ -227,27 +302,43 @@ describe('stripHtmlTags', () => {
   });
 });
 
-describe('buildInspectFormats', () => {
+describe('buildInspectResult — format priority', () => {
+  /** Inspect entries whose type names are the semantic formats themselves. */
+  function inspectOf(...types: string[]) {
+    return buildInspectResult(
+      types.map((type) => ({ type, bytes: 1 })),
+      (type) =>
+        ['text', 'html', 'rtf', 'image'].includes(type) ? (type as ClipboardFormat) : null,
+    );
+  }
+
   it('returns empty primary format when no formats present', () => {
-    const result = buildInspectFormats(new Set());
+    const result = inspectOf();
     expect(result.primaryFormat).toBe('empty');
     expect(result.availableFormats).toEqual([]);
   });
 
   it('returns text as primary when only text is present', () => {
-    const result = buildInspectFormats(new Set(['text' as const]));
+    const result = inspectOf('text');
     expect(result.primaryFormat).toBe('text');
     expect(result.availableFormats).toEqual(['text']);
   });
 
   it('returns image as primary when image and text are present', () => {
-    const result = buildInspectFormats(new Set(['text' as const, 'image' as const]));
+    const result = inspectOf('image', 'text');
     expect(result.primaryFormat).toBe('image');
+    expect(result.availableFormats).toEqual(['text', 'image']);
   });
 
   it('returns html as primary over rtf and text', () => {
-    const result = buildInspectFormats(new Set(['text' as const, 'rtf' as const, 'html' as const]));
+    const result = inspectOf('text', 'rtf', 'html');
     expect(result.primaryFormat).toBe('html');
+  });
+
+  it('ignores types with no semantic format and collapses duplicates', () => {
+    const result = inspectOf('TARGETS', 'text', 'text');
+    expect(result.availableFormats).toEqual(['text']);
+    expect(result.primaryFormat).toBe('text');
   });
 });
 
@@ -306,5 +397,49 @@ describe('stripHtmlTags — numeric character references (#25)', () => {
     const result = stripHtmlTags(html);
     expect(result).toBe('A C');
     expect(result).not.toContain('B');
+  });
+});
+
+describe('parseRangedReadEnvelope — revision and mid-read changes (#38)', () => {
+  const envelope = (fields: Record<string, unknown>) =>
+    JSON.stringify({ present: true, total: 3, contentBase64: 'YWJj', ...fields });
+
+  it('returns the helper revision with the window', () => {
+    expect(parseRangedReadEnvelope(envelope({ revision: '42' }), 'macOS', 'Text')).toEqual({
+      total: 3,
+      contentBase64: 'YWJj',
+      revision: '42',
+    });
+  });
+
+  it.each([
+    ['missing', {}],
+    ['empty', { revision: '' }],
+    ['a number', { revision: 42 }],
+  ])('a revision that is %s makes the envelope unreadable', (_label, fields) => {
+    expect(() => parseRangedReadEnvelope(envelope(fields), 'Windows', 'RTF')).toThrow(
+      expect.objectContaining({ code: -32070 }),
+    );
+  });
+
+  it('`changed: true` is the typed representation_changed outcome, never unreadable', () => {
+    let thrown: unknown;
+    try {
+      parseRangedReadEnvelope(JSON.stringify({ changed: true }), 'macOS', 'HTML');
+    } catch (err) {
+      thrown = err;
+    }
+    expect(isClipboardOutcome(thrown)).toBe(true);
+    expect(thrown).toMatchObject({
+      category: 'representation_changed',
+      platform: 'macOS',
+      message: 'The clipboard changed while its HTML was being read.',
+    });
+  });
+
+  it('characterization: `present: false` is still format_unavailable', () => {
+    expect(() =>
+      parseRangedReadEnvelope(JSON.stringify({ present: false }), 'macOS', 'RTF'),
+    ).toThrow(expect.objectContaining({ category: 'format_unavailable' }));
   });
 });

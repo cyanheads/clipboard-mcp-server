@@ -7,8 +7,10 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getContentBlocks } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { clipboardRead } from '@/mcp-server/tools/definitions/clipboard-read.tool.js';
-import { SIZE_LIMITS } from '@/services/clipboard/clipboard-service.js';
-import { clipboardOutcome } from '@/services/clipboard/types.js';
+import { ClipboardService, SIZE_LIMITS } from '@/services/clipboard/clipboard-service.js';
+import type { ByteRange, ClipboardBackend, ClipboardFormat } from '@/services/clipboard/types.js';
+import { clipboardOutcome, inspectUnreadable } from '@/services/clipboard/types.js';
+import { REAL_PNG_13x7 } from '../services/clipboard/png-fixtures.js';
 
 vi.mock('@/services/clipboard/clipboard-service.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/clipboard/clipboard-service.js')>();
@@ -23,12 +25,16 @@ import { getClipboardService } from '@/services/clipboard/clipboard-service.js';
 
 const mockGetService = vi.mocked(getClipboardService);
 
+/** The token the mocked service reports for every read. */
+const REP_ID = 'text:rev-1';
+
 /** Shape a bare backend-style result the way ClipboardService.read() returns it: one complete slice. */
 function asRangedRead<T extends { content: Buffer }>(r: T) {
   return {
     byteSize: r.content.byteLength,
     totalByteSize: r.content.byteLength,
     complete: true,
+    representationId: REP_ID,
     ...r,
   };
 }
@@ -326,6 +332,56 @@ describe('clipboardRead', () => {
     });
   });
 
+  describe('error: inspect_unreadable (#45)', () => {
+    function inspectFailing(error: unknown) {
+      const svc = {
+        inspect: vi.fn().mockRejectedValueOnce(error),
+        read: vi.fn(),
+      } as unknown as ReturnType<typeof getClipboardService>;
+      mockGetService.mockReturnValueOnce(svc);
+      return svc;
+    }
+
+    it('maps an unreadable auto-mode inspection to the declared inspect_unreadable reason', async () => {
+      const svc = inspectFailing(inspectUnreadable('macOS', 'not json'));
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const failure = clipboardRead.handler(clipboardRead.input.parse({ format: 'auto' }), ctx);
+      await expect(failure).rejects.toMatchObject({
+        code: JsonRpcErrorCode.SerializationError,
+        data: {
+          reason: 'inspect_unreadable',
+          platform: 'macOS',
+          recovery: { hint: expect.stringContaining('clipboard_read') },
+        },
+      });
+      expect(svc.read).not.toHaveBeenCalled();
+    });
+
+    it('carries no helper output in the error data', async () => {
+      inspectFailing(inspectUnreadable('Windows', 'At line:1 char:1 secret-helper-output'));
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const error = await clipboardRead
+        .handler(clipboardRead.input.parse({ format: 'auto' }), ctx)
+        .catch((err: unknown) => err as { data?: unknown });
+      expect(JSON.stringify(error.data)).not.toContain('secret-helper-output');
+    });
+
+    it('declares inspect_unreadable as a SerializationError whose recovery names clipboard_read', () => {
+      const entry = clipboardRead.errors?.find((e) => e.reason === 'inspect_unreadable');
+      expect(entry?.code).toBe(JsonRpcErrorCode.SerializationError);
+      expect(entry?.recovery).toMatch(/clipboard_read/);
+      expect(entry?.recovery).toMatch(/explicit format/);
+    });
+
+    it('characterization: an unrelated inspection failure still rethrows untyped', async () => {
+      inspectFailing(new Error('osascript exited 1: execution error'));
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const failure = clipboardRead.handler(clipboardRead.input.parse({ format: 'auto' }), ctx);
+      await expect(failure).rejects.toThrow('osascript exited 1: execution error');
+      await expect(failure).rejects.not.toHaveProperty('data.reason');
+    });
+  });
+
   describe('error: content_too_large', () => {
     it('throws content_too_large when service signals size exceeded', async () => {
       const oversized = Object.assign(new Error('content_too_large'), {
@@ -534,6 +590,7 @@ describe('clipboardRead — response-surface characterization', () => {
         byteSize: png.byteLength,
         totalByteSize: png.byteLength,
         complete: true,
+        representationId: REP_ID,
       });
     });
 
@@ -668,6 +725,7 @@ describe('clipboardRead handler — image block on content[] (#6)', () => {
       byteSize: png.byteLength,
       totalByteSize: png.byteLength,
       complete: true,
+      representationId: REP_ID,
     });
   });
 
@@ -681,7 +739,9 @@ describe('clipboardRead handler — image block on content[] (#6)', () => {
       }),
       read: vi
         .fn()
-        .mockResolvedValueOnce({ format: 'image' as const, content: png, width: 8, height: 6 }),
+        .mockResolvedValueOnce(
+          asRangedRead({ format: 'image' as const, content: png, width: 8, height: 6 }),
+        ),
     } as unknown as ReturnType<typeof getClipboardService>;
     mockGetService.mockReturnValueOnce(svc);
 
@@ -749,6 +809,12 @@ describe('clipboardRead — bounded retrieval (#7)', () => {
   it('accepts the smallest progress-guaranteeing limit and an offset on its own', () => {
     expect(clipboardRead.input.parse({ format: 'text', limit: 4 })).toMatchObject({ limit: 4 });
     expect(clipboardRead.input.parse({ format: 'text', offset: 0 })).toMatchObject({ offset: 0 });
+  });
+
+  it('the limit description matches the handler: offset alone is a valid ranged read', () => {
+    const description = clipboardRead.input.shape.limit.description ?? '';
+    expect(description).not.toMatch(/Required alongside offset/);
+    expect(description).toMatch(/passing offset without limit returns up to the format size limit/);
   });
 
   it('passes no range to the service when neither offset nor limit is given', async () => {
@@ -823,11 +889,13 @@ describe('clipboardRead — bounded retrieval (#7)', () => {
       totalByteSize: 4096,
       complete: false,
       nextOffset: 512,
+      representationId: REP_ID,
     });
     const text = clipboardRead.format!(result).find((b) => b.type === 'text')?.text ?? '';
     expect(text).toContain('23 of 4,096 bytes');
     expect(text).toContain('**Complete:** false');
     expect(text).toContain('**Next offset:** 512');
+    expect(text).toContain(`**Representation ID:** ${REP_ID}`);
     expect(fencedPayload(text)?.payload).toBe(content);
   });
 
@@ -857,10 +925,438 @@ describe('clipboardRead — bounded retrieval (#7)', () => {
     expect(text).toContain('**Complete:** true');
   });
 
+  it('the description lists image among the zero-byte formats that return empty content (#43)', () => {
+    expect(clipboardRead.description).toMatch(
+      /A text, HTML, RTF, or image format that is present but zero bytes long returns empty content/,
+    );
+  });
+
   it('content_too_large recovery points at offset/limit', () => {
     const entry = clipboardRead.errors?.find((e) => e.reason === 'content_too_large');
     expect(entry?.recovery).toMatch(/offset/);
     expect(entry?.recovery).toMatch(/limit/);
     expect(entry?.recovery).toMatch(/nextOffset/);
+  });
+});
+
+describe('clipboardRead format() — text, HTML, and RTF slice rendering (characterization)', () => {
+  // #38 added the Representation ID line; #32 leaves these branches untouched.
+  it.each(['text' as const, 'html' as const, 'rtf' as const])(
+    'renders a partial %s slice exactly as before',
+    (format) => {
+      const text =
+        clipboardRead.format!({
+          format,
+          content: 'ab`c',
+          byteSize: 4,
+          totalByteSize: 10,
+          complete: false,
+          nextOffset: 4,
+          representationId: `${format}:rev`,
+        }).find((b) => b.type === 'text')?.text ?? '';
+      expect(text).toBe(
+        `**Format:** ${format}\n**Size:** 4 of 10 bytes\n**Complete:** false\n**Next offset:** 4\n**Representation ID:** ${format}:rev\n\n\`\`\`\nab\`c\n\`\`\``,
+      );
+    },
+  );
+});
+
+/**
+ * A backend holding one PNG, sliced the way the real backends slice: the
+ * `[offset, offset + limit)` window plus the true total. Served through the
+ * real ClipboardService, so the tool sees exactly what a live read returns.
+ */
+function servePng(png: Buffer) {
+  const backend = {
+    clear: vi.fn(),
+    inspect: vi.fn().mockResolvedValue({
+      primaryFormat: 'image',
+      availableFormats: ['image'],
+      rawTypes: [{ type: 'public.png', bytes: png.byteLength }],
+    }),
+    read: vi.fn(async (_format: string, range: ByteRange) => ({
+      format: 'image' as const,
+      content: png.subarray(range.offset, range.offset + range.limit),
+      totalByteSize: png.byteLength,
+      revision: 'png-rev',
+      width: 13,
+      height: 7,
+    })),
+    write: vi.fn(),
+  } as unknown as ClipboardBackend;
+  mockGetService.mockReturnValue(new ClipboardService(backend));
+}
+
+/** Run one clipboard_read call and collect both surfaces. */
+async function readBothSurfaces(input: Record<string, unknown>) {
+  const ctx = createMockContext({ errors: clipboardRead.errors });
+  const result = await clipboardRead.handler(clipboardRead.input.parse(input), ctx);
+  const text = clipboardRead.format!(result).find((b) => b.type === 'text')?.text ?? '';
+  const images = getContentBlocks(ctx).filter((b) => b.type === 'image');
+  return { result, text, images };
+}
+
+describe('clipboardRead — image slices are PNG byte chunks, not images (#32)', () => {
+  const png = REAL_PNG_13x7;
+  const total = png.byteLength;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    ['unranged', { format: 'image' }],
+    ['offset 0 with limit equal to the total', { format: 'image', offset: 0, limit: total }],
+    ['offset 0 with limit one past the total', { format: 'image', offset: 0, limit: total + 1 }],
+    ['auto, unranged', { format: 'auto' }],
+  ])(
+    'a whole-representation read (%s) emits one image block and no base64 text',
+    async (_label, input) => {
+      servePng(png);
+      const { result, text, images } = await readBothSurfaces(input);
+      expect(result).toMatchObject({ byteSize: total, totalByteSize: total, complete: true });
+      expect(images).toEqual([
+        { type: 'image', data: png.toString('base64'), mimeType: 'image/png' },
+      ]);
+      expect(text).not.toContain(png.toString('base64'));
+      expect(text).not.toContain('```');
+    },
+  );
+
+  it.each([
+    ['first', 0, 7],
+    ['first, one byte short of the whole', 0, total - 1],
+    ['middle', 7, 7],
+    ['final', total - 5, 7],
+  ])(
+    'a %s partial slice emits no image block and carries its base64 in the text',
+    async (_label, offset, limit) => {
+      for (const format of ['image', 'auto'] as const) {
+        servePng(png);
+        const { result, text, images } = await readBothSurfaces({ format, offset, limit });
+        const expected = png.subarray(offset, offset + limit);
+        expect(images, format).toEqual([]);
+        expect(result.content).toBe(expected.toString('base64'));
+        expect(fencedPayload(text)?.payload).toBe(result.content);
+        expect(text).toContain(
+          `**Byte range:** bytes ${offset} through ${offset + expected.byteLength - 1}`,
+        );
+        expect(text).toMatch(/base64-decode each chunk separately/i);
+        expect(text).toMatch(/concatenate the bytes in offset order/i);
+        expect(text).toContain(`**Complete:** ${result.complete}`);
+        if (result.nextOffset === undefined) {
+          expect(result.complete).toBe(true);
+          expect(text).not.toContain('Next offset');
+        } else {
+          expect(text).toContain(`**Next offset:** ${result.nextOffset}`);
+        }
+      }
+    },
+  );
+
+  it('the final slice is complete and still emits no image block', async () => {
+    servePng(png);
+    const { result, images } = await readBothSurfaces({
+      format: 'image',
+      offset: total - 5,
+      limit: 7,
+    });
+    expect(result).toMatchObject({ byteSize: 5, complete: true });
+    expect(images).toEqual([]);
+  });
+
+  it.each([total, total + 1, total + 10_000])(
+    'an empty slice at offset %i emits no block and renders no base64',
+    async (offset) => {
+      servePng(png);
+      const { result, text, images } = await readBothSurfaces({
+        format: 'image',
+        offset,
+        limit: 7,
+      });
+      expect(result).toMatchObject({ content: '', byteSize: 0, complete: true });
+      expect(images).toEqual([]);
+      expect(text).not.toContain('```');
+      expect(text).not.toContain('Byte range');
+    },
+  );
+
+  it('decoding each chunk from the text and concatenating reproduces the whole read byte for byte', async () => {
+    servePng(png);
+    const whole = await readBothSurfaces({ format: 'image' });
+    const chunkSize = 7; // not a multiple of 3, so chunk base64 cannot be joined as text
+    const bytes: Buffer[] = [];
+    let offset: number | undefined = 0;
+    let chunks = 0;
+    while (offset !== undefined) {
+      const { result, text } = await readBothSurfaces({
+        format: 'image',
+        offset,
+        limit: chunkSize,
+      });
+      const payload = fencedPayload(text)?.payload;
+      expect(payload).toBeDefined();
+      bytes.push(Buffer.from(payload ?? '', 'base64'));
+      offset = result.nextOffset;
+      chunks++;
+    }
+    expect(chunks).toBe(Math.ceil(total / chunkSize));
+    expect(Buffer.concat(bytes).equals(Buffer.from(whole.result.content, 'base64'))).toBe(true);
+  });
+
+  it('the description, the content output description, and the content_too_large hint call image slices byte chunks', () => {
+    const chunkWording = /PNG byte chunks?, not (?:a )?standalone images?/;
+    expect(clipboardRead.description).toMatch(chunkWording);
+    expect(clipboardRead.output.shape.content.description).toMatch(chunkWording);
+    expect(clipboardRead.errors?.find((e) => e.reason === 'content_too_large')?.recovery).toMatch(
+      chunkWording,
+    );
+  });
+});
+
+describe('clipboardRead — auto falls through a format that reads as absent (#46)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const absent = (format: string) =>
+    clipboardOutcome('macOS', `${format} format not found on clipboard`, {
+      category: 'format_unavailable',
+    });
+
+  /** A service listing `available`, whose read of each format resolves or rejects per `reads`. */
+  function serve(
+    available: ClipboardFormat[],
+    reads: Partial<Record<ClipboardFormat, () => Promise<unknown>>>,
+  ) {
+    const read = vi.fn(async (format: ClipboardFormat) => {
+      const reply = reads[format];
+      if (!reply) throw new Error(`unexpected read of ${format}`);
+      return reply();
+    });
+    mockGetService.mockReturnValue({
+      inspect: vi.fn().mockResolvedValue({
+        primaryFormat: available.at(-1) ?? 'empty',
+        availableFormats: available,
+        rawTypes: available.map((type) => ({ type, bytes: 3 })),
+      }),
+      read,
+    } as unknown as ReturnType<typeof getClipboardService>);
+    return read;
+  }
+
+  const text = () => async () =>
+    asRangedRead({
+      format: 'text' as const,
+      content: Buffer.from('abc'),
+      representationId: 'text:rev-2',
+    });
+
+  it('characterization: auto reads its first choice when that succeeds, and reads nothing else', async () => {
+    const read = serve(['text', 'image'], {
+      image: async () => asRangedRead({ format: 'image' as const, content: REAL_PNG_13x7 }),
+    });
+    const { result } = await readBothSurfaces({ format: 'auto' });
+    expect(result.format).toBe('image');
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it('characterization: an explicit format that reads as absent still fails, with no fallback', async () => {
+    const read = serve(['text', 'image'], {
+      image: () => Promise.reject(absent('Image')),
+      text: text(),
+    });
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await expect(
+      clipboardRead.handler(clipboardRead.input.parse({ format: 'image' }), ctx),
+    ).rejects.toMatchObject({ data: { reason: 'format_unavailable', requestedFormat: 'image' } });
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it('characterization: auto over a lone image that reads as absent fails format_unavailable', async () => {
+    serve(['image'], { image: () => Promise.reject(absent('Image')) });
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await expect(
+      clipboardRead.handler(clipboardRead.input.parse({ format: 'auto' }), ctx),
+    ).rejects.toMatchObject({ data: { reason: 'format_unavailable', requestedFormat: 'image' } });
+  });
+
+  it.each([
+    [
+      'representation_changed',
+      () => clipboardOutcome('macOS', 'changed', { category: 'representation_changed' }),
+    ],
+    [
+      'clipboard_unavailable',
+      () =>
+        clipboardOutcome('Windows', 'no powershell', {
+          category: 'clipboard_unavailable',
+          recoveryHint: 'Install PowerShell.',
+        }),
+    ],
+  ])('characterization: %s on the first choice stops auto', async (reason, error) => {
+    const read = serve(['text', 'image'], {
+      image: () => Promise.reject(error()),
+      text: text(),
+    });
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await expect(
+      clipboardRead.handler(clipboardRead.input.parse({ format: 'auto' }), ctx),
+    ).rejects.toMatchObject({ data: { reason } });
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it('auto moves past formats that read as absent to the next listed one', async () => {
+    const read = serve(['text', 'rtf', 'image'], {
+      image: () => Promise.reject(absent('Image')),
+      rtf: () => Promise.reject(absent('RTF')),
+      text: text(),
+    });
+    const { result, images } = await readBothSurfaces({ format: 'auto' });
+    expect(result).toMatchObject({
+      format: 'text',
+      content: 'abc',
+      representationId: 'text:rev-2',
+    });
+    expect(images).toEqual([]);
+    expect(read.mock.calls.map(([format]) => format)).toEqual(['image', 'rtf', 'text']);
+  });
+
+  it('an auto continuation compares its token against the format actually read', async () => {
+    serve(['text', 'image'], { image: () => Promise.reject(absent('Image')), text: text() });
+    const matching = await readBothSurfaces({
+      format: 'auto',
+      offset: 0,
+      limit: 8,
+      representationId: 'text:rev-2',
+    });
+    expect(matching.result.content).toBe('abc');
+
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await expect(
+      clipboardRead.handler(
+        clipboardRead.input.parse({ format: 'auto', offset: 0, representationId: 'image:rev-2' }),
+        ctx,
+      ),
+    ).rejects.toMatchObject({
+      data: { reason: 'representation_changed', requestedFormat: 'text' },
+    });
+  });
+});
+
+describe('clipboardRead — representationId (#38)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const RECOVERY =
+    'The clipboard changed during the read — after an earlier slice, or while this call was reading. Discard the bytes read so far and restart at offset 0 without representationId.';
+
+  it('declares representation_changed as a Conflict with the ruled recovery', () => {
+    const entry = clipboardRead.errors?.find((e) => e.reason === 'representation_changed');
+    expect(entry?.code).toBe(JsonRpcErrorCode.Conflict);
+    expect(entry?.recovery).toBe(RECOVERY);
+  });
+
+  it('returns the service token on both surfaces', async () => {
+    servePng(REAL_PNG_13x7);
+    for (const input of [
+      { format: 'image' },
+      { format: 'image', offset: 0, limit: 7 },
+      { format: 'auto', offset: 7, limit: 7 },
+    ]) {
+      const { result, text } = await readBothSurfaces(input);
+      expect(result.representationId).toBe('image:png-rev');
+      expect(text).toContain('**Representation ID:** image:png-rev');
+    }
+  });
+
+  it('a matching representationId returns the slice unchanged', async () => {
+    servePng(REAL_PNG_13x7);
+    const plain = await readBothSurfaces({ format: 'image', offset: 7, limit: 7 });
+    servePng(REAL_PNG_13x7);
+    const continued = await readBothSurfaces({
+      format: 'image',
+      offset: 7,
+      limit: 7,
+      representationId: 'image:png-rev',
+    });
+    expect(continued.result).toEqual(plain.result);
+  });
+
+  it.each([
+    ['a partial slice', { offset: 7, limit: 7 }],
+    ['a whole image', {}],
+  ])('a different token on %s fails with no bytes and no image block', async (_label, range) => {
+    servePng(REAL_PNG_13x7);
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await expect(
+      clipboardRead.handler(
+        clipboardRead.input.parse({ format: 'image', ...range, representationId: 'image:stale' }),
+        ctx,
+      ),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'representation_changed', recovery: { hint: RECOVERY } },
+    });
+    expect(getContentBlocks(ctx)).toEqual([]);
+  });
+
+  it('a token from another format conflicts', async () => {
+    servePng(REAL_PNG_13x7);
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await expect(
+      clipboardRead.handler(
+        clipboardRead.input.parse({ format: 'auto', offset: 0, representationId: 'text:png-rev' }),
+        ctx,
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'representation_changed' } });
+  });
+
+  it('an empty representationId from a form-based client is treated as absent', async () => {
+    servePng(REAL_PNG_13x7);
+    const { result } = await readBothSurfaces({
+      format: 'image',
+      offset: 0,
+      limit: 7,
+      representationId: '',
+    });
+    expect(result.byteSize).toBe(7);
+  });
+
+  it('maps a mid-read change the backend reports, keeping its platform', async () => {
+    const svc = mockService({
+      read: Promise.reject(
+        clipboardOutcome('macOS', 'The clipboard changed while its Text was being read.', {
+          category: 'representation_changed',
+        }),
+      ),
+    });
+    mockGetService.mockReturnValueOnce(svc);
+    const ctx = createMockContext({ errors: clipboardRead.errors });
+    await expect(
+      clipboardRead.handler(clipboardRead.input.parse({ format: 'text' }), ctx),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      message: expect.stringContaining('changed while its Text was being read'),
+      data: {
+        reason: 'representation_changed',
+        platform: 'macOS',
+        recovery: { hint: RECOVERY },
+      },
+    });
+  });
+
+  it('the input and output descriptions explain the continuation contract', () => {
+    expect(clipboardRead.input.shape.representationId.description).toMatch(
+      /previous slice's representationId/,
+    );
+    expect(clipboardRead.input.shape.representationId.description).toMatch(
+      /representation_changed/,
+    );
+    expect(clipboardRead.output.shape.representationId.description).toMatch(
+      /Equal across full and sliced reads of an unchanged value/,
+    );
+    expect(clipboardRead.description).toMatch(/representationId/);
   });
 });

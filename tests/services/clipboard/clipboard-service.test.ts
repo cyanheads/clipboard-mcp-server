@@ -48,11 +48,13 @@ function fakeBackend(opts: { read?: ReadResult | Error; write: WriteResult }): C
   const read =
     opts.read instanceof Error
       ? vi.fn().mockRejectedValue(opts.read)
-      : vi
-          .fn()
-          .mockResolvedValue(
-            opts.read && { totalByteSize: opts.read.content.byteLength, ...opts.read },
-          );
+      : vi.fn().mockResolvedValue(
+          opts.read && {
+            totalByteSize: opts.read.content.byteLength,
+            revision: 'rev-1',
+            ...opts.read,
+          },
+        );
   return {
     clear: vi.fn().mockResolvedValue(undefined),
     inspect: vi.fn(),
@@ -350,7 +352,7 @@ describe('ClipboardService.write — prior contents capture (#28)', () => {
 
   it('completes the write when the prior read fails unexpectedly', async () => {
     const backend = fakeBackend({
-      read: new Error('pbpaste exited 1'),
+      read: new Error('osascript exited 1'),
       write: { format: 'html', byteSize: 12 },
     });
     const svc = new ClipboardService(backend);
@@ -467,7 +469,7 @@ describe('ClipboardService.clear (#24)', () => {
 });
 
 describe('ClipboardService.read — bounded ranged reads (#7)', () => {
-  /** A backend that honors the range the way the real ones do: slice + true total. */
+  /** A backend that honors the range the way the real ones do: slice + true total + revision. */
   function slicingBackend(full: Buffer, format: 'text' | 'image' = 'text') {
     const read = vi
       .fn()
@@ -475,6 +477,7 @@ describe('ClipboardService.read — bounded ranged reads (#7)', () => {
         format,
         content: full.subarray(range.offset, range.offset + range.limit),
         totalByteSize: full.byteLength,
+        revision: `rev-of-${full.byteLength}`,
       }));
     return {
       backend: {
@@ -508,6 +511,7 @@ describe('ClipboardService.read — bounded ranged reads (#7)', () => {
       byteSize: 11,
       totalByteSize: 11,
       complete: true,
+      representationId: 'text:rev-of-11',
     });
   });
 
@@ -540,6 +544,7 @@ describe('ClipboardService.read — bounded ranged reads (#7)', () => {
         byteSize: 0,
         totalByteSize: 3,
         complete: true,
+        representationId: 'text:rev-of-3',
       });
     }
   });
@@ -588,5 +593,79 @@ describe('ClipboardService.read — bounded ranged reads (#7)', () => {
     const slice = await svc.read('image', createMockContext(), { offset: 2, limit: 4 });
     expect([...slice.content]).toEqual([0x80, 0x81, 0x82, 0x83]);
     expect(slice).toMatchObject({ byteSize: 4, totalByteSize: 8, complete: false, nextOffset: 6 });
+  });
+});
+
+describe('ClipboardService.read — representationId (#38)', () => {
+  function backendReturning(results: Array<{ format: 'text' | 'html'; revision: string }>) {
+    const read = vi.fn();
+    for (const { format, revision } of results) {
+      read.mockResolvedValueOnce({
+        format,
+        content: Buffer.from('abcd'),
+        totalByteSize: 8,
+        revision,
+      });
+    }
+    return new ClipboardService({
+      clear: vi.fn(),
+      inspect: vi.fn(),
+      read,
+      write: vi.fn(),
+    } as unknown as ClipboardBackend);
+  }
+
+  it('composes the format and the backend revision into one token', async () => {
+    const svc = backendReturning([{ format: 'text', revision: 'Zm9v' }]);
+    const result = await svc.read('text', createMockContext(), { offset: 0, limit: 4 });
+    expect(result.representationId).toBe('text:Zm9v');
+  });
+
+  it('the same revision read as another format is another token', async () => {
+    const svc = backendReturning([
+      { format: 'text', revision: 'same' },
+      { format: 'html', revision: 'same' },
+    ]);
+    const ctx = createMockContext();
+    const text = await svc.read('text', ctx);
+    const html = await svc.read('html', ctx);
+    expect(text.representationId).not.toBe(html.representationId);
+  });
+
+  it('carries the token on unranged, ranged, and past-the-end reads alike', async () => {
+    const read = vi.fn(async (_format: string, range: { offset: number; limit: number }) => ({
+      format: 'text' as const,
+      content: Buffer.from('0123456789').subarray(range.offset, range.offset + range.limit),
+      totalByteSize: 10,
+      revision: 'r',
+    }));
+    const svc = new ClipboardService({
+      clear: vi.fn(),
+      inspect: vi.fn(),
+      read,
+      write: vi.fn(),
+    } as unknown as ClipboardBackend);
+    const ctx = createMockContext();
+    for (const range of [undefined, { offset: 0, limit: 4 }, { offset: 50, limit: 4 }]) {
+      expect((await svc.read('text', ctx, range)).representationId).toBe('text:r');
+    }
+  });
+
+  it('a mid-read change the backend reports propagates as the typed outcome', async () => {
+    const svc = new ClipboardService({
+      clear: vi.fn(),
+      inspect: vi.fn(),
+      read: vi.fn().mockRejectedValue(
+        Object.assign(new Error('changed'), {
+          _clipboardOutcome: true,
+          platform: 'macOS',
+          category: 'representation_changed',
+        }),
+      ),
+      write: vi.fn(),
+    } as unknown as ClipboardBackend);
+    await expect(svc.read('text', createMockContext())).rejects.toMatchObject({
+      category: 'representation_changed',
+    });
   });
 });

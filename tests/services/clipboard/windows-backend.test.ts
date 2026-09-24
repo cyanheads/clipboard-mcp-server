@@ -12,6 +12,7 @@ vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 import { spawn } from 'node:child_process';
 import { buildCfHtml } from '@/services/clipboard/cf-html.js';
 import { WindowsBackend } from '@/services/clipboard/windows-backend.js';
+import { REAL_PNG_13x7 } from './png-fixtures.js';
 import { type HelperScript, scriptedSpawn } from './scripted-spawn.js';
 
 const mockSpawn = vi.mocked(spawn);
@@ -70,12 +71,18 @@ function installHtml(payloadFor: (call: number) => Buffer | undefined) {
 /** Full-representation range: what the service passes for an unranged read. */
 const FULL = { offset: 0, limit: 8 * 1024 * 1024 } as const;
 
+/** The revision the read helpers compute: base64 SHA-256 of the full representation. */
+function sha256Of(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('base64');
+}
+
 function stringEnvelope(content: string): string {
   const bytes = Buffer.from(content, 'utf8');
   return JSON.stringify({
     present: true,
     total: bytes.byteLength,
     contentBase64: bytes.toString('base64'),
+    revision: sha256Of(bytes),
   });
 }
 
@@ -85,6 +92,7 @@ function imageEnvelope(bytes: Buffer, width: number, height: number): string {
     present: true,
     total: bytes.byteLength,
     contentBase64: bytes.toString('base64'),
+    revision: sha256Of(bytes),
     width,
     height,
   });
@@ -228,7 +236,12 @@ describe('WindowsBackend', () => {
 
       const result = await backend.read('text', FULL);
 
-      expect(result).toEqual({ format: 'text', content: Buffer.alloc(0), totalByteSize: 0 });
+      expect(result).toEqual({
+        format: 'text',
+        content: Buffer.alloc(0),
+        totalByteSize: 0,
+        revision: sha256Of(Buffer.alloc(0)),
+      });
     });
   });
 
@@ -476,6 +489,35 @@ describe('WindowsBackend — ranged helper scripts (#7)', () => {
     }
   });
 
+  it('encodes each slice straight from the full array, never through a range-operator copy (#47)', async () => {
+    const expected = {
+      text: ['$bytes'],
+      rtf: ['$bytes'],
+      image: ['$png', '$bytes', '$png'],
+    } as const;
+    for (const format of ['text', 'rtf', 'image'] as const) {
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: imageEnvelope(Buffer.from('payload'), 1, 1) }),
+      );
+      await backend.read(format, { offset: 5, limit: 7 });
+      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+      const script = args.at(-1) ?? '';
+      const encoded = [
+        ...script.matchAll(
+          /contentBase64 = \[Convert\]::ToBase64String\((\$\w+), \$start, \$sliceLen\)/g,
+        ),
+      ].map((match) => match[1]);
+      expect(encoded, format).toEqual(expected[format]);
+      // 64-bit clamps: an Int32 first argument makes PowerShell pick Min(Int32, Int32).
+      expect(script, format).toContain('$start = [Math]::Min([long]$offset, [long]$total)');
+      expect(script, format).toContain(
+        '$sliceLen = [Math]::Min([long]$limit, [long]$total - $start)',
+      );
+      expect(script, format).not.toMatch(/\[\$offset\.\./);
+      expect(script, format).not.toContain('$slice ');
+    }
+  });
+
   it('refuses to build a script from an unsafe range', async () => {
     await expect(backend.read('text', { offset: 1.5, limit: 4 })).rejects.toThrow(
       /Invalid read range offset/,
@@ -491,12 +533,14 @@ describe('WindowsBackend — ranged helper scripts (#7)', () => {
           present: true,
           total: full.byteLength,
           contentBase64: full.subarray(2, 6).toString('base64'),
+          revision: sha256Of(full),
         }),
       }),
     );
     const result = await backend.read('text', { offset: 2, limit: 4 });
     expect(result.content.toString()).toBe('2345');
     expect(result.totalByteSize).toBe(10);
+    expect(result.revision).toBe(sha256Of(full));
   });
 });
 
@@ -528,6 +572,205 @@ describe('WindowsBackend — typed outcomes (#36)', () => {
     const failure = new WindowsBackend().read('html', FULL);
     await expect(failure).rejects.toThrow(/powershell exited 1/);
     await expect(failure).rejects.not.toHaveProperty('category');
+  });
+});
+
+describe('WindowsBackend — measured, unmeasured, and failed inspection entries (#41)', () => {
+  let backend: WindowsBackend;
+  beforeEach(() => {
+    backend = new WindowsBackend();
+    vi.resetAllMocks();
+  });
+
+  async function inspectScript(): Promise<string> {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'null' }));
+    await backend.inspect();
+    const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+    return args.at(-1) ?? '';
+  }
+
+  it('characterization: the listing sizes strings as UTF-8 and byte arrays by length', async () => {
+    const script = await inspectScript();
+    expect(script).toContain('[System.Text.Encoding]::UTF8.GetByteCount($obj)');
+    expect(script).toContain('$obj -is [byte[]]');
+    expect(script).toContain('$obj.Length');
+  });
+
+  it('marks a GetData that returns null or throws as measurementFailed, with no zero default', async () => {
+    const script = await inspectScript();
+    expect(script).toMatch(/\$obj -is \[byte\[\]\]\) \{ \$entry\.bytes = \$obj\.Length \}/);
+    expect(script).toMatch(
+      /\$obj -is \[System\.IO\.Stream\]\) \{ \$entry\.bytes = \$obj\.Length \}/,
+    );
+    expect(script).not.toContain('$bytes = 0');
+    expect(script).toMatch(/if \(\$null -eq \$obj\) \{ \$entry\.measurementFailed = \$true \}/);
+    expect(script).toMatch(/\} catch \{ \$entry\.measurementFailed = \$true \}/);
+    // Any other object (a Bitmap, a FileDrop string[]) leaves bytes absent.
+    expect(script).not.toMatch(/else \{ \$entry\.bytes/);
+  });
+
+  it('marks a text or RTF format whose data is not a string as measurementFailed, since those reads take only strings (#41)', async () => {
+    const script = await inspectScript();
+    const formats = [
+      '[System.Windows.Forms.DataFormats]::UnicodeText',
+      '[System.Windows.Forms.DataFormats]::Text',
+      '[System.Windows.Forms.DataFormats]::OemText',
+      '[System.Windows.Forms.DataFormats]::Rtf',
+    ];
+    expect(script).toContain(`$stringOnly = @(${formats.join(', ')})`);
+    const stringBranch = script.indexOf('elseif ($obj -is [string])');
+    const stringOnlyBranch = script.indexOf(
+      'elseif ($stringOnly -contains $fmt) { $entry.measurementFailed = $true }',
+    );
+    expect(stringOnlyBranch).toBeGreaterThan(stringBranch);
+    expect(stringOnlyBranch).toBeLessThan(script.indexOf('elseif ($obj -is [byte[]])'));
+    // The same four formats are the only ones the text and RTF reads look up.
+    for (const format of ['text', 'rtf'] as const) {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('abc') }));
+      await backend.read(format, FULL);
+      const read = (mockSpawn.mock.calls.at(-1) as [string, string[]])[1].at(-1) ?? '';
+      expect(read).toContain('-is [string]');
+      for (const name of read.match(/\[System\.Windows\.Forms\.DataFormats\]::\w+/g) ?? []) {
+        expect(formats).toContain(name);
+      }
+    }
+  });
+
+  it('keeps unmeasured and failed entries without a size, and only read entries make a format available', async () => {
+    const listing = [
+      { type: 'Bitmap' },
+      { type: 'UnicodeText', measurementFailed: true },
+      { type: 'Rich Text Format', bytes: 0 },
+    ];
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify(listing) }));
+    await expect(backend.inspect()).resolves.toEqual({
+      primaryFormat: 'image',
+      availableFormats: ['rtf', 'image'],
+      rawTypes: listing,
+    });
+  });
+
+  it('still rejects an entry that is neither measured, unmeasured, nor failed', async () => {
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({ stdout: '[{"type":"Text","bytes":4,"measurementFailed":true}]' }),
+    );
+    await expect(backend.inspect()).rejects.toMatchObject({ _inspectUnreadable: true });
+  });
+
+  it('the text read moves on to the next text format when one yields no string', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('abc') }));
+    await backend.read('text', FULL);
+    const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+    const script = args.at(-1) ?? '';
+    // GetData runs inside the loop, and only a string ends it.
+    expect(script).toMatch(
+      /foreach \(\$format in \$nativeTextFormats\) \{\s*if \(\$data\.GetDataPresent\(\$format, \$false\)\) \{\s*\$candidate = \$data\.GetData\(\$format, \$false\)\s*if \(\$candidate -is \[string\]\) \{\s*\$text = \$candidate\s*break/,
+    );
+    expect(script).toMatch(/if \(\$null -ne \$text\) \{/);
+  });
+});
+
+describe('WindowsBackend — image reads (#43)', () => {
+  let backend: WindowsBackend;
+  beforeEach(() => {
+    backend = new WindowsBackend();
+    vi.resetAllMocks();
+  });
+
+  async function imageScript(): Promise<string> {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: imageEnvelope(Buffer.from('x'), 1, 1) }));
+    await backend.read('image', FULL);
+    const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+    return args.at(-1) ?? '';
+  }
+
+  it('reads the PNG format before falling back to GetImage()', async () => {
+    const script = await imageScript();
+    const pngRead = script.indexOf("$data.GetData('PNG', $false)");
+    expect(pngRead).toBeGreaterThanOrEqual(0);
+    expect(pngRead).toBeLessThan(script.indexOf('[System.Windows.Forms.Clipboard]::GetImage()'));
+    expect(script).toContain('$raw -is [System.IO.MemoryStream]');
+    expect(script).toContain('$raw -is [byte[]]');
+  });
+
+  it('takes a non-empty PNG only when it decodes, with the decoded dimensions', async () => {
+    const script = await imageScript();
+    expect(script).toMatch(
+      /if \(\$null -ne \$png -and \$png\.Length -gt 0\) \{\s*try \{\s*\$probe = \[System\.Drawing\.Image\]::FromStream\(\[System\.IO\.MemoryStream\]::new\(\$png\)\)\s*\$w = \$probe\.Width\s*\$h = \$probe\.Height\s*\$probe\.Dispose\(\)\s*\$pngDecodes = \$true\s*\} catch \{\}/,
+    );
+    const pngBranch = script.indexOf('if ($pngDecodes) {');
+    expect(pngBranch).toBeGreaterThan(script.indexOf('FromStream'));
+    const getImage = script.indexOf('[System.Windows.Forms.Clipboard]::GetImage()');
+    expect(script.slice(pngBranch, getImage)).toContain(
+      'ComputeHash($png)); width = $w; height = $h }',
+    );
+  });
+
+  it('falls back to GetImage() for an undecodable PNG, and returns an empty PNG only when it is zero-length', async () => {
+    const script = await imageScript();
+    expect(script.indexOf('if ($pngDecodes) {')).toBeLessThan(
+      script.indexOf('[System.Windows.Forms.Clipboard]::GetImage()'),
+    );
+    // The empty-PNG branch sits after the GetImage() attempt and takes only zero bytes.
+    const emptyBranch = script.indexOf('} elseif ($null -ne $png -and $png.Length -eq 0) {');
+    expect(emptyBranch).toBeGreaterThan(
+      script.indexOf('[System.Windows.Forms.Clipboard]::GetImage()'),
+    );
+  });
+
+  it('reports the dimensions the helper decoded, on a slice past the header too', async () => {
+    const window = REAL_PNG_13x7.subarray(40, 50);
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({
+        stdout: JSON.stringify({
+          present: true,
+          total: REAL_PNG_13x7.byteLength,
+          contentBase64: window.toString('base64'),
+          revision: sha256Of(REAL_PNG_13x7),
+          width: 13,
+          height: 7,
+        }),
+      }),
+    );
+    const result = await backend.read('image', { offset: 40, limit: 10 });
+    expect(result).toMatchObject({ width: 13, height: 7, totalByteSize: REAL_PNG_13x7.byteLength });
+    expect(result.content.equals(window)).toBe(true);
+  });
+
+  it('a zero-length PNG with no bitmap reads as an empty image success', async () => {
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({
+        stdout: JSON.stringify({
+          present: true,
+          total: 0,
+          contentBase64: '',
+          revision: sha256Of(Buffer.alloc(0)),
+        }),
+      }),
+    );
+    await expect(backend.read('image', FULL)).resolves.toEqual({
+      format: 'image',
+      content: Buffer.alloc(0),
+      totalByteSize: 0,
+      revision: sha256Of(Buffer.alloc(0)),
+    });
+  });
+
+  it('characterization: a Bitmap read keeps the dimensions GetImage() reported', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: imageEnvelope(REAL_PNG_13x7, 800, 600) }));
+    await expect(backend.read('image', FULL)).resolves.toMatchObject({ width: 800, height: 600 });
+  });
+
+  it.each([
+    ['DeviceIndependentBitmap', ['image']],
+    ['Format17', ['image']],
+    ['Bitmap', ['image']],
+    ['PNG', ['image']],
+    ['dib', []],
+    ['dibv5', []],
+  ] as const)('inspection maps %s to %j', async (type, formats) => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify([{ type, bytes: 40 }]) }));
+    await expect(backend.inspect()).resolves.toMatchObject({ availableFormats: formats });
   });
 });
 
@@ -679,5 +922,116 @@ describe('WindowsBackend read() html — CF_HTML framing (#37)', () => {
       const script = call.args.at(-1) ?? '';
       expect(script).not.toMatch(/StartFragment|EndFragment|StartHTML|Version:|<html|IndexOf/i);
     }
+  });
+});
+
+describe('WindowsBackend — SHA-256 revision computed in the helper (#38)', () => {
+  let backend: WindowsBackend;
+  beforeEach(() => {
+    backend = new WindowsBackend();
+    vi.resetAllMocks();
+  });
+
+  /**
+   * Model of a sliced read helper over the full representation `full`: it
+   * answers the `$offset`/`$limit` window the script asks for and hashes every
+   * byte it holds, as `psSliceSnippet` does.
+   */
+  function slicedClipboard(full: () => Buffer): HelperScript {
+    return (_command, args) => {
+      const script = args.at(-1) ?? '';
+      const bytes = full();
+      const from = Math.min(psInt(script, 'offset'), bytes.byteLength);
+      return {
+        stdout: JSON.stringify({
+          present: true,
+          total: bytes.byteLength,
+          contentBase64: bytes.subarray(from, from + psInt(script, 'limit')).toString('base64'),
+          revision: sha256Of(bytes),
+        }),
+      };
+    };
+  }
+
+  async function scriptFor(format: 'text' | 'rtf' | 'image'): Promise<string> {
+    const fake = scriptedSpawn(slicedClipboard(() => Buffer.from('payload')));
+    mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+    await backend.read(format, { offset: 2, limit: 3 });
+    return fake.calls[0]?.args.at(-1) ?? '';
+  }
+
+  it.each([
+    ['text', ['$bytes']],
+    ['rtf', ['$bytes']],
+    ['image', ['$png', '$bytes', '$png']],
+  ] as const)(
+    'every %s envelope hashes the full representation variable, never the slice',
+    async (format, hashed) => {
+      const script = await scriptFor(format);
+      const hashes = [
+        ...script.matchAll(
+          /revision = \[Convert\]::ToBase64String\(\[System\.Security\.Cryptography\.SHA256\]::Create\(\)\.ComputeHash\((\$\w+)\)\)/g,
+        ),
+      ].map((match) => match[1]);
+      expect(hashes).toEqual(hashed);
+      expect(script).not.toContain('ComputeHash($slice)');
+      // One envelope per present branch, each carrying the revision.
+      expect(script.match(/present = \$true/g)).toHaveLength(hashed.length);
+    },
+  );
+
+  it.each(['text', 'rtf', 'image'] as const)(
+    'a %s read returns the helper revision, equal across full and sliced reads of one value',
+    async (format) => {
+      const value = Buffer.from('AAAA1111');
+      const fake = scriptedSpawn(slicedClipboard(() => value));
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+      const whole = await backend.read(format, FULL);
+      const slice = await backend.read(format, { offset: 4, limit: 4 });
+      expect(whole.revision).toBe(sha256Of(value));
+      expect(slice.revision).toBe(whole.revision);
+      expect(slice.content.toString()).toBe('1111');
+    },
+  );
+
+  it('a same-size replacement between reads changes the revision', async () => {
+    let value = Buffer.from('AAAA1111');
+    const fake = scriptedSpawn(slicedClipboard(() => value));
+    mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+    const first = await backend.read('text', { offset: 0, limit: 4 });
+    value = Buffer.from('BBBB2222');
+    const second = await backend.read('text', { offset: 4, limit: 4 });
+    expect(second.totalByteSize).toBe(first.totalByteSize);
+    expect(second.revision).not.toBe(first.revision);
+  });
+
+  it('an HTML read reports the whole payload hash on the one-call and the two-call path', async () => {
+    const payload = buildCfHtml(`<p>${'a'.repeat(300_000)}Z</p>`);
+    const fake = installHtml(() => payload);
+    const head = await backend.read('html', { offset: 0, limit: 8 });
+    const tail = await backend.read('html', { offset: 300_003, limit: 5 });
+    expect(fake.calls).toHaveLength(3);
+    expect(head.revision).toBe(sha256Of(payload));
+    expect(tail.revision).toBe(head.revision);
+    expect(tail.content.toString()).toBe('Z</p>');
+  });
+
+  it('the two HTML calls hashing differently fail representation_changed, never a plain Error', async () => {
+    const before = buildCfHtml(`<p>${'a'.repeat(300_000)}</p>`);
+    const after = buildCfHtml(`<p>${'b'.repeat(300_000)}</p>`);
+    installHtml((call) => (call === 0 ? before : after));
+    await expect(backend.read('html', { offset: 200_000, limit: 10 })).rejects.toMatchObject({
+      _clipboardOutcome: true,
+      category: 'representation_changed',
+      platform: 'Windows',
+      message: expect.stringMatching(/clipboard changed/i),
+    });
+  });
+
+  it('an envelope without a revision is unreadable', async () => {
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({ stdout: JSON.stringify({ present: true, total: 1, contentBase64: 'eA==' }) }),
+    );
+    await expect(backend.read('rtf', FULL)).rejects.toMatchObject({ code: -32070 });
   });
 });

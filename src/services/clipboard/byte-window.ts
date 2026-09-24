@@ -5,6 +5,7 @@
  * @module services/clipboard/byte-window
  */
 
+import { createHash } from 'node:crypto';
 import type { Readable } from 'node:stream';
 import type { ByteRange } from './types.js';
 
@@ -43,6 +44,23 @@ export function collectByteWindow(stream: Readable, range: ByteRange): Promise<B
     stream.on('end', () => resolve({ window: Buffer.concat(pieces), totalByteSize }));
     stream.on('error', reject);
   });
+}
+
+/**
+ * `collectByteWindow`, plus the base64url SHA-256 of every byte the stream
+ * carried — computed over the same pass, so the digest identifies the full
+ * representation the window was cut from while memory stays bounded by the
+ * window.
+ */
+export async function collectHashedByteWindow(
+  stream: Readable,
+  range: ByteRange,
+): Promise<ByteWindowResult & { sha256: string }> {
+  const hash = createHash('sha256');
+  // Attached in the same tick as collectByteWindow's listener: both see every chunk.
+  stream.on('data', (chunk: Buffer) => hash.update(chunk));
+  const result = await collectByteWindow(stream, range);
+  return { ...result, sha256: hash.digest('base64url') };
 }
 
 /** Count the bytes in `stream` without retaining any of them. */

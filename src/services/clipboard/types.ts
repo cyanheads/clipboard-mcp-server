@@ -8,18 +8,19 @@ import { serializationError } from '@cyanheads/mcp-ts-core/errors';
 /** A semantic clipboard format identifier. */
 export type ClipboardFormat = 'text' | 'html' | 'rtf' | 'image';
 
-/** Metadata about a single pasteboard type. */
+/**
+ * Metadata about a single pasteboard type, in one of three shapes:
+ * `{ type, bytes }` — measured, where `0` means present and empty;
+ * `{ type }` — listed but not sized by this backend (an unrecognized Linux
+ * target, a Windows object that is not a string, byte array, or stream);
+ * `{ type, measurementFailed: true }` — listed, but its data was nil, null, or
+ * failed to read. Only a measured or unsized entry makes its format available.
+ */
 export interface RawTypeEntry {
-  /**
-   * Byte size of this representation. Absent when `measurementFailed` is true —
-   * a size that could not be read is reported as unknown, never as zero.
-   */
+  /** Measured byte size of this representation. Never a stand-in for an unknown size. */
   bytes?: number;
-  /**
-   * True when the platform listed this type but reading it to measure its size
-   * failed. The type is present on the clipboard; only its size is unknown.
-   */
-  measurementFailed?: boolean;
+  /** True when the platform listed this type but its data was nil, null, or unreadable. */
+  measurementFailed?: true;
   /** Platform-native type identifier (UTI, MIME type, or Windows format name). */
   type: string;
 }
@@ -69,13 +70,18 @@ export function isInspectUnreadable(err: unknown): err is Error & InspectUnreada
  *
  * - `empty` — nothing is on the clipboard (no selection owner, nothing copied).
  * - `format_unavailable` — the clipboard holds content, but not the requested representation.
+ * - `representation_changed` — the clipboard changed while one read was in progress.
  * - `clipboard_unavailable` — the helper is missing, or it cannot reach the desktop session.
  */
-export type ClipboardOutcomeCategory = 'empty' | 'format_unavailable' | 'clipboard_unavailable';
+export type ClipboardOutcomeCategory =
+  | 'empty'
+  | 'format_unavailable'
+  | 'representation_changed'
+  | 'clipboard_unavailable';
 
 /** Category-specific fields: an unavailable clipboard always says how to recover. */
 export type ClipboardOutcomeDetails =
-  | { category: 'empty' | 'format_unavailable' }
+  | { category: 'empty' | 'format_unavailable' | 'representation_changed' }
   | {
       category: 'clipboard_unavailable';
       /** Next step for the caller — the install command or the session variable to fix. */
@@ -113,20 +119,15 @@ export function isClipboardOutcome(err: unknown): err is ClipboardOutcomeError {
   );
 }
 
-/** One `{ type, bytes }` pair as a platform's inspection helper emits it. */
-interface NativeTypeEntry {
-  bytes: number;
-  type: string;
-}
-
 /**
- * Parse the JSON type listing a native inspection helper printed. Anything that
- * is not a list of `{ type: string, bytes: number }` throws the unreadable
- * sentinel — collapsing it to an empty list would be indistinguishable from a
- * genuinely empty clipboard. Callers handle their platform's own way of
- * spelling "nothing here" before calling.
+ * Parse the JSON type listing a native inspection helper printed into
+ * `RawTypeEntry` values. Anything that is not a list of entries in one of the
+ * three `RawTypeEntry` shapes throws the unreadable sentinel — collapsing it to
+ * an empty list would be indistinguishable from a genuinely empty clipboard.
+ * Callers handle their platform's own way of spelling "nothing here" before
+ * calling.
  */
-export function parseNativeTypeEntries(raw: string, platform: string): NativeTypeEntry[] {
+export function parseNativeTypeEntries(raw: string, platform: string): RawTypeEntry[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -138,8 +139,18 @@ export function parseNativeTypeEntries(raw: string, platform: string): NativeTyp
   const items = Array.isArray(parsed) ? parsed : [parsed];
   return items.map((item) => {
     if (typeof item !== 'object' || item === null) throw inspectUnreadable(platform, raw);
-    const { bytes, type } = item as { bytes?: unknown; type?: unknown };
-    if (typeof type !== 'string' || typeof bytes !== 'number' || !Number.isFinite(bytes)) {
+    const { bytes, measurementFailed, type } = item as {
+      bytes?: unknown;
+      measurementFailed?: unknown;
+      type?: unknown;
+    };
+    if (typeof type !== 'string') throw inspectUnreadable(platform, raw);
+    if (measurementFailed !== undefined) {
+      if (measurementFailed !== true || bytes !== undefined) throw inspectUnreadable(platform, raw);
+      return { type, measurementFailed };
+    }
+    if (bytes === undefined) return { type };
+    if (typeof bytes !== 'number' || !Number.isSafeInteger(bytes) || bytes < 0) {
       throw inspectUnreadable(platform, raw);
     }
     return { type, bytes };
@@ -152,20 +163,32 @@ export interface RangedReadWindow {
   contentBase64: string;
   /** Image height in pixels (image reads only). */
   height?: number;
+  /** Identity of the value the window was cut from (see `ReadResult.revision`). */
+  revision: string;
   /** Byte size of the full representation. */
   total: number;
   /** Image width in pixels (image reads only). */
   width?: number;
 }
 
+/** The outcome for a clipboard that changed while one read was in progress. */
+export function representationChanged(platform: string, formatName: string): ClipboardOutcomeError {
+  return clipboardOutcome(
+    platform,
+    `The clipboard changed while its ${formatName} was being read.`,
+    { category: 'representation_changed' },
+  );
+}
+
 /**
- * Parse the `{ present, total, contentBase64, width?, height? }` envelope a
- * macOS or Windows ranged read helper prints. `present: false` is the helper
- * reporting the representation absent (`format_unavailable`). Anything else
- * that is not a well-formed envelope is a SerializationError: the helper's
- * output was unreadable, which is neither the caller's input being wrong nor
- * the format being absent. The response can carry clipboard bytes, so it never
- * rides the error.
+ * Parse the `{ present, total, contentBase64, revision, width?, height? }`
+ * envelope a macOS or Windows ranged read helper prints. `present: false` is
+ * the helper reporting the representation absent (`format_unavailable`);
+ * `changed: true` is the helper seeing the clipboard change mid-read
+ * (`representation_changed`). Anything else that is not a well-formed envelope
+ * is a SerializationError: the helper's output was unreadable, which is neither
+ * the caller's input being wrong nor the format being absent. The response can
+ * carry clipboard bytes, so it never rides the error.
  */
 export function parseRangedReadEnvelope(
   raw: string,
@@ -185,22 +208,27 @@ export function parseRangedReadEnvelope(
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw unreadable();
   const envelope = parsed as {
+    changed?: unknown;
     contentBase64?: unknown;
     height?: unknown;
     present?: unknown;
+    revision?: unknown;
     total?: unknown;
     width?: unknown;
   };
+  if (envelope.changed === true) throw representationChanged(platform, formatName);
   if (typeof envelope.present !== 'boolean') throw unreadable();
   if (!envelope.present) {
     throw clipboardOutcome(platform, `${formatName} format not found on clipboard`, {
       category: 'format_unavailable',
     });
   }
-  const { total, contentBase64, width, height } = envelope;
+  const { total, contentBase64, revision, width, height } = envelope;
   if (
     typeof total !== 'number' ||
     typeof contentBase64 !== 'string' ||
+    typeof revision !== 'string' ||
+    revision === '' ||
     (width !== undefined && typeof width !== 'number') ||
     (height !== undefined && typeof height !== 'number')
   ) {
@@ -209,6 +237,20 @@ export function parseRangedReadEnvelope(
   return {
     total,
     contentBase64,
+    revision,
+    ...(width !== undefined && { width }),
+    ...(height !== undefined && { height }),
+  };
+}
+
+/** The `ReadResult` for a window a ranged read helper returned (see `parseRangedReadEnvelope`). */
+export function toReadResult(format: ClipboardFormat, window: RangedReadWindow): ReadResult {
+  const { total, contentBase64, revision, width, height } = window;
+  return {
+    format,
+    content: Buffer.from(contentBase64, 'base64'),
+    totalByteSize: total,
+    revision,
     ...(width !== undefined && { width }),
     ...(height !== undefined && { height }),
   };
@@ -220,7 +262,7 @@ export interface InspectResult {
   availableFormats: ClipboardFormat[];
   /** The richest semantic format present (image > html > rtf > text), or 'empty'. */
   primaryFormat: ClipboardFormat | 'empty';
-  /** All explicitly-set pasteboard types with sizes. */
+  /** Every type the platform lists, with its measured size where there is one. */
   rawTypes: RawTypeEntry[];
 }
 
@@ -231,21 +273,20 @@ export interface InspectResult {
 export const FORMAT_PRIORITY: ClipboardFormat[] = ['text', 'rtf', 'html', 'image'];
 
 /**
- * Derive primaryFormat and availableFormats from a set of detected semantic formats.
- * Returns `'empty'` as primaryFormat when the set is empty.
+ * Derive `availableFormats` (in `FORMAT_PRIORITY` order) and `primaryFormat`
+ * (the richest of them, or `'empty'`) from inspected entries. A format counts
+ * only when at least one of its representations was read — a
+ * `measurementFailed` entry alone cannot be returned by `read()`.
  */
-export function buildInspectFormats(semanticSet: Set<ClipboardFormat>): {
-  availableFormats: ClipboardFormat[];
-  primaryFormat: ClipboardFormat | 'empty';
-} {
-  const availableFormats = FORMAT_PRIORITY.filter((f) => semanticSet.has(f));
-  const primaryFormat =
-    availableFormats.length > 0
-      ? availableFormats.reduce((a, b) =>
-          FORMAT_PRIORITY.indexOf(b) > FORMAT_PRIORITY.indexOf(a) ? b : a,
-        )
-      : ('empty' as const);
-  return { availableFormats, primaryFormat };
+export function buildInspectResult(
+  rawTypes: RawTypeEntry[],
+  toFormat: (type: string) => ClipboardFormat | null,
+): InspectResult {
+  const readable = new Set(
+    rawTypes.filter((entry) => !entry.measurementFailed).map((entry) => toFormat(entry.type)),
+  );
+  const availableFormats = FORMAT_PRIORITY.filter((format) => readable.has(format));
+  return { rawTypes, availableFormats, primaryFormat: availableFormats.at(-1) ?? 'empty' };
 }
 
 /**
@@ -349,6 +390,14 @@ export interface ReadResult {
   format: ClipboardFormat;
   /** Image height in pixels (present only for image format). */
   height?: number;
+  /**
+   * Identity of the value `content` was cut from, derived in the same pass that
+   * produced it: the SHA-256 of the full representation (Linux, Windows), or
+   * `NSPasteboard.changeCount`, sampled unchanged before and after the data
+   * access (macOS). Equal across reads of an unchanged value; a changed value
+   * yields a different one.
+   */
+  revision: string;
   /** Total byte size of the full representation, regardless of how much of it `content` holds. */
   totalByteSize: number;
   /** Image width in pixels (present only for image format). */
@@ -372,6 +421,8 @@ export interface RangedReadResult {
   height?: number;
   /** Offset to pass to the next call. Absent once `complete` is true. */
   nextOffset?: number;
+  /** Opaque token for the value and format this window was cut from: `<format>:<revision>`. */
+  representationId: string;
   /** Total byte size of the full representation. */
   totalByteSize: number;
   /** Image width in pixels (present only for image format). */
@@ -426,9 +477,10 @@ export interface ClipboardBackend {
   /**
    * Read clipboard content in the specified format, bounded to `range`.
    * A format that is not present throws a `format_unavailable` (or, on an empty
-   * clipboard, `empty`) outcome; a present zero-byte text, HTML, or RTF
-   * representation is returned as empty content. A zero-byte image is too on
-   * Linux; macOS and Windows cannot decode one and report it absent.
+   * clipboard, `empty`) outcome; a present zero-byte representation of any
+   * format is returned as empty content. An image read takes the first image
+   * representation that yields PNG bytes and returns the empty success only
+   * when every listed one is zero-length.
    */
   read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult>;
 

@@ -1,13 +1,15 @@
 /**
- * @fileoverview Unit tests for the streaming byte-window sink and the
- * UTF-8-boundary trimmer it feeds.
+ * @fileoverview Unit tests for the streaming byte-window sink, its hashing
+ * variant, and the UTF-8-boundary trimmer it feeds.
  * @module tests/services/clipboard/byte-window.test
  */
 
+import { createHash } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import {
   collectByteWindow,
+  collectHashedByteWindow,
   countBytes,
   trimToUtf8Boundaries,
 } from '@/services/clipboard/byte-window.js';
@@ -167,5 +169,64 @@ describe('trimToUtf8Boundaries', () => {
     const result = trimToUtf8Boundaries(window, false);
     expect(result.content.byteLength).toBe(0);
     expect(result.consumed).toBe(window.byteLength);
+  });
+});
+
+describe('collectHashedByteWindow (#38)', () => {
+  const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('base64url');
+  const full = Buffer.from('0123456789ABCDEFGHIJ');
+
+  it.each([
+    ['one chunk', [full]],
+    ['uneven chunks', [full.subarray(0, 1), full.subarray(1, 13), full.subarray(13)]],
+    ['one byte per chunk', [...full].map((byte) => Buffer.from([byte]))],
+  ])('hashes the whole stream however it is chunked (%s)', async (_label, chunks) => {
+    const result = await collectHashedByteWindow(streamOf(chunks), { offset: 4, limit: 3 });
+    expect(result.sha256).toBe(sha256(full));
+    expect(result.window.toString()).toBe('456');
+    expect(result.totalByteSize).toBe(20);
+  });
+
+  it.each([
+    { offset: 0, limit: 0 },
+    { offset: 0, limit: 100 },
+    { offset: 19, limit: 5 },
+    { offset: 20, limit: 5 },
+    { offset: 500, limit: 5 },
+  ])('the digest is independent of the window %j', async (range) => {
+    const result = await collectHashedByteWindow(streamOf([full]), range);
+    expect(result.sha256).toBe(sha256(full));
+    expect(result.window.byteLength).toBe(
+      Math.max(0, Math.min(range.limit, full.byteLength - range.offset)),
+    );
+  });
+
+  it('an empty stream hashes to the SHA-256 of nothing', async () => {
+    const result = await collectHashedByteWindow(streamOf([]), { offset: 0, limit: 8 });
+    expect(result).toEqual({
+      window: Buffer.alloc(0),
+      totalByteSize: 0,
+      sha256: sha256(Buffer.alloc(0)),
+    });
+  });
+
+  it('different bytes of the same length hash differently', async () => {
+    const a = await collectHashedByteWindow(streamOf([Buffer.from('AAAA1111')]), {
+      offset: 0,
+      limit: 4,
+    });
+    const b = await collectHashedByteWindow(streamOf([Buffer.from('AAAA2222')]), {
+      offset: 0,
+      limit: 4,
+    });
+    expect(a.window.equals(b.window)).toBe(true);
+    expect(a.sha256).not.toBe(b.sha256);
+  });
+
+  it('rejects when the stream errors', async () => {
+    const stream = new PassThrough();
+    const promise = collectHashedByteWindow(stream, { offset: 0, limit: 10 });
+    stream.emit('error', new Error('boom'));
+    await expect(promise).rejects.toThrow('boom');
   });
 });

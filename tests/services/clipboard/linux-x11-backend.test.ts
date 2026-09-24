@@ -3,6 +3,7 @@
  * @module tests/services/clipboard/linux-x11-backend.test
  */
 
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -119,9 +120,9 @@ describe('LinuxX11Backend', () => {
         { type: 'UTF8_STRING', bytes: 5 },
         { type: 'image/png', measurementFailed: true },
       ]);
-      // The type is still advertised — only its size is unknown.
-      expect(result.availableFormats).toEqual(['text', 'image']);
-      expect(result.primaryFormat).toBe('image');
+      // An unreadable representation cannot be returned by a read (#41).
+      expect(result.availableFormats).toEqual(['text']);
+      expect(result.primaryFormat).toBe('text');
     });
 
     it('reports a genuine zero-length representation as bytes: 0 (#23)', async () => {
@@ -184,10 +185,66 @@ describe('LinuxX11Backend', () => {
         expect(result).toEqual({
           primaryFormat: 'empty',
           availableFormats: [],
-          rawTypes: [{ type, bytes: 0 }],
+          rawTypes: [{ type }],
         });
       },
     );
+
+    it('omits bytes for targets it does not recognize and never converts them (#41)', async () => {
+      const fake = scriptedSpawn((_c, args) =>
+        requestedType(args) === 'TARGETS'
+          ? {
+              stdout:
+                'TIMESTAMP\nMULTIPLE\nTARGETS\nDELETE\nINCR\nTEXT\nSTRING\napplication/x-probe\n',
+            }
+          : { stdout: 'hello' },
+      );
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+
+      const result = await backend.inspect();
+
+      expect(result.rawTypes).toEqual([
+        { type: 'TIMESTAMP' },
+        { type: 'MULTIPLE' },
+        { type: 'TARGETS' },
+        { type: 'DELETE' },
+        { type: 'INCR' },
+        { type: 'TEXT', bytes: 5 },
+        { type: 'STRING', bytes: 5 },
+        { type: 'application/x-probe' },
+      ]);
+      expect(fake.calls.map((c) => requestedType(c.args))).toEqual(['TARGETS', 'TEXT', 'STRING']);
+      expect(result.availableFormats).toEqual(['text']);
+    });
+
+    it('a format whose only target failed to measure is not available (#41)', async () => {
+      mockSpawn
+        .mockReturnValueOnce(fakeChild({ stdout: 'TARGETS\ntext/html\n' }))
+        .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'xclip: Error: conversion failed' }));
+
+      const result = await backend.inspect();
+
+      expect(result).toEqual({
+        primaryFormat: 'empty',
+        availableFormats: [],
+        rawTypes: [{ type: 'TARGETS' }, { type: 'text/html', measurementFailed: true }],
+      });
+    });
+
+    it('a format stays available when one of its targets measured and another failed (#41)', async () => {
+      mockSpawn
+        .mockReturnValueOnce(fakeChild({ stdout: 'UTF8_STRING\nSTRING\n' }))
+        .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'xclip: Error: conversion failed' }))
+        .mockReturnValueOnce(fakeChild({ stdout: 'abc' }));
+
+      const result = await backend.inspect();
+
+      expect(result.rawTypes).toEqual([
+        { type: 'UTF8_STRING', measurementFailed: true },
+        { type: 'STRING', bytes: 3 },
+      ]);
+      expect(result.availableFormats).toEqual(['text']);
+    });
   });
 
   describe('read()', () => {
@@ -654,5 +711,57 @@ describe('LinuxX11Backend — write settles once the selection is owned (#40)', 
     await expect(new LinuxX11Backend().write('abc', 'text')).rejects.toThrow(
       'xclip exited 1: xclip: Error: BadAlloc',
     );
+  });
+});
+
+describe('LinuxX11Backend — streamed SHA-256 revision (#38)', () => {
+  let backend: LinuxX11Backend;
+  beforeEach(() => {
+    backend = new LinuxX11Backend();
+    vi.resetAllMocks();
+  });
+
+  const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('base64url');
+  const value = Buffer.from('AAAA1111é😀');
+
+  /** Serve one read of `bytes`, delivered in three chunks. */
+  function serve(bytes: Buffer, target = 'UTF8_STRING') {
+    mockSpawn
+      .mockReturnValueOnce(targets(target))
+      .mockReturnValueOnce(
+        fakeChild({ stdout: [bytes.subarray(0, 3), bytes.subarray(3, 9), bytes.subarray(9)] }),
+      );
+  }
+
+  it.each([
+    ['the whole representation', FULL],
+    ['a first window', { offset: 0, limit: 4 }],
+    ['a middle window spanning chunks', { offset: 2, limit: 8 }],
+    ['a window past the end', { offset: 500, limit: 4 }],
+  ])('%s is identified by the hash of every streamed byte', async (_label, range) => {
+    serve(value);
+    const result = await backend.read('text', range);
+    expect(result.revision).toBe(sha256(value));
+    expect(result.content.equals(value.subarray(range.offset, range.offset + range.limit))).toBe(
+      true,
+    );
+  });
+
+  it('a same-size replacement yields a different revision', async () => {
+    serve(Buffer.from('AAAA1111'));
+    const before = await backend.read('text', { offset: 0, limit: 4 });
+    serve(Buffer.from('BBBB2222'));
+    const after = await backend.read('text', { offset: 4, limit: 4 });
+    expect(after.totalByteSize).toBe(before.totalByteSize);
+    expect(after.revision).not.toBe(before.revision);
+  });
+
+  it('an image and a zero-byte representation are hashed the same way', async () => {
+    serve(REAL_PNG_13x7, 'image/png');
+    expect((await backend.read('image', { offset: 8, limit: 16 })).revision).toBe(
+      sha256(REAL_PNG_13x7),
+    );
+    mockSpawn.mockReturnValueOnce(targets('text/html')).mockReturnValueOnce(fakeChild({}));
+    expect((await backend.read('html', FULL)).revision).toBe(sha256(Buffer.alloc(0)));
   });
 });

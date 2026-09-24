@@ -94,6 +94,14 @@ describe('default HTTP launch', () => {
     expect(instructions).toContain('clipboard_write replaces it');
   });
 
+  it('explains image slices and the representationId continuation', async () => {
+    const result = resultOf<InitializeResult>(await initialize(server.url));
+    const instructions = result.instructions ?? '';
+    expect(instructions).toContain('PNG byte chunks');
+    expect(instructions).toContain('not standalone images');
+    expect(instructions).toContain('pass back the returned representationId');
+  });
+
   it('registers all three clipboard tools', async () => {
     expect(await listToolNames(await connect(server.url))).toEqual([
       'clipboard_inspect',

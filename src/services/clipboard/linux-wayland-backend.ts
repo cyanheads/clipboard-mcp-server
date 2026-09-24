@@ -5,7 +5,7 @@
 
 import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
-import { collectByteWindow, countBytes } from './byte-window.js';
+import { collectByteWindow, collectHashedByteWindow, countBytes } from './byte-window.js';
 import { readPngDimensions } from './png-dimensions.js';
 import type {
   ByteRange,
@@ -15,7 +15,7 @@ import type {
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats, clipboardOutcome, isClipboardOutcome } from './types.js';
+import { buildInspectResult, clipboardOutcome, isClipboardOutcome } from './types.js';
 
 const PLATFORM = 'Linux Wayland';
 
@@ -200,33 +200,24 @@ function runWlCopy(args: string[], content?: Buffer): Promise<void> {
 
 /** Linux Wayland clipboard backend using wl-paste/wl-copy. */
 export class LinuxWaylandBackend implements ClipboardBackend {
+  /** Only recognized MIME types are read to measure them; the rest are listed without a size. */
   async inspect(): Promise<InspectResult> {
-    const mimes = await listTypes();
-
     const rawTypes: RawTypeEntry[] = [];
-    const semanticSet = new Set<ClipboardFormat>();
-
-    for (const mime of mimes) {
-      const fmt = mimeToFormat(mime);
-      if (fmt) semanticSet.add(fmt);
-      // Read each recognized MIME type to measure size
-      if (fmt) {
-        try {
-          // Stream and count — clipboard_inspect is metadata-only, so the
-          // representation is never retained just to report its size (#26).
-          const bytes = await runWlPasteStream(payloadArgs(mime), countBytes);
-          rawTypes.push({ type: mime, bytes });
-        } catch {
-          // --list-types advertised this MIME type but reading it failed —
-          // report the measurement as failed, not as a zero-byte payload.
-          rawTypes.push({ type: mime, measurementFailed: true });
-        }
-      } else {
-        rawTypes.push({ type: mime, bytes: 0 });
+    for (const mime of await listTypes()) {
+      if (!mimeToFormat(mime)) {
+        rawTypes.push({ type: mime });
+        continue;
+      }
+      try {
+        // Stream and count — clipboard_inspect is metadata-only, so the
+        // representation is never retained just to report its size (#26).
+        const bytes = await runWlPasteStream(payloadArgs(mime), countBytes);
+        rawTypes.push({ type: mime, bytes });
+      } catch {
+        rawTypes.push({ type: mime, measurementFailed: true });
       }
     }
-
-    return { rawTypes, ...buildInspectFormats(semanticSet) };
+    return buildInspectResult(rawTypes, mimeToFormat);
   }
 
   /**
@@ -250,15 +241,18 @@ export class LinuxWaylandBackend implements ClipboardBackend {
     let lastError: unknown;
     for (const mime of candidates) {
       try {
-        const { window, totalByteSize } = await runWlPasteStream(payloadArgs(mime), (stdout) =>
-          collectByteWindow(stdout, range),
+        // Every read streams the whole representation, so hashing it on the way
+        // through identifies the value the window was cut from.
+        const { window, totalByteSize, sha256 } = await runWlPasteStream(
+          payloadArgs(mime),
+          (stdout) => collectHashedByteWindow(stdout, range),
         );
         // wl-paste hands over opaque bytes with no dimension API — read them out
         // of the PNG header so Linux reads carry what macOS and Windows report.
         // The header only lives in the window when the window starts at byte 0.
         const dimensions =
           format === 'image' && range.offset === 0 ? readPngDimensions(window) : {};
-        return { format, content: window, totalByteSize, ...dimensions };
+        return { format, content: window, totalByteSize, revision: sha256, ...dimensions };
       } catch (error) {
         if (isClipboardOutcome(error) && error.category === 'clipboard_unavailable') throw error;
         lastError = error;

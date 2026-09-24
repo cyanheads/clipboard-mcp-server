@@ -1,32 +1,34 @@
 /**
- * @fileoverview macOS clipboard backend: pbpaste for text reads, and JXA/NSPasteboard
- * (via osascript) for inspection, rich-format reads, every write, and clear.
+ * @fileoverview macOS clipboard backend: JXA/NSPasteboard (via osascript) for
+ * inspection, every read, every write, and clear.
  * @module services/clipboard/macos-backend
  */
 
 import { spawn } from 'node:child_process';
-import { assertByteRange, collectByteWindow } from './byte-window.js';
+import { assertByteRange } from './byte-window.js';
 import type {
   ByteRange,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
   RangedReadWindow,
-  RawTypeEntry,
   ReadResult,
 } from './types.js';
 import {
-  buildInspectFormats,
-  clipboardOutcome,
+  buildInspectResult,
   parseNativeTypeEntries,
   parseRangedReadEnvelope,
   stripHtmlTags,
+  toReadResult,
 } from './types.js';
 
 /**
- * JXA script for inspecting pasteboard types.
- * Returns JSON: [{ type: string, bytes: number }, ...]
- * Uses pb.types() to get only explicitly-set types (not synthesized ones).
+ * JXA script listing the pasteboard's types, printed as a JSON array of
+ * `RawTypeEntry` values. `pb.types` holds the types the owner declared plus
+ * the translations AppKit can supply (`public.tiff` beside a `public.png`,
+ * `public.utf8-plain-text` beside `public.utf16-plain-text`), so a listed type
+ * can have nil data — a type declared and never set. Nil data is a failed
+ * measurement, never a zero-byte representation.
  */
 const JXA_INSPECT = `
 ObjC.import('AppKit');
@@ -37,8 +39,7 @@ if (!types.isNil()) {
   for (let i = 0; i < types.count; i++) {
     const t = ObjC.unwrap(types.objectAtIndex(i));
     const data = pb.dataForType(t);
-    const bytes = data.isNil() ? 0 : Number(data.length);
-    result.push({ type: t, bytes: bytes });
+    result.push(data.isNil() ? { type: t, measurementFailed: true } : { type: t, bytes: Number(data.length) });
   }
 }
 JSON.stringify(result);
@@ -58,9 +59,30 @@ pb.clearContents;
 `.trim();
 
 /**
+ * Opening of every JXA read script: the pasteboard, its `changeCount` sampled
+ * before any data is touched, and the `{ present: false }` envelope a script
+ * replaces once it finds its representation.
+ */
+const JXA_READ_PRELUDE = `
+ObjC.import('AppKit');
+const pb = $.NSPasteboard.generalPasteboard;
+const changeCount = Number(pb.changeCount);
+let result = { present: false };
+`.trim();
+
+/**
+ * Closing statement of every JXA read script. `changeCount` is sampled again
+ * after the data access: an unchanged count prints the envelope, whose
+ * `revision` is that count; a changed one means another application wrote the
+ * pasteboard mid-read, and the script prints `{ changed: true }` instead.
+ */
+const JXA_READ_REPORT =
+  'JSON.stringify(Number(pb.changeCount) === changeCount ? result : { changed: true });';
+
+/**
  * Clamp-and-slice snippet shared by every ranged JXA read script, given a
- * non-nil NSData `dataVar`. Prints the `{ present, total, contentBase64 }`
- * envelope `parseRangedReadEnvelope` reads: `total` is the full
+ * non-nil NSData `dataVar`. Fills in the `{ present, total, contentBase64,
+ * revision }` envelope `parseRangedReadEnvelope` reads: `total` is the full
  * representation's byte size and `contentBase64` only the `[offset, offset +
  * limit)` window — the JXA process holds the full representation (that is how
  * NSPasteboard works), but Node never receives more than the window. The slice
@@ -73,102 +95,111 @@ const total = Number(${dataVar}.length);
 const location = Math.min(${range.offset}, total);
 const slice = ${dataVar}.subdataWithRange({ location: location, length: Math.min(${range.limit}, total - location) });
 const b64 = ObjC.unwrap(slice.base64EncodedStringWithOptions(0));
-JSON.stringify({ present: true, total: total, contentBase64: b64${extraFields} });
+result = { present: true, total: total, contentBase64: b64, revision: String(changeCount)${extraFields} };
 `;
 }
 
 /**
- * JXA script builder for reading HTML from the pasteboard, bounded to `range`.
- * Prints the ranged-read envelope (see `jxaSliceSnippet`). The HTML string is re-encoded as UTF-8 so
- * the byte range the service trims to UTF-8 boundaries matches this response;
- * a `public.html` AppKit cannot decode as a string is sliced as its raw bytes.
+ * JXA script builder for a ranged read of the NSData the `lookup` statements
+ * leave in `data`: prints `{ present: false }` when it is nil, otherwise the
+ * envelope from `jxaSliceSnippet`.
  *
  * Every nil test in the JXA read scripts uses `.isNil()`: a nil Objective-C
  * return is a truthy wrapper in JXA, so `!value` never detects it.
  */
-function buildJxaReadHtml(range: ByteRange): string {
+function buildJxaDataRead(lookup: string, range: ByteRange): string {
   assertByteRange(range);
   return `
-ObjC.import('AppKit');
-const pb = $.NSPasteboard.generalPasteboard;
-const html = pb.stringForType($.NSPasteboardTypeHTML);
-const data = html.isNil()
-  ? pb.dataForType($.NSPasteboardTypeHTML)
-  : html.dataUsingEncoding($.NSUTF8StringEncoding);
-if (data.isNil()) {
-  JSON.stringify({ present: false });
-} else {
+${JXA_READ_PRELUDE}
+${lookup.trim()}
+if (!data.isNil()) {
   ${jxaSliceSnippet('data', range)}
 }
+${JXA_READ_REPORT}
 `.trim();
 }
 
 /**
- * JXA script builder for reading RTF from the pasteboard, bounded to `range`.
- * Prefers the raw RTF/RTFD data; falls back to the plain-RTF string
- * re-encoded as UTF-8, same source-preference order as the unranged read.
+ * Plain text: the raw bytes of the first non-nil of `public.utf8-plain-text`
+ * and `public.plain-text`. AppKit translates UTF-16 plain text into the former
+ * but not the latter. Raw bytes keep a leading byte-order mark, which NSString
+ * decoding (`stringForType`, `pbpaste`) consumes.
  */
-function buildJxaReadRtf(range: ByteRange): string {
-  assertByteRange(range);
-  return `
-ObjC.import('AppKit');
-const pb = $.NSPasteboard.generalPasteboard;
-const rtfType = 'com.apple.flat-rtfd';
-const publicRtf = 'public.rtf';
-const hasBytes = (d) => !d.isNil() && Number(d.length) > 0;
-let data = pb.dataForType(rtfType);
-if (!hasBytes(data)) data = pb.dataForType(publicRtf);
-if (!hasBytes(data)) {
-  const str = pb.stringForType(publicRtf);
-  data = str.isNil() ? str : str.dataUsingEncoding($.NSUTF8StringEncoding);
+const TEXT_LOOKUP = `
+let data = pb.dataForType('public.utf8-plain-text');
+if (data.isNil()) data = pb.dataForType('public.plain-text');
+`;
+
+/**
+ * HTML: the raw bytes of `public.html`, whatever their encoding — decoding
+ * through NSString would drop a leading byte-order mark.
+ */
+const HTML_LOOKUP = `
+const data = pb.dataForType('public.html');
+`;
+
+/**
+ * RTF: the first non-empty of the raw `com.apple.flat-rtfd` and `public.rtf`
+ * data, then the plain-RTF string re-encoded as UTF-8. A listed type whose
+ * data is zero-length is present and empty, as inspection reports it, so it
+ * is the last resort before nil.
+ */
+const RTF_LOOKUP = `
+const sources = [pb.dataForType('com.apple.flat-rtfd'), pb.dataForType('public.rtf')];
+let data = sources.find((d) => !d.isNil() && Number(d.length) > 0);
+if (data === undefined) {
+  const str = pb.stringForType('public.rtf');
+  data = str.isNil() ? (sources.find((d) => !d.isNil()) ?? str) : str.dataUsingEncoding($.NSUTF8StringEncoding);
 }
-if (data.isNil()) {
-  JSON.stringify({ present: false });
-} else {
-  ${jxaSliceSnippet('data', range)}
-}
-`.trim();
-}
+`;
+
+/** The data lookup and the name failures report, per format read through `buildJxaDataRead`. */
+const DATA_READS = {
+  text: { lookup: TEXT_LOOKUP, name: 'Text' },
+  html: { lookup: HTML_LOOKUP, name: 'HTML' },
+  rtf: { lookup: RTF_LOOKUP, name: 'RTF' },
+} as const satisfies Record<Exclude<ClipboardFormat, 'image'>, { lookup: string; name: string }>;
 
 /**
  * JXA script builder for reading an image from the pasteboard as PNG, bounded
- * to `range`. Converts TIFF to PNG via NSBitmapImageRep, same as the unranged
- * read. Width/height come from the full (unsliced) `NSBitmapImageRep` — they
- * are always reported when the image is present, regardless of `range`.
+ * to `range`. Takes the first of `public.png`, `public.tiff`, `com.apple.pict`
+ * that NSBitmapImageRep decodes, skipping zero-length and undecodable data, and
+ * re-encodes it as PNG. Width/height come from the full (unsliced) rep — always
+ * reported when an image is returned, regardless of `range`. When every listed
+ * image type is zero-length, the image is present and empty: an empty envelope
+ * with no dimensions.
  */
 function buildJxaReadImage(range: ByteRange): string {
   assertByteRange(range);
   return `
-ObjC.import('AppKit');
-const pb = $.NSPasteboard.generalPasteboard;
+${JXA_READ_PRELUDE}
 const imgTypes = ['public.png', 'public.tiff', 'com.apple.pict'];
-let imgData = null;
+let listed = false;
+let sawBytes = false;
+let rep = null;
+let pngData = null;
 for (const t of imgTypes) {
   const d = pb.dataForType(t);
-  if (!d.isNil() && Number(d.length) > 0) { imgData = d; break; }
+  if (d.isNil()) continue;
+  listed = true;
+  if (Number(d.length) === 0) continue;
+  sawBytes = true;
+  const candidate = $.NSBitmapImageRep.imageRepWithData(d);
+  if (candidate.isNil()) continue;
+  const encoded = candidate.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, {});
+  if (encoded.isNil() || Number(encoded.length) === 0) continue;
+  rep = candidate;
+  pngData = encoded;
+  break;
 }
-if (imgData === null) {
-  JSON.stringify({ present: false });
-} else {
-  const img = $.NSImage.alloc.initWithData(imgData);
-  if (img.isNil() || !img.isValid) {
-    JSON.stringify({ present: false });
-  } else {
-    const rep = $.NSBitmapImageRep.imageRepWithData(imgData);
-    if (rep.isNil()) {
-      JSON.stringify({ present: false });
-    } else {
-      const pngData = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, {});
-      if (pngData.isNil() || Number(pngData.length) === 0) {
-        JSON.stringify({ present: false });
-      } else {
-        const w = Math.round(ObjC.unwrap(rep.pixelsWide));
-        const h = Math.round(ObjC.unwrap(rep.pixelsHigh));
-        ${jxaSliceSnippet('pngData', range, ', width: w, height: h')}
-      }
-    }
-  }
+if (pngData !== null) {
+  const w = Math.round(ObjC.unwrap(rep.pixelsWide));
+  const h = Math.round(ObjC.unwrap(rep.pixelsHigh));
+  ${jxaSliceSnippet('pngData', range, ', width: w, height: h')}
+} else if (listed && !sawBytes) {
+  result = { present: true, total: 0, contentBase64: '', revision: String(changeCount) };
 }
+${JXA_READ_REPORT}
 `.trim();
 }
 
@@ -237,39 +268,6 @@ function runJxa(script: string, stdin?: Buffer): Promise<string> {
   });
 }
 
-/**
- * Environment for pbpaste. It transcodes through the process locale, so a parent
- * with no UTF-8 locale (launchd, `env -i`, some client launchers) would make it
- * emit one byte for `é`. Pinning LC_ALL keeps text bytes equal to the
- * clipboard's UTF-8 bytes on every launch path. The JXA writer decodes UTF-8
- * itself and needs no locale.
- */
-const UTF8_ENV = { ...process.env, LC_ALL: 'en_US.UTF-8' };
-
-/**
- * Run pbpaste and return the `[range.offset, range.offset + range.limit)`
- * byte window plus the stream's total size — pbpaste has no native range
- * support, so this streams its stdout through `collectByteWindow` rather than
- * buffering the whole output before slicing.
- */
-function runPbpasteWindow(range: ByteRange): Promise<{ totalByteSize: number; window: Buffer }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('pbpaste', [], {
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: UTF8_ENV,
-    });
-    const windowPromise = collectByteWindow(child.stdout, range);
-    child.on('close', (code) => {
-      windowPromise.then(
-        (result) => (code === 0 ? resolve(result) : reject(new Error(`pbpaste exited ${code}`))),
-        reject,
-      );
-    });
-    child.on('error', reject);
-  });
-}
-
 /** Run a ranged JXA read script and decode the envelope it prints (see `jxaSliceSnippet`). */
 async function runJxaRangedRead(script: string, formatName: string): Promise<RangedReadWindow> {
   return parseRangedReadEnvelope(await runJxa(script), 'macOS', formatName);
@@ -283,14 +281,8 @@ function utiToFormat(uti: string): ClipboardFormat | null {
     uti === 'NSStringPboardType'
   )
     return 'text';
-  if (uti === 'public.html' || uti === 'NSHTMLPboardType') return 'html';
-  if (
-    uti === 'public.rtf' ||
-    uti === 'com.apple.flat-rtfd' ||
-    uti === 'NSRTFPboardType' ||
-    uti === 'NSRTFDPboardType'
-  )
-    return 'rtf';
+  if (uti === 'public.html') return 'html';
+  if (uti === 'public.rtf' || uti === 'com.apple.flat-rtfd') return 'rtf';
   if (uti === 'public.tiff' || uti === 'public.png' || uti === 'com.apple.pict') return 'image';
   return null;
 }
@@ -301,66 +293,21 @@ export class MacosBackend implements ClipboardBackend {
     // JXA always prints a JSON array — `[]` for an empty pasteboard. Anything
     // else means the script failed, which is a reportable failure rather than
     // an empty clipboard.
-    const raw = await runJxa(JXA_INSPECT);
-    const entries = parseNativeTypeEntries(raw, 'macOS');
-
-    const rawTypes: RawTypeEntry[] = entries.map((e) => ({ type: e.type, bytes: e.bytes }));
-    const semanticSet = new Set<ClipboardFormat>();
-    for (const e of entries) {
-      const fmt = utiToFormat(e.type);
-      if (fmt) semanticSet.add(fmt);
-    }
-
-    return { rawTypes, ...buildInspectFormats(semanticSet) };
+    return buildInspectResult(
+      parseNativeTypeEntries(await runJxa(JXA_INSPECT), 'macOS'),
+      utiToFormat,
+    );
   }
 
   async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
-    switch (format) {
-      case 'text': {
-        // pbpaste returns "" on empty clipboard, indistinguishable from a real empty string.
-        // Inspect first so an empty clipboard gets a proper "not found" error.
-        const inspection = await this.inspect();
-        if (!inspection.availableFormats.includes('text')) {
-          throw clipboardOutcome('macOS', 'text format not found on clipboard', {
-            category: 'format_unavailable',
-          });
-        }
-        const { window, totalByteSize } = await runPbpasteWindow(range);
-        return { format: 'text', content: window, totalByteSize };
-      }
-
-      case 'html': {
-        const { total, contentBase64 } = await runJxaRangedRead(buildJxaReadHtml(range), 'HTML');
-        return {
-          format: 'html',
-          content: Buffer.from(contentBase64, 'base64'),
-          totalByteSize: total,
-        };
-      }
-
-      case 'rtf': {
-        const { total, contentBase64 } = await runJxaRangedRead(buildJxaReadRtf(range), 'RTF');
-        return {
-          format: 'rtf',
-          content: Buffer.from(contentBase64, 'base64'),
-          totalByteSize: total,
-        };
-      }
-
-      case 'image': {
-        const { total, contentBase64, width, height } = await runJxaRangedRead(
-          buildJxaReadImage(range),
-          'Image',
-        );
-        return {
-          format: 'image',
-          content: Buffer.from(contentBase64, 'base64'),
-          totalByteSize: total,
-          ...(width !== undefined && { width }),
-          ...(height !== undefined && { height }),
-        };
-      }
-    }
+    const window =
+      format === 'image'
+        ? await runJxaRangedRead(buildJxaReadImage(range), 'Image')
+        : await runJxaRangedRead(
+            buildJxaDataRead(DATA_READS[format].lookup, range),
+            DATA_READS[format].name,
+          );
+    return toReadResult(format, window);
   }
 
   async write(

@@ -5,7 +5,7 @@
 
 import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
-import { collectByteWindow, countBytes } from './byte-window.js';
+import { collectByteWindow, collectHashedByteWindow, countBytes } from './byte-window.js';
 import { readPngDimensions } from './png-dimensions.js';
 import type {
   ByteRange,
@@ -15,7 +15,7 @@ import type {
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats, clipboardOutcome, isClipboardOutcome } from './types.js';
+import { buildInspectResult, clipboardOutcome, isClipboardOutcome } from './types.js';
 
 const PLATFORM = 'Linux X11';
 
@@ -227,37 +227,31 @@ function runXsel(args: string[]): Promise<void> {
 
 /** Linux X11 clipboard backend using xclip. */
 export class LinuxX11Backend implements ClipboardBackend {
+  /**
+   * Only recognized targets are converted to measure them: converting an
+   * ICCCM side-effect target (`DELETE`) or a parameterized one (`MULTIPLE`) is
+   * unsafe, so every other target is listed without a size.
+   */
   async inspect(): Promise<InspectResult> {
-    const targets = await listTargets();
-
     const rawTypes: RawTypeEntry[] = [];
-    const semanticSet = new Set<ClipboardFormat>();
-
-    for (const target of targets) {
-      const fmt = mimeToFormat(target);
-      if (fmt) semanticSet.add(fmt);
-      // Measure size by reading the content for each known semantic type
-      // We only read for recognized MIME types to limit latency
-      if (fmt) {
-        try {
-          // Stream and count — clipboard_inspect is metadata-only, so the
-          // representation is never retained just to report its size (#26).
-          const bytes = await runXclipStream(
-            ['-o', '-selection', 'clipboard', '-t', target],
-            countBytes,
-          );
-          rawTypes.push({ type: target, bytes });
-        } catch {
-          // TARGETS advertised this type but reading it failed — report the
-          // measurement as failed rather than as a zero-byte representation.
-          rawTypes.push({ type: target, measurementFailed: true });
-        }
-      } else {
-        rawTypes.push({ type: target, bytes: 0 });
+    for (const target of await listTargets()) {
+      if (!mimeToFormat(target)) {
+        rawTypes.push({ type: target });
+        continue;
+      }
+      try {
+        // Stream and count — clipboard_inspect is metadata-only, so the
+        // representation is never retained just to report its size (#26).
+        const bytes = await runXclipStream(
+          ['-o', '-selection', 'clipboard', '-t', target],
+          countBytes,
+        );
+        rawTypes.push({ type: target, bytes });
+      } catch {
+        rawTypes.push({ type: target, measurementFailed: true });
       }
     }
-
-    return { rawTypes, ...buildInspectFormats(semanticSet) };
+    return buildInspectResult(rawTypes, mimeToFormat);
   }
 
   /**
@@ -283,16 +277,18 @@ export class LinuxX11Backend implements ClipboardBackend {
     let lastError: unknown;
     for (const target of candidates) {
       try {
-        const { window, totalByteSize } = await runXclipStream(
+        // Every read streams the whole representation, so hashing it on the way
+        // through identifies the value the window was cut from.
+        const { window, totalByteSize, sha256 } = await runXclipStream(
           ['-o', '-selection', 'clipboard', '-t', target],
-          (stdout) => collectByteWindow(stdout, range),
+          (stdout) => collectHashedByteWindow(stdout, range),
         );
         // xclip hands over opaque bytes with no dimension API — read them out of
         // the PNG header so Linux reads carry what macOS and Windows report.
         // The header only lives in the window when the window starts at byte 0.
         const dimensions =
           format === 'image' && range.offset === 0 ? readPngDimensions(window) : {};
-        return { format, content: window, totalByteSize, ...dimensions };
+        return { format, content: window, totalByteSize, revision: sha256, ...dimensions };
       } catch (error) {
         if (isClipboardOutcome(error) && error.category === 'clipboard_unavailable') throw error;
         lastError = error;

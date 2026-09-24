@@ -3,6 +3,7 @@
  * @module tests/services/clipboard/linux-wayland-backend.test
  */
 
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -142,8 +143,9 @@ describe('LinuxWaylandBackend', () => {
         { type: 'text/plain', bytes: 5 },
         { type: 'image/png', measurementFailed: true },
       ]);
-      expect(result.availableFormats).toEqual(['text', 'image']);
-      expect(result.primaryFormat).toBe('image');
+      // An unreadable representation cannot be returned by a read (#41).
+      expect(result.availableFormats).toEqual(['text']);
+      expect(result.primaryFormat).toBe('text');
     });
 
     it('reports a genuine zero-length representation as bytes: 0 (#23)', async () => {
@@ -183,10 +185,45 @@ describe('LinuxWaylandBackend', () => {
         expect(result).toEqual({
           primaryFormat: 'empty',
           availableFormats: [],
-          rawTypes: [{ type, bytes: 0 }],
+          rawTypes: [{ type }],
         });
       },
     );
+
+    it('omits bytes for MIME types it does not recognize and never reads them (#41)', async () => {
+      const fake = scriptedSpawn((_c, args) =>
+        args.includes('--list-types')
+          ? { stdout: 'application/x-probe\ntext/plain\nchromium/x-source-url\n' }
+          : { stdout: 'hello' },
+      );
+      mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+
+      const result = await backend.inspect();
+
+      expect(result.rawTypes).toEqual([
+        { type: 'application/x-probe' },
+        { type: 'text/plain', bytes: 5 },
+        { type: 'chromium/x-source-url' },
+      ]);
+      expect(fake.calls.map((c) => requestedType(c.args) ?? c.args[0])).toEqual([
+        '--list-types',
+        'text/plain',
+      ]);
+    });
+
+    it('a format whose only type failed to measure is not available (#41)', async () => {
+      mockSpawn
+        .mockReturnValueOnce(fakeChild({ stdout: 'text/html\n' }))
+        .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'wl-paste: read failed' }));
+
+      const result = await backend.inspect();
+
+      expect(result).toEqual({
+        primaryFormat: 'empty',
+        availableFormats: [],
+        rawTypes: [{ type: 'text/html', measurementFailed: true }],
+      });
+    });
   });
 
   describe('read()', () => {
@@ -809,5 +846,57 @@ describe('LinuxWaylandBackend — typed outcomes from wl-clipboard diagnostics (
     const failure = new LinuxWaylandBackend().inspect();
     await expect(failure).rejects.toThrow('wl-paste exited 1: wl-paste: out of memory');
     await expect(failure).rejects.not.toHaveProperty('category');
+  });
+});
+
+describe('LinuxWaylandBackend — streamed SHA-256 revision (#38)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('base64url');
+  const value = Buffer.from('AAAA1111é😀');
+
+  /** Serve one read of `bytes`, delivered in three chunks. */
+  function serve(bytes: Buffer, mime = 'text/plain') {
+    mockSpawn
+      .mockReturnValueOnce(listing(mime))
+      .mockReturnValueOnce(
+        fakeChild({ stdout: [bytes.subarray(0, 3), bytes.subarray(3, 9), bytes.subarray(9)] }),
+      );
+  }
+
+  it.each([
+    ['the whole representation', FULL],
+    ['a first window', { offset: 0, limit: 4 }],
+    ['a middle window spanning chunks', { offset: 2, limit: 8 }],
+    ['a window past the end', { offset: 500, limit: 4 }],
+  ])('%s is identified by the hash of every streamed byte', async (_label, range) => {
+    serve(value);
+    const result = await new LinuxWaylandBackend().read('text', range);
+    expect(result.revision).toBe(sha256(value));
+    expect(result.content.equals(value.subarray(range.offset, range.offset + range.limit))).toBe(
+      true,
+    );
+  });
+
+  it('a same-size replacement yields a different revision', async () => {
+    const backend = new LinuxWaylandBackend();
+    serve(Buffer.from('AAAA1111'));
+    const before = await backend.read('text', { offset: 0, limit: 4 });
+    serve(Buffer.from('BBBB2222'));
+    const after = await backend.read('text', { offset: 4, limit: 4 });
+    expect(after.totalByteSize).toBe(before.totalByteSize);
+    expect(after.revision).not.toBe(before.revision);
+  });
+
+  it('an image and a zero-byte representation are hashed the same way', async () => {
+    const backend = new LinuxWaylandBackend();
+    serve(REAL_PNG_13x7, 'image/png');
+    expect((await backend.read('image', { offset: 8, limit: 16 })).revision).toBe(
+      sha256(REAL_PNG_13x7),
+    );
+    mockSpawn.mockReturnValueOnce(listing('text/html')).mockReturnValueOnce(fakeChild({}));
+    expect((await backend.read('html', FULL)).revision).toBe(sha256(Buffer.alloc(0)));
   });
 });

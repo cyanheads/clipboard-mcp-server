@@ -28,8 +28,10 @@ import { ClipboardService, getClipboardService } from '@/services/clipboard/clip
 import { LinuxWaylandBackend } from '@/services/clipboard/linux-wayland-backend.js';
 import { LinuxX11Backend } from '@/services/clipboard/linux-x11-backend.js';
 import { MacosBackend } from '@/services/clipboard/macos-backend.js';
+import { readPngDimensions } from '@/services/clipboard/png-dimensions.js';
 import type { ClipboardBackend } from '@/services/clipboard/types.js';
 import { WindowsBackend } from '@/services/clipboard/windows-backend.js';
+import { REAL_PNG_13x7 } from '../services/clipboard/png-fixtures.js';
 import {
   type HelperScript,
   requestedType,
@@ -333,10 +335,7 @@ describe.each(['0.13', 'git'] as const)('X11, xclip %s', (version) => {
     const inspect = await runToolContract(clipboardInspect, {});
     expect(inspect.structuredContent).toMatchObject({
       primaryFormat: 'html',
-      rawTypes: [
-        { type: 'TARGETS', bytes: 0 },
-        { type: 'text/html', bytes: 0 },
-      ],
+      rawTypes: [{ type: 'TARGETS' }, { type: 'text/html', bytes: 0 }],
     });
 
     for (const format of ['html', 'auto'] as const) {
@@ -667,6 +666,12 @@ describe.each(['2.1', '2.2'] as const)('Wayland, wl-clipboard %s', (version) => 
 // #36 — macOS and Windows raise the typed categories too.
 // ---------------------------------------------------------------------------
 
+/** An empty macOS pasteboard: the type listing is `[]`, every ranged read is absent. */
+const macosEmptyScript: HelperScript = (_command, args) =>
+  (args.at(-1) ?? '').includes('subdataWithRange')
+    ? { stdout: JSON.stringify({ present: false }) }
+    : { stdout: '[]' };
+
 describe('macOS and Windows typed outcomes', () => {
   it('macOS: an absent HTML representation fails format_unavailable', async () => {
     install(new MacosBackend(), () => ({ stdout: JSON.stringify({ present: false }) }));
@@ -675,7 +680,7 @@ describe('macOS and Windows typed outcomes', () => {
   });
 
   it('macOS: text on an empty pasteboard fails format_unavailable', async () => {
-    install(new MacosBackend(), () => ({ stdout: '[]' }));
+    install(new MacosBackend(), macosEmptyScript);
     const error = wireError(await runToolContract(clipboardRead, { format: 'text' }));
     expect(error).toMatchObject({ code: NotFound, data: { reason: 'format_unavailable' } });
   });
@@ -850,21 +855,32 @@ describe('clipboard_write through the stdin writers (#30, #31)', () => {
     expect(textOf(result)).toContain('setting public.html failed');
   });
 
-  it('macOS: previousContent is still captured before the text write', async () => {
-    const fake = install(new MacosBackend(), (command, args) => {
-      if (command === 'pbpaste') return { stdout: 'prior text' };
-      if (args.at(-1)?.includes('fileHandleWithStandardInput')) return { stdout: 'ok' };
-      return { stdout: JSON.stringify([{ type: 'public.utf8-plain-text', bytes: 10 }]) };
+  it('macOS: previousContent is still captured before the text write, through one JXA read', async () => {
+    const prior = Buffer.from('﻿prior text');
+    const fake = install(new MacosBackend(), (_command, args) => {
+      const script = args.at(-1) ?? '';
+      if (script.includes('fileHandleWithStandardInput')) return { stdout: 'ok' };
+      if (script.includes("dataForType('public.utf8-plain-text')")) {
+        return {
+          stdout: JSON.stringify({
+            present: true,
+            total: prior.byteLength,
+            contentBase64: prior.toString('base64'),
+            revision: '31',
+          }),
+        };
+      }
+      return { exitCode: 1, stderr: 'unexpected helper script' };
     });
     const result = await runToolContract(clipboardWrite, { content: 'new', format: 'text' });
     expect(result.structuredContent).toMatchObject({
       format: 'text',
       byteSize: 3,
-      previousContent: 'prior text',
+      previousContent: '﻿prior text',
     });
     expect(textOf(result)).toContain('prior text');
-    expect(fake.calls.map((call) => call.command)).toEqual(['osascript', 'pbpaste', 'osascript']);
-    expect(fake.calls.some((call) => call.command === 'pbcopy')).toBe(false);
+    expect(fake.calls.map((call) => call.command)).toEqual(['osascript', 'osascript']);
+    expect(fake.calls.some((call) => ['pbcopy', 'pbpaste'].includes(call.command))).toBe(false);
   });
 });
 
@@ -919,5 +935,542 @@ describe('unreadable helper output on macOS and Windows reads', () => {
       const error = wireError(await runToolContract(clipboardRead, { format: 'rtf' }));
       expect(error).toMatchObject({ code: NotFound, data: { reason: 'format_unavailable' } });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #45 — an unreadable pre-read inspection is a typed inspect_unreadable.
+// ---------------------------------------------------------------------------
+
+describe('clipboard_read auto over an unreadable inspection (#45)', () => {
+  const SerializationError = -32070;
+
+  it.each([
+    ['macOS', () => new MacosBackend()],
+    ['Windows', () => new WindowsBackend()],
+  ] as const)(
+    '%s: auto fails inspect_unreadable with its hint on both surfaces',
+    async (platform, make) => {
+      install(make(), () => ({ stdout: 'secret-helper-output, not json' }));
+      const result = await runToolContract(clipboardRead, { format: 'auto' });
+      const error = wireError(result);
+      expect(error).toMatchObject({
+        code: SerializationError,
+        data: { reason: 'inspect_unreadable', platform },
+      });
+      expect(hintOf(error)).toMatch(/clipboard_read/);
+      expect(textOf(result)).toContain(hintOf(error));
+      expect(JSON.stringify(error.data)).not.toContain('secret-helper-output');
+    },
+  );
+
+  it('characterization: a readable inspection still resolves auto to the richest format', async () => {
+    install(
+      new LinuxWaylandBackend(),
+      waylandScript({ version: '2.2', types: wlTextOffer('abc') }),
+    );
+    const result = await runToolContract(clipboardRead, { format: 'auto' });
+    expect(result.structuredContent).toMatchObject({ format: 'text', content: 'abc' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #43 — Windows image reads take the PNG format before GetImage().
+// ---------------------------------------------------------------------------
+
+interface WindowsImageWorld {
+  /** A GDI bitmap GetImage() can return, re-encoded as this PNG at 13x7. */
+  bitmap?: Buffer;
+  /** Bytes of the registered `PNG` format. */
+  png?: Buffer;
+  text?: string;
+}
+
+/**
+ * Windows world answering the inspection, text, and image scripts. The image
+ * script's two sources are modeled separately: the `PNG` format answers only a
+ * script that reads it, and GetImage() answers only from a bitmap.
+ */
+function windowsImageScript(world: WindowsImageWorld): HelperScript {
+  return (_command, args) => {
+    const script = args.at(-1) ?? '';
+    /** The `$offset`/`$limit` window of `bytes`, answered as `psSliceSnippet` does. */
+    const envelope = (bytes: Buffer, extra: Record<string, number> = {}) => {
+      const from = Math.min(psInt(script, 'offset'), bytes.byteLength);
+      return {
+        stdout: JSON.stringify({
+          present: true,
+          total: bytes.byteLength,
+          contentBase64: bytes.subarray(from, from + psInt(script, 'limit')).toString('base64'),
+          revision: createHash('sha256').update(bytes).digest('base64'),
+          ...extra,
+        }),
+      };
+    };
+    if (script.includes('GetFormats')) {
+      const listing = [
+        ...(world.png ? [{ type: 'PNG', bytes: world.png.byteLength }] : []),
+        ...(world.bitmap ? [{ type: 'Bitmap' }] : []),
+        ...(world.text !== undefined
+          ? [{ type: 'UnicodeText', bytes: Buffer.byteLength(world.text) }]
+          : []),
+      ];
+      return { stdout: JSON.stringify(listing) };
+    }
+    if (script.includes('nativeTextFormats')) {
+      return world.text === undefined
+        ? { stdout: JSON.stringify({ present: false }) }
+        : envelope(Buffer.from(world.text));
+    }
+    const png = script.includes("GetData('PNG', $false)") ? world.png : undefined;
+    // A script that decodes the PNG first (System.Drawing, modeled by the header
+    // check) takes it only when it decodes; one that does not takes any bytes.
+    const decoded =
+      png && png.byteLength > 0
+        ? script.includes('[System.Drawing.Image]::FromStream(')
+          ? readPngDimensions(png)
+          : {}
+        : undefined;
+    if (png && decoded) return envelope(png, { ...decoded });
+    if (world.bitmap) return envelope(world.bitmap, { width: 13, height: 7 });
+    if (png?.byteLength === 0) return envelope(png);
+    return { stdout: JSON.stringify({ present: false }) };
+  };
+}
+
+describe('Windows clipboard_read image (#43)', () => {
+  it('a zero-length PNG beside text: image and auto return the empty image, with no image block', async () => {
+    install(new WindowsBackend(), windowsImageScript({ png: Buffer.alloc(0), text: 'abc' }));
+
+    const inspect = await runToolContract(clipboardInspect, {});
+    expect(inspect.structuredContent).toMatchObject({
+      primaryFormat: 'image',
+      availableFormats: ['text', 'image'],
+    });
+
+    for (const format of ['image', 'auto'] as const) {
+      const result = await runToolContract(clipboardRead, { format });
+      expect(result.isError, format).toBeFalsy();
+      expect(result.structuredContent).toEqual({
+        format: 'image',
+        content: '',
+        byteSize: 0,
+        totalByteSize: 0,
+        complete: true,
+        representationId: `image:${createHash('sha256').update(Buffer.alloc(0)).digest('base64')}`,
+      });
+      expect(result.content.some((b) => b.type === 'image')).toBe(false);
+    }
+  });
+
+  it('a decodable PNG with no bitmap returns that PNG with its decoded dimensions', async () => {
+    install(new WindowsBackend(), windowsImageScript({ png: REAL_PNG_13x7 }));
+    const result = await runToolContract(clipboardRead, { format: 'image' });
+    expect(result.structuredContent).toMatchObject({
+      format: 'image',
+      content: REAL_PNG_13x7.toString('base64'),
+      width: 13,
+      height: 7,
+      totalByteSize: REAL_PNG_13x7.byteLength,
+    });
+    expect(result.content.some((b) => b.type === 'image')).toBe(true);
+  });
+
+  it('an undecodable PNG beside a bitmap reads the bitmap; alone, image and auto fail format_unavailable', async () => {
+    const notPng = Buffer.from('not a png');
+    install(new WindowsBackend(), windowsImageScript({ png: notPng, bitmap: REAL_PNG_13x7 }));
+    const withBitmap = await runToolContract(clipboardRead, { format: 'image' });
+    expect(withBitmap.structuredContent).toMatchObject({
+      content: REAL_PNG_13x7.toString('base64'),
+      width: 13,
+      height: 7,
+    });
+
+    install(new WindowsBackend(), windowsImageScript({ png: notPng }));
+    for (const format of ['image', 'auto'] as const) {
+      const result = await runToolContract(clipboardRead, { format });
+      expect(wireError(result), format).toMatchObject({
+        code: NotFound,
+        data: { reason: 'format_unavailable' },
+      });
+      expect(result.content.some((b) => b.type === 'image')).toBe(false);
+    }
+  });
+
+  it('auto over an undecodable PNG beside text returns the text (#46)', async () => {
+    install(
+      new WindowsBackend(),
+      windowsImageScript({ png: Buffer.from('not a png'), text: 'abc' }),
+    );
+    const result = await runToolContract(clipboardRead, { format: 'auto' });
+    expect(result.structuredContent).toMatchObject({ format: 'text', content: 'abc' });
+    expect(result.content.some((b) => b.type === 'image')).toBe(false);
+  });
+
+  it('a PNG slice past its header still carries the decoded dimensions', async () => {
+    install(new WindowsBackend(), windowsImageScript({ png: REAL_PNG_13x7 }));
+    const result = await runToolContract(clipboardRead, { format: 'image', offset: 40, limit: 10 });
+    expect(result.structuredContent).toMatchObject({ width: 13, height: 7, byteSize: 10 });
+  });
+
+  it('characterization: a Bitmap-only clipboard still reads through GetImage()', async () => {
+    install(new WindowsBackend(), windowsImageScript({ bitmap: REAL_PNG_13x7 }));
+    const result = await runToolContract(clipboardRead, { format: 'image' });
+    expect(result.structuredContent).toMatchObject({ format: 'image', width: 13, height: 7 });
+  });
+
+  it('a Bitmap-only clipboard lists image with no size, and auto reads it (#41)', async () => {
+    install(new WindowsBackend(), windowsImageScript({ bitmap: REAL_PNG_13x7 }));
+    const inspect = await runToolContract(clipboardInspect, {});
+    expect(inspect.structuredContent).toEqual({
+      primaryFormat: 'image',
+      availableFormats: ['image'],
+      rawTypes: [{ type: 'Bitmap' }],
+    });
+    expect(textOf(inspect)).toContain('| `Bitmap` | unknown |');
+    const result = await runToolContract(clipboardRead, { format: 'auto' });
+    expect(result.structuredContent).toMatchObject({ format: 'image', width: 13, height: 7 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #38 — representationId ties the slices of a chunked read to one value.
+// ---------------------------------------------------------------------------
+
+const Conflict = -32002;
+
+/** One successful clipboard_read's structuredContent, asserting it did not fail. */
+async function readOk(input: Record<string, unknown>) {
+  const result = await runToolContract(clipboardRead, input);
+  expect(result.isError, JSON.stringify(input)).toBeFalsy();
+  return {
+    result,
+    structured: result.structuredContent as {
+      content: string;
+      format: string;
+      nextOffset?: number;
+      representationId: string;
+      totalByteSize: number;
+    },
+  };
+}
+
+/** Assert a call failed representation_changed with the declared hint on both surfaces. */
+function expectRepresentationChanged(result: Awaited<ReturnType<typeof runToolContract>>) {
+  const error = wireError(result);
+  expect(error).toMatchObject({ code: Conflict, data: { reason: 'representation_changed' } });
+  expect(hintOf(error)).toBe(
+    'The clipboard changed during the read — after an earlier slice, or while this call was reading. Discard the bytes read so far and restart at offset 0 without representationId.',
+  );
+  expect(textOf(result)).toContain(hintOf(error));
+  expect(result.structuredContent).not.toHaveProperty('content');
+  expect(result.content.some((b) => b.type === 'image')).toBe(false);
+}
+
+interface TextWorld {
+  /** Empty the clipboard. */
+  clear(): void;
+  /** Replace the clipboard with `value` under the text types only. */
+  setText(value: string): void;
+  /** Offer `value` as both text and HTML. */
+  setTextAndHtml(value: string): void;
+}
+
+/** Linux worlds whose contents the test replaces between calls. */
+const linuxWorlds = [
+  [
+    'Wayland',
+    (): TextWorld => {
+      const world: WaylandWorld = { version: '2.2' };
+      install(new LinuxWaylandBackend(), waylandScript(world));
+      return {
+        setText: (value) => {
+          world.types = wlTextOffer(value);
+        },
+        setTextAndHtml: (value) => {
+          world.types = { ...wlTextOffer(value), 'text/html': value };
+        },
+        clear: () => {
+          world.types = undefined;
+        },
+      };
+    },
+  ],
+  [
+    'X11',
+    (): TextWorld => {
+      const world: X11World = { version: '0.13' };
+      install(new LinuxX11Backend(), x11Script(world));
+      return {
+        setText: (value) => {
+          world.owner = { kind: 'xsel', types: { UTF8_STRING: value } };
+        },
+        setTextAndHtml: (value) => {
+          world.owner = { kind: 'xsel', types: { UTF8_STRING: value, 'text/html': value } };
+        },
+        clear: () => {
+          world.owner = undefined;
+        },
+      };
+    },
+  ],
+] as const;
+
+describe.each(linuxWorlds)('%s: representationId across slices (#38)', (_platform, makeWorld) => {
+  it('full and sliced reads of an unchanged value share one token on both surfaces', async () => {
+    makeWorld().setText('AAAA1111');
+    const first = await readOk({ format: 'text', offset: 0, limit: 4 });
+    expect(first.structured).toMatchObject({ content: 'AAAA', totalByteSize: 8, nextOffset: 4 });
+    expect(first.structured.representationId).toMatch(/\S/);
+    expect(textOf(first.result)).toContain(
+      `**Representation ID:** ${first.structured.representationId}`,
+    );
+
+    const whole = await readOk({ format: 'text' });
+    expect(whole.structured.representationId).toBe(first.structured.representationId);
+
+    const next = await readOk({
+      format: 'text',
+      offset: 4,
+      limit: 4,
+      representationId: first.structured.representationId,
+    });
+    expect(next.structured).toMatchObject({ content: '1111', complete: true });
+    expect(next.structured.representationId).toBe(first.structured.representationId);
+  });
+
+  it('a same-size replacement between slices fails the continuation with representation_changed', async () => {
+    const world = makeWorld();
+    world.setText('AAAA1111');
+    const first = await readOk({ format: 'text', offset: 0, limit: 4 });
+    world.setText('BBBB2222');
+    expectRepresentationChanged(
+      await runToolContract(clipboardRead, {
+        format: 'text',
+        offset: first.structured.nextOffset,
+        limit: 4,
+        representationId: first.structured.representationId,
+      }),
+    );
+  });
+
+  it('a call without representationId still reads the replaced value as before', async () => {
+    const world = makeWorld();
+    world.setText('AAAA1111');
+    const first = await readOk({ format: 'text', offset: 0, limit: 4 });
+    world.setText('BBBB2222');
+    const next = await readOk({ format: 'text', offset: 4, limit: 4 });
+    expect(next.structured).toMatchObject({ content: '2222', totalByteSize: 8 });
+    expect(next.structured.representationId).not.toBe(first.structured.representationId);
+  });
+
+  it('an auto continuation that resolves to another format conflicts, even over identical bytes', async () => {
+    const world = makeWorld();
+    world.setText('same');
+    const first = await readOk({ format: 'auto', offset: 0, limit: 4 });
+    expect(first.structured.format).toBe('text');
+    world.setTextAndHtml('same');
+    expectRepresentationChanged(
+      await runToolContract(clipboardRead, {
+        format: 'auto',
+        offset: 0,
+        limit: 4,
+        representationId: first.structured.representationId,
+      }),
+    );
+  });
+
+  it('a clipboard emptied between slices still fails format_unavailable', async () => {
+    const world = makeWorld();
+    world.setText('AAAA1111');
+    const first = await readOk({ format: 'text', offset: 0, limit: 4 });
+    world.clear();
+    for (const format of ['text', 'auto'] as const) {
+      const error = wireError(
+        await runToolContract(clipboardRead, {
+          format,
+          offset: 4,
+          limit: 4,
+          representationId: first.structured.representationId,
+        }),
+      );
+      expect(error, format).toMatchObject({
+        code: NotFound,
+        data: { reason: 'format_unavailable' },
+      });
+    }
+  });
+
+  it('a clipboard that no longer holds the format between slices still fails format_unavailable', async () => {
+    const world = makeWorld();
+    world.setTextAndHtml('<b>x</b>');
+    const first = await readOk({ format: 'html', offset: 0, limit: 4 });
+    world.setText('<b>x</b>');
+    const error = wireError(
+      await runToolContract(clipboardRead, {
+        format: 'html',
+        offset: 4,
+        limit: 4,
+        representationId: first.structured.representationId,
+      }),
+    );
+    expect(error).toMatchObject({ code: NotFound, data: { reason: 'format_unavailable' } });
+  });
+});
+
+/** Integer the macOS slice snippet interpolates into `pattern`. */
+function jxaInt(script: string, pattern: RegExp): number {
+  const match = pattern.exec(script);
+  if (!match?.[1]) throw new Error(`script has no ${pattern}`);
+  return Number(match[1]);
+}
+
+interface MacosTextWorld {
+  changeCount: number;
+  /** The script sees changeCount move between its two samples. */
+  changesMidRead?: boolean;
+  text?: Buffer;
+}
+
+/**
+ * macOS world holding plain text. A read script answers the window its slice
+ * snippet asks for with `revision: String(changeCount)`, or `{ changed: true }`
+ * when the pasteboard is written between its two changeCount samples.
+ */
+function macosTextScript(world: MacosTextWorld): HelperScript {
+  return (_command, args) => {
+    const script = args.at(-1) ?? '';
+    if (!script.includes('subdataWithRange')) {
+      return {
+        stdout: JSON.stringify(
+          world.text ? [{ type: 'public.utf8-plain-text', bytes: world.text.byteLength }] : [],
+        ),
+      };
+    }
+    if (world.changesMidRead) return { stdout: JSON.stringify({ changed: true }) };
+    const text = world.text;
+    if (!text || !script.includes("dataForType('public.utf8-plain-text')")) {
+      return { stdout: JSON.stringify({ present: false }) };
+    }
+    const from = Math.min(jxaInt(script, /Math\.min\((\d+), total\)/), text.byteLength);
+    const limit = jxaInt(script, /Math\.min\((\d+), total - location\)/);
+    return {
+      stdout: JSON.stringify({
+        present: true,
+        total: text.byteLength,
+        contentBase64: text.subarray(from, from + limit).toString('base64'),
+        revision: String(world.changeCount),
+      }),
+    };
+  };
+}
+
+/** Windows world holding plain text, answered as `psSliceSnippet` would. */
+function windowsTextScript(world: { text: Buffer }): HelperScript {
+  return (_command, args) => {
+    const script = args.at(-1) ?? '';
+    const from = Math.min(psInt(script, 'offset'), world.text.byteLength);
+    return {
+      stdout: JSON.stringify({
+        present: true,
+        total: world.text.byteLength,
+        contentBase64: world.text.subarray(from, from + psInt(script, 'limit')).toString('base64'),
+        revision: createHash('sha256').update(world.text).digest('base64'),
+      }),
+    };
+  };
+}
+
+describe('macOS and Windows: representationId across slices (#38)', () => {
+  it('macOS: the token follows changeCount — stable while unchanged, a same-size replacement conflicts', async () => {
+    const world: MacosTextWorld = { changeCount: 90, text: Buffer.from('AAAA1111') };
+    install(new MacosBackend(), macosTextScript(world));
+
+    const first = await readOk({ format: 'text', offset: 0, limit: 4 });
+    expect(first.structured).toMatchObject({ content: 'AAAA', representationId: 'text:90' });
+    expect((await readOk({ format: 'text' })).structured.representationId).toBe('text:90');
+    const next = await readOk({
+      format: 'text',
+      offset: 4,
+      limit: 4,
+      representationId: 'text:90',
+    });
+    expect(next.structured.content).toBe('1111');
+
+    world.text = Buffer.from('BBBB2222');
+    world.changeCount = 91;
+    expectRepresentationChanged(
+      await runToolContract(clipboardRead, {
+        format: 'text',
+        offset: 4,
+        limit: 4,
+        representationId: 'text:90',
+      }),
+    );
+  });
+
+  it('macOS: a change caught between the two changeCount samples fails representation_changed with no token passed', async () => {
+    install(
+      new MacosBackend(),
+      macosTextScript({ changeCount: 5, changesMidRead: true, text: Buffer.from('x') }),
+    );
+    for (const input of [{ format: 'text' }, { format: 'auto' }, { format: 'text', offset: 0 }]) {
+      const result = await runToolContract(clipboardRead, input);
+      expectRepresentationChanged(result);
+      expect(wireError(result).data?.platform).toBe('macOS');
+    }
+  });
+
+  it('Windows: a same-size replacement between slices conflicts; an unchanged value continues', async () => {
+    const world = { text: Buffer.from('AAAA1111') };
+    install(new WindowsBackend(), windowsTextScript(world));
+
+    const first = await readOk({ format: 'text', offset: 0, limit: 4 });
+    const token = first.structured.representationId;
+    expect(token).toBe(`text:${createHash('sha256').update(world.text).digest('base64')}`);
+    expect(
+      (await readOk({ format: 'text', offset: 4, limit: 4, representationId: token })).structured
+        .content,
+    ).toBe('1111');
+
+    world.text = Buffer.from('BBBB2222');
+    expectRepresentationChanged(
+      await runToolContract(clipboardRead, {
+        format: 'text',
+        offset: 4,
+        limit: 4,
+        representationId: token,
+      }),
+    );
+  });
+
+  it('Windows: the two HTML Format calls hashing differently fail representation_changed on the wire', async () => {
+    const before = buildCfHtml(`<p>${'a'.repeat(300_000)}</p>`);
+    const after = buildCfHtml(`<p>${'b'.repeat(300_000)}</p>`);
+    let call = 0;
+    install(new WindowsBackend(), (command, args) =>
+      windowsHtmlScript(call++ === 0 ? before : after)(command, args),
+    );
+    const result = await runToolContract(clipboardRead, {
+      format: 'html',
+      offset: 200_000,
+      limit: 10,
+    });
+    expectRepresentationChanged(result);
+    expect(wireError(result).data?.platform).toBe('Windows');
+  });
+
+  it('Windows: an HTML continuation across the one- and two-call paths keeps one token', async () => {
+    const fragment = `<p>${'a'.repeat(300_000)}Z</p>`;
+    install(new WindowsBackend(), windowsHtmlScript(buildCfHtml(fragment)));
+    const head = await readOk({ format: 'html', offset: 0, limit: 8 });
+    const tail = await readOk({
+      format: 'html',
+      offset: 300_003,
+      limit: 5,
+      representationId: head.structured.representationId,
+    });
+    expect(tail.structured.content).toBe('Z</p>');
+    expect(tail.structured.representationId).toBe(head.structured.representationId);
   });
 });

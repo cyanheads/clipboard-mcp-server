@@ -58,7 +58,7 @@ function buildInstructions(writeEnabled: boolean): string {
     ? 'There is no history — the clipboard is a single live slot, so clipboard_read returns whatever is on it right now and clipboard_write replaces it.'
     : 'There is no history — the clipboard is a single live slot, so clipboard_read returns whatever is on it right now.';
   const formats =
-    'A clipboard holds one item in several formats (text/html/rtf/image); call clipboard_inspect first to see what is present, and prefer clipboard_read with format "auto". Images come back as base64 PNG.';
+    'A clipboard holds one item in several formats (text/html/rtf/image); call clipboard_inspect first to see what is present, and prefer clipboard_read with format "auto". Images come back as base64 PNG; read in offset/limit slices, they are PNG byte chunks to base64-decode and concatenate in offset order, not standalone images. When paging with nextOffset, pass back the returned representationId so a clipboard change between slices fails instead of mixing two values.';
   return `${lead} ${slot} ${formats}`;
 }
 

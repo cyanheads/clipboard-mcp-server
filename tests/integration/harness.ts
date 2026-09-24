@@ -34,8 +34,8 @@ function writeScript(path: string, body: string): void {
 export const OSASCRIPT_STDIN_LOG = 'osascript-stdin.log';
 
 /**
- * Create a bin directory of clipboard stubs. Writers swallow stdin, readers
- * emit nothing, and the `osascript` stub swallows any stdin payload (logging
+ * Create a bin directory of clipboard stubs. Writers swallow stdin, `wl-paste`
+ * emits nothing, and the `osascript` stub swallows any stdin payload (logging
  * its byte count to `OSASCRIPT_STDIN_LOG`) and prints an empty type listing
  * (`[]`) — enough for every backend this suite exercises
  * without reading or mutating the developer's real clipboard.
@@ -45,9 +45,7 @@ export function createClipboardStubBin(): string {
   for (const writer of ['xclip', 'xsel', 'wl-copy']) {
     writeScript(join(dir, writer), 'cat > /dev/null');
   }
-  for (const reader of ['pbpaste', 'wl-paste']) {
-    writeScript(join(dir, reader), "printf ''");
-  }
+  writeScript(join(dir, 'wl-paste'), "printf ''");
   writeScript(
     join(dir, 'osascript'),
     `wc -c | tr -d ' ' >> "${join(dir, OSASCRIPT_STDIN_LOG)}"\nprintf '[]'`,

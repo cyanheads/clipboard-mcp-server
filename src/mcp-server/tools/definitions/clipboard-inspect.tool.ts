@@ -27,7 +27,9 @@ export const clipboardInspect = tool('clipboard_inspect', {
     availableFormats: z
       .array(z.enum(['text', 'html', 'rtf', 'image']))
       .describe(
-        'All semantic formats present. Use to decide which format to pass to clipboard_read.',
+        'The semantic formats clipboard_read can return — a format is listed only when at least one of its representations was read. ' +
+          'One exception: an image whose bytes no decoder accepts is listed, but reading it as "image" fails format_unavailable ("auto" moves on to the next format). ' +
+          'Use to decide which format to pass to clipboard_read.',
       ),
     rawTypes: z
       .array(
@@ -43,23 +45,25 @@ export const clipboardInspect = tool('clipboard_inspect', {
               .int()
               .optional()
               .describe(
-                'Size of this representation in bytes. ' +
+                'Measured size of this representation in bytes; 0 means the representation is present and empty. ' +
                   "On Linux, sizes are measured by streaming and counting each format's bytes without retaining them — " +
                   'may still add latency for large items, but never buffers the full payload. ' +
-                  'Absent when measurementFailed is true; 0 means a genuinely empty representation.',
+                  'Absent when the platform did not size this type (a Linux type with no semantic format, such as TARGETS, or a Windows object that is not a string, byte array, or stream) ' +
+                  'or when measurementFailed is true.',
               ),
             measurementFailed: z
               .boolean()
               .optional()
               .describe(
-                'True when the platform listed this type but reading it to measure its size failed. ' +
-                  'The type is on the clipboard and clipboard_read may still return it — only the size is unknown.',
+                'True when the platform listed this type but its data was nil, null, failed to read, or (a Windows text or RTF format) was not a string. ' +
+                  'Such an entry does not make its format available: clipboard_read cannot return it.',
               ),
           })
           .describe('A single pasteboard type entry with its identifier and byte size.'),
       )
       .describe(
-        'All explicitly-set pasteboard types with byte sizes. Useful for debugging or understanding exactly what was copied.',
+        'Every type the platform lists, including translations it can supply, with byte sizes where measured. ' +
+          'Useful for debugging or understanding exactly what was copied.',
       ),
   }),
   errors: [

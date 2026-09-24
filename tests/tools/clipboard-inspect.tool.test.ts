@@ -237,5 +237,54 @@ describe('clipboardInspect — surfaced failures (#23)', () => {
       expect(text).toContain('1,234');
       expect(text).toContain('measurementFailed: true');
     });
+
+    it('renders an unmeasured entry as unknown, without the failure note (#41)', () => {
+      const text = render([{ type: 'TARGETS' }]);
+      expect(text).toContain('| `TARGETS` | unknown |');
+      expect(text).not.toContain('measurementFailed');
+    });
+
+    it('renders measured, zero-byte, unmeasured, and failed entries in one table (#41)', () => {
+      const text = render([
+        { type: 'UTF8_STRING', bytes: 5 },
+        { type: 'text/html', bytes: 0 },
+        { type: 'TIMESTAMP' },
+        { type: 'image/png', measurementFailed: true },
+      ]);
+      expect(text).toContain('| `UTF8_STRING` | 5 |');
+      expect(text).toContain('| `text/html` | 0 |');
+      expect(text).toContain('| `TIMESTAMP` | unknown |');
+      expect(text).toContain('| `image/png` | unknown (measurementFailed: true) |');
+    });
+  });
+
+  describe('output contract (#41)', () => {
+    const entry = clipboardInspect.output.shape.rawTypes.element.shape;
+
+    it('an unmeasured entry passes the output schema with no bytes', () => {
+      expect(
+        clipboardInspect.output.parse({
+          primaryFormat: 'empty',
+          availableFormats: [],
+          rawTypes: [{ type: 'TARGETS' }],
+        }).rawTypes[0],
+      ).toEqual({ type: 'TARGETS' });
+    });
+
+    it('says bytes is absent for types the platform did not size, and 0 means present and empty', () => {
+      expect(entry.bytes.description).toMatch(/did not size/);
+      expect(entry.bytes.description).toMatch(/0 means/);
+    });
+
+    it('says a failed measurement does not make its format available', () => {
+      expect(entry.measurementFailed.description).toMatch(/clipboard_read cannot return/);
+      expect(entry.measurementFailed.description).not.toMatch(/may still return/);
+    });
+
+    it('says availableFormats lists only what clipboard_read can return', () => {
+      expect(clipboardInspect.output.shape.availableFormats.description).toMatch(
+        /clipboard_read can return/,
+      );
+    });
   });
 });

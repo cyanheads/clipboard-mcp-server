@@ -79,7 +79,7 @@ async function detectBackend(): Promise<ClipboardBackend> {
   const platform = process.platform;
 
   if (platform === 'darwin') {
-    // pbpaste and osascript are built-in on macOS — no detection needed.
+    // osascript is built in on macOS — no detection needed.
     return new MacosBackend();
   }
 
@@ -190,7 +190,8 @@ export class ClipboardService {
    * the backend) exceeds the limit, without ever holding the full oversized
    * payload. With `range`, the caller's `limit` is clamped to the format's
    * size limit and `content_too_large` is never thrown — the caller owns
-   * paging through the representation via `nextOffset`.
+   * paging through the representation via `nextOffset`. Every result carries
+   * `representationId`, which stays equal across reads of an unchanged value.
    */
   async read(format: ClipboardFormat, ctx: Context, range?: ByteRange): Promise<RangedReadResult> {
     ctx.log.debug('clipboard read', { format, range });
@@ -228,6 +229,8 @@ export class ClipboardService {
       totalByteSize: result.totalByteSize,
       complete,
       ...(complete ? {} : { nextOffset }),
+      // The format is part of the token: the same bytes read as another format are another value.
+      representationId: `${result.format}:${result.revision}`,
     };
   }
 
