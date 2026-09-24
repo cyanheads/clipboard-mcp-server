@@ -38,7 +38,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
 - **Secrets in env vars only** — never hardcoded.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
-- **No Docker.** This server requires direct host OS access (pbpaste, JXA/NSPasteboard on macOS; xclip/wl-clipboard on Linux; PowerShell on Windows). None of these work inside a container. Skip Docker build/push steps in any release or publish workflow.
+- **No Docker.** This server requires direct host OS access (JXA/NSPasteboard via osascript on macOS; xclip/wl-clipboard on Linux; PowerShell on Windows). None of these work inside a container. Skip Docker build/push steps in any release or publish workflow.
 
 ---
 
@@ -230,7 +230,7 @@ src/
     clipboard/
       clipboard-service.ts              # ClipboardService facade + init/accessor
       types.ts                          # Domain types and interfaces
-      macos-backend.ts                  # macOS backend (pbpaste + osascript/JXA)
+      macos-backend.ts                  # macOS backend (osascript/JXA)
       linux-x11-backend.ts              # Linux X11 backend (xclip)
       linux-wayland-backend.ts          # Linux Wayland backend (wl-clipboard)
       windows-backend.ts                # Windows backend (PowerShell)

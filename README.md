@@ -39,12 +39,13 @@ The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write
 
 ### `clipboard_read` <sub>tool</sub>
 
-- `auto` returns the richest format explicitly present — priority: image > html > rtf > text; `format` requests a specific one instead
+- `auto` returns the richest format explicitly present — priority: image > html > rtf > text — moving on to the next one when a listed format can't be read (an image no decoder accepts); `format` requests a specific one instead
 - Size limits: 512 KB for text/HTML/RTF, 5 MB for images (raw bytes before base64 expansion)
-- Content above the limit reads via `offset`/`limit` slicing — pass both to read a bounded window (`limit` is at least 4, clamped to the format's size limit) and follow the returned `nextOffset` until `complete` is `true`
-- `image` returns base64-encoded PNG data, with `width`/`height` whenever the capture carries a readable PNG header
-- A text, HTML, or RTF format that is present but zero bytes long returns empty content, not an error
-- Typed errors: `format_unavailable` when the requested format isn't on the clipboard (or the clipboard is empty), `content_too_large` when no `offset`/`limit` was given and content exceeds the size limit, `clipboard_unavailable` when the platform helper is missing or can't reach the desktop session
+- Content above the limit reads via `offset`/`limit` slicing — pass `offset` to read a bounded window (`limit` is optional, at least 4, and clamped to the format's size limit) and follow the returned `nextOffset` until `complete` is `true`
+- Every read returns `representationId`, an opaque token for the value and format it was cut from — the same across full and sliced reads of an unchanged value. Pass it back with each `nextOffset`: if another application copied in between (even a same-size replacement), or `auto` now resolves to a different format, the continuation returns no bytes and fails with `representation_changed`. Linux and Windows derive it from a SHA-256 of the full representation, macOS from `NSPasteboard.changeCount`
+- `image` returns base64-encoded PNG data, with `width`/`height` whenever the capture carries a readable PNG header. Only a response holding the whole image attaches an image block; image slices are PNG byte chunks, not standalone images — a partial slice carries its base64 and byte range in the text, and the chunks are base64-decoded separately and their bytes concatenated in offset order
+- A text, HTML, RTF, or image format that is present but zero bytes long returns empty content, not an error (a zero-byte image attaches no image block)
+- Typed errors: `format_unavailable` when the requested format isn't on the clipboard (or the clipboard is empty), `content_too_large` when no `offset`/`limit` was given and content exceeds the size limit, `representation_changed` when the clipboard changed after the slice that returned the given `representationId`, or while the read itself was running, `clipboard_unavailable` when the platform helper is missing or can't reach the desktop session, `inspect_unreadable` when `auto` can't read the clipboard's type listing (an explicit format reads without it)
 
 ---
 
@@ -62,8 +63,8 @@ The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write
 
 ### `clipboard_inspect` <sub>tool</sub>
 
-- Returns `primaryFormat` (richest present — image > html > rtf > text — or `empty`) and `availableFormats`, the formats available to pass to `clipboard_read`
-- Returns `rawTypes` — every raw platform type identifier with byte size (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows); an entry whose size couldn't be measured carries `measurementFailed: true` and no `bytes`, never a false zero
+- Returns `primaryFormat` (richest present — image > html > rtf > text — or `empty`) and `availableFormats` — only the formats `clipboard_read` can return, each backed by at least one representation that was read (the one exception: an image whose bytes no decoder accepts is listed, but reading it as `image` fails `format_unavailable`, and `auto` moves on to the next format)
+- Returns `rawTypes` — every raw platform type identifier (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows) with its measured `bytes`, where `0` means present and empty; a type the platform doesn't size (e.g. `TARGETS`) has no `bytes`, and one whose data was nil or unreadable carries `measurementFailed: true` and no `bytes` — never a false zero
 - Typed `inspect_unreadable` error when the platform helper's output cannot be read, instead of reporting an empty clipboard; typed `clipboard_unavailable` when the helper is missing or can't reach the desktop session
 
 ---
@@ -74,7 +75,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 Clipboard-specific:
 
-- Cross-platform backend detection at startup — macOS (pbpaste + osascript), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
+- Cross-platform backend detection at startup — macOS (osascript/JXA), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
 - Semantic format mapping — platform-native type identifiers (UTIs, TARGETS, Windows format names) mapped to `text`, `html`, `rtf`, `image` across all backends
 - Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; on Linux the HTML is the only payload, which plain-text paste targets can also receive
 - Image support — every backend returns PNG as base64 with width/height (Linux backends read them from the PNG header)
@@ -82,9 +83,9 @@ Clipboard-specific:
 Agent-friendly output:
 
 - Size-guarded I/O — reads and writes over the format limit fail with a typed `content_too_large` error carrying byte/limit metadata, rather than truncating silently
-- Bounded continuation — `clipboard_read` slices oversized content with `offset`/`limit` and `nextOffset` instead of forcing a single all-or-nothing read
+- Bounded continuation — `clipboard_read` slices oversized content with `offset`/`limit` and `nextOffset` instead of forcing a single all-or-nothing read, and `representationId` makes a clipboard change between slices fail loudly instead of splicing two values together
 - Undo support — `clipboard_write` returns `previousContent` so an unintended overwrite can be reverted
-- Discriminated failure — `format_unavailable`, `content_too_large`, `inspect_unreadable`, and `clipboard_unavailable` are typed reasons with recovery hints, not generic errors; each backend classifies its helper's outcomes itself (across wl-clipboard and xclip release spellings), so an empty clipboard, an absent format, and an unreachable helper never blur together
+- Discriminated failure — `format_unavailable`, `content_too_large`, `representation_changed`, `inspect_unreadable`, and `clipboard_unavailable` are typed reasons with recovery hints, not generic errors; each backend classifies its helper's outcomes itself (across wl-clipboard and xclip release spellings), so an empty clipboard, an absent format, and an unreachable helper never blur together
 
 ---
 
@@ -137,7 +138,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 Bun 1.4.0+ or Node.js 24+.
 
-**macOS:** No additional tools required — `pbpaste` and `osascript` are built in.
+**macOS:** No additional tools required — `osascript` is built in.
 
 **Linux X11:** `xclip` must be installed. `xsel` is additionally required for `clipboard_write`'s `clear` mode — it is the only one of the two that can hand the selection back rather than owning an empty one.
 
@@ -215,9 +216,9 @@ bun run test       # Vitest test suite
 
 See [`CLAUDE.md`](./CLAUDE.md) for the full developer protocol — tool patterns, service patterns, error handling, logging conventions, and the checklist for shipping changes. The short version:
 
-- Handlers throw, framework catches — no `try/catch` in tool logic
+- Handlers throw, framework catches — tool logic catches only to map a backend's typed outcome to a declared error reason
 - Use `ctx.log` for request-scoped logging
-- No Docker — this server needs direct host OS access (pbpaste, JXA/NSPasteboard, xclip, wl-clipboard, PowerShell), none of which work inside a container
+- No Docker — this server needs direct host OS access (JXA/NSPasteboard, xclip, wl-clipboard, PowerShell), none of which work inside a container
 
 ---
 
