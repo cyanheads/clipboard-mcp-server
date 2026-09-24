@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-09-24
+
+clipboard_read slices carry a representationId that fails a continuation over a changed clipboard, image slices travel as PNG byte chunks instead of broken images, and clipboard_inspect lists only formats clipboard_read can return.
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-09-24
 
 macOS and Windows writes go through stdin-fed helper scripts that keep text typed and reach 1 MiB, Windows HTML uses CF_HTML framing, and empty clipboards, absent formats, and missing helpers now return typed errors.
