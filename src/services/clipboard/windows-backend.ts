@@ -4,16 +4,25 @@
  */
 
 import { spawn } from 'node:child_process';
+import { serializationError } from '@cyanheads/mcp-ts-core/errors';
 import { assertByteRange } from './byte-window.js';
+import { buildCfHtml, parseCfHtmlHeader } from './cf-html.js';
 import type {
   ByteRange,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
+  RangedReadWindow,
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats, parseNativeTypeEntries, stripHtmlTags } from './types.js';
+import {
+  buildInspectFormats,
+  clipboardOutcome,
+  parseNativeTypeEntries,
+  parseRangedReadEnvelope,
+  stripHtmlTags,
+} from './types.js';
 
 /** Run a PowerShell script. Returns stdout as Buffer. Optionally pipes stdin. */
 function runPowershell(script: string, stdin?: Buffer): Promise<Buffer> {
@@ -23,7 +32,12 @@ function runPowershell(script: string, stdin?: Buffer): Promise<Buffer> {
       shell: false,
       stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
-    if (stdin) child.stdin?.end(stdin);
+    if (stdin) {
+      // A helper that exits before draining stdin surfaces as its exit code; the
+      // resulting EPIPE on the pipe must not become an unhandled stream error.
+      child.stdin?.on('error', () => undefined);
+      child.stdin?.end(stdin);
+    }
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
@@ -39,7 +53,18 @@ function runPowershell(script: string, stdin?: Buffer): Promise<Buffer> {
     });
     child.on('error', (err) => {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('powershell.exe not found — requires PowerShell 5.1+ on Windows 10+'));
+        reject(
+          clipboardOutcome(
+            'Windows',
+            'powershell.exe not found — requires PowerShell 5.1+ on Windows 10+',
+            {
+              category: 'clipboard_unavailable',
+              recoveryHint:
+                'Make PowerShell 5.1+ available as powershell.exe on PATH (built in on Windows 10 and later), then retry.',
+            },
+            err,
+          ),
+        );
       } else {
         reject(err);
       }
@@ -127,22 +152,42 @@ if ($selectedFormat) {
 `;
 }
 
-/** PowerShell script builder to read HTML from the clipboard, bounded to `range`. */
-function buildPsReadHtml(range: ByteRange): string {
-  assertByteRange(range);
+/**
+ * PowerShell script builder that moves raw `HTML Format` bytes without
+ * interpreting them: the representation's total size, the offset just past its
+ * trailing NUL padding (`dataEnd`), a SHA-256 of every byte, its first
+ * `prefixLimit` bytes, and the raw byte window `window`. CF_HTML framing is
+ * parsed in TypeScript (`cf-html.ts`).
+ */
+function buildPsReadHtml(prefixLimit: number, window: ByteRange): string {
+  assertByteRange(window);
+  assertByteRange({ offset: 0, limit: prefixLimit });
   return `
 Add-Type -AssemblyName System.Windows.Forms
+$prefixLimit = ${prefixLimit}
+$windowOffset = ${window.offset}
+$windowLimit = ${window.limit}
 $data = [System.Windows.Forms.Clipboard]::GetDataObject()
-if ($data -and $data.GetDataPresent('HTML Format')) {
-  $html = $data.GetData('HTML Format')
-  if ($html -is [string]) {
-    # Windows HTML clipboard format includes headers — extract just the HTML body
-    $startIdx = $html.IndexOf('<html')
-    if ($startIdx -eq -1) { $startIdx = $html.IndexOf('<HTML') }
-    if ($startIdx -ge 0) { $html = $html.Substring($startIdx) }
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($html)
-    ${psSliceSnippet('$bytes', range)}
-  } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
+$raw = $null
+if ($data -and $data.GetDataPresent('HTML Format')) { $raw = $data.GetData('HTML Format') }
+if ($raw -is [System.IO.MemoryStream]) { $bytes = $raw.ToArray() }
+elseif ($raw -is [string]) { $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw) }
+else { $bytes = $null }
+if ($null -ne $bytes) {
+  $total = $bytes.Length
+  $dataEnd = $total
+  while ($dataEnd -gt 0 -and $bytes[$dataEnd - 1] -eq 0) { $dataEnd-- }
+  $prefixLength = [Math]::Min($prefixLimit, $total)
+  $windowStart = [Math]::Min($windowOffset, $total)
+  $windowLength = [Math]::Min($windowLimit, $total - $windowStart)
+  [PSCustomObject]@{
+    present = $true
+    total = $total
+    dataEnd = $dataEnd
+    sha256 = [Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes))
+    prefixBase64 = [Convert]::ToBase64String($bytes, 0, $prefixLength)
+    contentBase64 = [Convert]::ToBase64String($bytes, $windowStart, $windowLength)
+  } | ConvertTo-Json -Compress
 } else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
 `;
 }
@@ -198,69 +243,134 @@ Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.Clipboard]::Clear()
 `;
 
-/** Envelope every ranged PowerShell read script prints (see `psSliceSnippet`). */
-interface RangedReadEnvelope {
-  contentBase64?: string;
-  height?: number;
-  present: boolean;
-  total?: number;
-  width?: number;
+/** Decode a ranged PowerShell read response (see `psSliceSnippet`) without altering its content. */
+function decodeRangedRead(buf: Buffer, formatName: string): RangedReadWindow {
+  return parseRangedReadEnvelope(buf.toString('utf8').trim(), 'Windows', formatName);
 }
 
-/** Decode a ranged JSON/base64 PowerShell read response without altering its content. */
-function decodeRangedRead(
-  buf: Buffer,
-  formatName: string,
-): { contentBase64: string; height?: number; total: number; width?: number } {
-  const raw = buf.toString('utf8').trim();
-  const parsed = JSON.parse(raw) as RangedReadEnvelope | null;
-  if (!parsed || typeof parsed.present !== 'boolean') {
-    throw new Error(`Invalid PowerShell response while reading ${formatName}`);
+/**
+ * Static PowerShell writer for every text and HTML write. The payload arrives
+ * on stdin as a JSON envelope of base64 UTF-8 fields — `{ text, html? }`, where
+ * `html` is a complete CF_HTML envelope — and is parsed as data, so no payload
+ * byte ever reaches the command line or the script source. `HTML Format` is
+ * stored as a MemoryStream, which WinForms copies to the clipboard verbatim;
+ * the text goes out as UnicodeText. Any failed step exits non-zero.
+ */
+const PS_WRITE = `
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  $stdin = [Console]::OpenStandardInput()
+  $buffer = New-Object System.IO.MemoryStream
+  $stdin.CopyTo($buffer)
+  $envelope = [System.Text.Encoding]::UTF8.GetString($buffer.ToArray()) | ConvertFrom-Json
+  $data = New-Object System.Windows.Forms.DataObject
+  if ($null -ne $envelope.html) {
+    $data.SetData('HTML Format', [System.IO.MemoryStream]::new([Convert]::FromBase64String($envelope.html)))
   }
-  if (!parsed.present) throw new Error(`${formatName} format not found on clipboard`);
-  if (typeof parsed.total !== 'number' || typeof parsed.contentBase64 !== 'string') {
-    throw new Error(`Invalid PowerShell response while reading ${formatName}`);
+  $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($envelope.text))
+  $data.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $text)
+  [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+`;
+
+/**
+ * Bytes of `HTML Format` fetched with the header call. Covers the CF_HTML
+ * header and, for most clipboards, the whole payload — so the common read
+ * takes one helper call; a window beyond it takes a second. Node holds at most
+ * this prefix plus the requested window.
+ */
+const HTML_PREFIX_BYTES = 64 * 1024;
+
+/** Decoded response of `buildPsReadHtml`. */
+interface HtmlBytes {
+  /** Offset just past the payload's trailing NUL padding. */
+  dataEnd: number;
+  prefix: Buffer;
+  /** Base64 SHA-256 of the whole payload — identifies the clipboard contents across calls. */
+  sha256: string;
+  total: number;
+  window: Buffer;
+}
+
+/** Run `buildPsReadHtml` and decode its response; an absent `HTML Format` is `format_unavailable`. */
+async function runPsReadHtml(prefixLimit: number, window: ByteRange): Promise<HtmlBytes> {
+  const raw = (await runPowershell(buildPsReadHtml(prefixLimit, window))).toString('utf8').trim();
+  // The response carries clipboard bytes, so it never rides the error.
+  const unreadable = () =>
+    serializationError(
+      'Windows clipboard helper returned an unreadable response while reading HTML.',
+      {
+        platform: 'Windows',
+        format: 'HTML',
+        responseBytes: raw.length,
+      },
+    );
+  let parsed: {
+    contentBase64?: unknown;
+    dataEnd?: unknown;
+    prefixBase64?: unknown;
+    present?: unknown;
+    sha256?: unknown;
+    total?: unknown;
+  } | null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw unreadable();
+  }
+  if (!parsed || typeof parsed.present !== 'boolean') throw unreadable();
+  if (!parsed.present) {
+    throw clipboardOutcome('Windows', 'HTML format not found on clipboard', {
+      category: 'format_unavailable',
+    });
+  }
+  if (
+    typeof parsed.total !== 'number' ||
+    typeof parsed.dataEnd !== 'number' ||
+    typeof parsed.sha256 !== 'string' ||
+    typeof parsed.prefixBase64 !== 'string' ||
+    typeof parsed.contentBase64 !== 'string'
+  ) {
+    throw unreadable();
   }
   return {
     total: parsed.total,
-    contentBase64: parsed.contentBase64,
-    ...(parsed.width !== undefined && { width: parsed.width }),
-    ...(parsed.height !== undefined && { height: parsed.height }),
+    dataEnd: parsed.dataEnd,
+    sha256: parsed.sha256,
+    prefix: Buffer.from(parsed.prefixBase64, 'base64'),
+    window: Buffer.from(parsed.contentBase64, 'base64'),
   };
 }
 
 /**
- * Build a PowerShell script that writes text to the clipboard.
- * Content is passed via base64 to avoid any shell interpretation.
+ * Read `range` of the clipboard's HTML. For a CF_HTML payload, `range` and the
+ * reported total apply to `[StartFragment, EndFragment)`; a payload without a
+ * header is taken whole, minus trailing NUL padding.
  */
-function buildPsWriteText(contentBase64: string): string {
-  return `
-Add-Type -AssemblyName System.Windows.Forms
-$b64 = ${JSON.stringify(contentBase64)}
-$bytes = [Convert]::FromBase64String($b64)
-$text = [System.Text.Encoding]::UTF8.GetString($bytes)
-[System.Windows.Forms.Clipboard]::SetText($text)
-`;
-}
+async function readHtml(range: ByteRange): Promise<ReadResult> {
+  assertByteRange(range);
+  const first = await runPsReadHtml(HTML_PREFIX_BYTES, { offset: 0, limit: 0 });
+  const header = parseCfHtmlHeader(first.prefix, first.total);
+  const spanStart = header ? header.startFragment : 0;
+  const spanEnd = header ? header.endFragment : first.dataEnd;
+  const spanSize = spanEnd - spanStart;
 
-/**
- * Build a PowerShell script that writes HTML + plain-text to the clipboard.
- * Content is passed via base64 to avoid any shell interpretation.
- */
-function buildPsWriteHtml(htmlBase64: string, plaintextBase64: string): string {
-  return `
-Add-Type -AssemblyName System.Windows.Forms
-$hb64 = ${JSON.stringify(htmlBase64)}
-$pb64 = ${JSON.stringify(plaintextBase64)}
-$htmlBytes = [Convert]::FromBase64String($hb64)
-$html = [System.Text.Encoding]::UTF8.GetString($htmlBytes)
-$ptBytes = [Convert]::FromBase64String($pb64)
-$pt = [System.Text.Encoding]::UTF8.GetString($ptBytes)
-$data = New-Object System.Windows.Forms.DataObject
-$data.SetData([System.Windows.Forms.DataFormats]::Html, $html)
-$data.SetData([System.Windows.Forms.DataFormats]::Text, $pt)
-[System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
-`;
+  const from = spanStart + Math.min(range.offset, spanSize);
+  const to = spanStart + Math.min(range.offset + range.limit, spanSize);
+  if (from === to || to <= first.prefix.byteLength) {
+    return { format: 'html', content: first.prefix.subarray(from, to), totalByteSize: spanSize };
+  }
+
+  // The header already came with the first call; the hash ties the window to the same payload.
+  const second = await runPsReadHtml(0, { offset: from, limit: to - from });
+  if (second.sha256 !== first.sha256) {
+    throw new Error('The clipboard changed while its HTML was being read. Retry the read.');
+  }
+  return { format: 'html', content: second.window, totalByteSize: spanSize };
 }
 
 /** Map Windows DataFormats string → semantic format. */
@@ -304,15 +414,8 @@ export class WindowsBackend implements ClipboardBackend {
           totalByteSize: total,
         };
       }
-      case 'html': {
-        const buf = await runPowershell(buildPsReadHtml(range));
-        const { total, contentBase64 } = decodeRangedRead(buf, 'HTML');
-        return {
-          format: 'html',
-          content: Buffer.from(contentBase64, 'base64'),
-          totalByteSize: total,
-        };
-      }
+      case 'html':
+        return await readHtml(range);
       case 'rtf': {
         const buf = await runPowershell(buildPsReadRtf(range));
         const { total, contentBase64 } = decodeRangedRead(buf, 'RTF');
@@ -341,16 +444,15 @@ export class WindowsBackend implements ClipboardBackend {
     format: 'text' | 'html',
   ): Promise<{ format: 'text' | 'html'; byteSize: number }> {
     const buf = Buffer.from(content, 'utf8');
-    if (format === 'text') {
-      const b64 = buf.toString('base64');
-      await runPowershell(buildPsWriteText(b64));
-      return { format: 'text', byteSize: buf.byteLength };
-    }
-    const plaintext = stripHtmlTags(content);
-    const htmlB64 = buf.toString('base64');
-    const ptB64 = Buffer.from(plaintext, 'utf8').toString('base64');
-    await runPowershell(buildPsWriteHtml(htmlB64, ptB64));
-    return { format: 'html', byteSize: buf.byteLength };
+    const envelope =
+      format === 'text'
+        ? { text: buf.toString('base64') }
+        : {
+            text: Buffer.from(stripHtmlTags(content), 'utf8').toString('base64'),
+            html: buildCfHtml(content).toString('base64'),
+          };
+    await runPowershell(PS_WRITE, Buffer.from(JSON.stringify(envelope), 'utf8'));
+    return { format, byteSize: buf.byteLength };
   }
 
   async clear(): Promise<void> {

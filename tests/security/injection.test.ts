@@ -21,6 +21,7 @@ import { SIZE_LIMITS } from '@/services/clipboard/clipboard-service.js';
 import { LinuxX11Backend } from '@/services/clipboard/linux-x11-backend.js';
 import { MacosBackend } from '@/services/clipboard/macos-backend.js';
 import { WindowsBackend } from '@/services/clipboard/windows-backend.js';
+import { scriptedSpawn } from '../services/clipboard/scripted-spawn.js';
 
 const mockSpawn = vi.mocked(spawn);
 
@@ -53,6 +54,7 @@ function fakeChild(opts: { stdout?: string | Buffer; exitCode?: number }) {
   const stderrEmitter = new EventEmitter();
   const stdinEmitter = new EventEmitter() as typeof child.stdin;
   (stdinEmitter as unknown as { end: (data?: Buffer) => void }).end = vi.fn();
+  Object.assign(stderrEmitter, { destroy: vi.fn() });
   Object.assign(child, {
     stdout: stdoutEmitter,
     stderr: stderrEmitter,
@@ -66,6 +68,8 @@ function fakeChild(opts: { stdout?: string | Buffer; exitCode?: number }) {
         'data',
         Buffer.isBuffer(opts.stdout) ? opts.stdout : Buffer.from(opts.stdout),
       );
+    // A writing helper (xclip -i, wl-copy) completes on its foreground exit.
+    child.emit('exit', opts.exitCode ?? 0, null);
     child.emit('close', opts.exitCode ?? 0);
     // Also emit 'spawn' for Wayland's detach logic
     child.emit('spawn');
@@ -76,65 +80,66 @@ function fakeChild(opts: { stdout?: string | Buffer; exitCode?: number }) {
 
 describe('Security: injection prevention', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
-  describe('MacosBackend — write text', () => {
-    it.each(INJECTION_PAYLOADS)(
-      'payload goes to stdin via pbcopy, not into args (%s)',
-      async (payload) => {
-        const child = fakeChild({ stdout: '' });
-        mockSpawn.mockReturnValueOnce(child);
-        const backend = new MacosBackend();
-        await backend.write(payload, 'text').catch(() => {
-          /* ignore */
-        });
+  /**
+   * One write through `backend`, recorded by a scripted spawn: the helper's
+   * argv and the bytes it received on stdin.
+   */
+  async function recordWrite(
+    backend: MacosBackend | WindowsBackend,
+    content: string,
+    format: 'text' | 'html',
+  ) {
+    const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
+    mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+    await backend.write(content, format);
+    expect(fake.calls).toHaveLength(1);
+    const [call] = fake.calls;
+    if (!call?.stdin) throw new Error('writer received no stdin');
+    return { command: call.command, args: call.args, stdin: call.stdin };
+  }
 
-        const calls = mockSpawn.mock.calls;
-        expect(calls.length).toBeGreaterThan(0);
-        const [cmd, args] = calls[calls.length - 1] as [string, string[]];
-        expect(cmd).toBe('pbcopy');
-        // Args should only be [] — content is on stdin
-        expect(args).toEqual([]);
-      },
-    );
-  });
+  /** Payloads whose argv must match byte for byte: 1 byte, 1 MiB, and every injection string. */
+  const ARGV_CASES = ['x', 'y'.repeat(SIZE_LIMITS.WRITE), ...INJECTION_PAYLOADS];
 
-  describe('MacosBackend — write html', () => {
-    it.each(INJECTION_PAYLOADS)(
-      'html content base64-encoded in JXA script, not raw (%s)',
-      async (payload) => {
-        const child = fakeChild({ stdout: 'ok' });
-        mockSpawn.mockReturnValueOnce(child);
-        const backend = new MacosBackend();
-        await backend.write(payload, 'html').catch(() => {
-          /* ignore */
-        });
-
-        const calls = mockSpawn.mock.calls;
-        if (calls.length === 0) return; // Skip if spawn wasn't called
-        const [cmd, args] = calls[calls.length - 1] as [string, string[]];
-        expect(cmd).toBe('osascript');
-        // Find the script content in args
-        const scriptArg =
-          (args as string[]).find((a) => typeof a === 'string' && a.includes('base64')) ?? '';
-        // The raw payload must not appear verbatim in the script source
-        // (it should only appear as base64-encoded data)
-        const dangerousChars = [
-          '$(',
-          '`',
-          'process.exit',
-          'ObjC.import',
-          'Invoke-Expression',
-          '| cat',
-        ];
-        for (const danger of dangerousChars) {
-          if (payload.includes(danger)) {
-            expect(scriptArg).not.toContain(danger);
-          }
+  describe.each([
+    ['MacosBackend', () => new MacosBackend(), 'osascript'],
+    ['WindowsBackend', () => new WindowsBackend(), 'powershell.exe'],
+  ] as const)('%s — writes (#31)', (_label, make, helper) => {
+    it.each(['text', 'html'] as const)(
+      '%s writes spawn a byte-identical argv for every payload',
+      async (format) => {
+        const baseline = await recordWrite(make(), 'x', format);
+        expect(baseline.command).toBe(helper);
+        for (const payload of ARGV_CASES) {
+          const call = await recordWrite(make(), payload, format);
+          expect(call.command).toBe(helper);
+          expect(call.args).toEqual(baseline.args);
         }
       },
     );
+
+    it.each(INJECTION_PAYLOADS)('payload bytes appear only on stdin (%j)', async (payload) => {
+      const call = await recordWrite(make(), payload, 'text');
+      const envelope = JSON.parse(call.stdin.toString('utf8')) as { text: string };
+      expect(Buffer.from(envelope.text, 'base64').toString('utf8')).toBe(payload);
+      const argv = call.args.join('\0');
+      expect(argv).not.toContain(envelope.text);
+      for (const danger of ['$(', '`id`', 'process.exit', 'Invoke-Expression', '| cat']) {
+        if (payload.includes(danger)) expect(argv).not.toContain(danger);
+      }
+    });
+  });
+
+  it('the Windows command line is a constant far under the 32,767-character limit', async () => {
+    for (const format of ['text', 'html'] as const) {
+      const call = await recordWrite(new WindowsBackend(), 'y'.repeat(SIZE_LIMITS.WRITE), format);
+      // libuv wraps each argument in quotes and escapes embedded quotes.
+      const quoted = [call.command, ...call.args].map((arg) => `"${arg.replace(/"/g, '\\"')}"`);
+      expect(quoted.join(' ').length).toBeLessThan(4096);
+    }
   });
 
   describe('LinuxX11Backend — write', () => {
@@ -172,28 +177,6 @@ describe('Security: injection prevention', () => {
           expect(arg).not.toContain('$(');
           expect(arg).not.toContain('| cat');
         }
-      },
-    );
-  });
-
-  describe('WindowsBackend — write', () => {
-    it.each(INJECTION_PAYLOADS)(
-      'content base64-encoded in PS script, not raw (%s)',
-      async (payload) => {
-        const child = fakeChild({ stdout: '' });
-        mockSpawn.mockReturnValueOnce(child);
-        const backend = new WindowsBackend();
-        await backend.write(payload, 'text').catch(() => {
-          /* ignore */
-        });
-
-        const calls = mockSpawn.mock.calls;
-        if (calls.length === 0) return;
-        const [, args] = calls[0] as [string, string[]];
-        // The -Command script arg must not contain Invoke-Expression or raw injection
-        const scriptArg = (args as string[]).find((a) => a.includes('Base64')) ?? '';
-        expect(scriptArg).not.toContain('Invoke-Expression');
-        expect(scriptArg).not.toContain('$(');
       },
     );
   });
