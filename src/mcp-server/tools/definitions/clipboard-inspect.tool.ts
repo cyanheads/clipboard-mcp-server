@@ -6,7 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getClipboardService } from '@/services/clipboard/clipboard-service.js';
-import { isInspectUnreadable } from '@/services/clipboard/types.js';
+import { isClipboardOutcome, isInspectUnreadable } from '@/services/clipboard/types.js';
 
 export const clipboardInspect = tool('clipboard_inspect', {
   title: 'Inspect Clipboard',
@@ -70,6 +70,13 @@ export const clipboardInspect = tool('clipboard_inspect', {
       recovery:
         'Retry clipboard_inspect once; if it fails again, copy the content afresh — the application holding the clipboard published metadata this server cannot decode.',
     },
+    {
+      reason: 'clipboard_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The platform clipboard helper is missing from PATH, or it cannot reach the desktop session (no display or compositor).',
+      recovery:
+        'Install the clipboard helper (Linux X11: apt install xclip; Wayland: apt install wl-clipboard; Windows: PowerShell 5.1+), or run the server inside the desktop session so DISPLAY or WAYLAND_DISPLAY names a live display, then retry.',
+    },
   ],
 
   async handler(_input, ctx) {
@@ -84,6 +91,12 @@ export const clipboardInspect = tool('clipboard_inspect', {
         throw ctx.fail('inspect_unreadable', err.message, {
           platform: err.platform,
           ...ctx.recoveryFor('inspect_unreadable'),
+        });
+      }
+      if (isClipboardOutcome(err) && err.category === 'clipboard_unavailable') {
+        throw ctx.fail('clipboard_unavailable', err.message, {
+          platform: err.platform,
+          recovery: { hint: err.recoveryHint },
         });
       }
       throw err;

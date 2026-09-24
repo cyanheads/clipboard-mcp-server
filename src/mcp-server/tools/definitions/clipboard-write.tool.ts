@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getClipboardService, isContentTooLarge } from '@/services/clipboard/clipboard-service.js';
+import { isClipboardOutcome } from '@/services/clipboard/types.js';
 
 /** Whether the caller supplied content worth writing. */
 function hasContent<T extends { content?: string | undefined }>(
@@ -17,7 +18,7 @@ function hasContent<T extends { content?: string | undefined }>(
 
 export const clipboardWrite = tool('clipboard_write', {
   title: 'Write Clipboard',
-  description: `Write content to the clipboard, replacing the current contents, or clear the clipboard outright. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. Linux X11 and Wayland publish only text/html. Pass clear: true with no content to remove every representation, leaving clipboard_inspect reporting an empty clipboard; supply exactly one of content or clear: true.`,
+  description: `Write content to the clipboard, replacing the current contents, or clear the clipboard outright. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. On Linux the HTML itself is the only payload, with no stripped fallback: Wayland offers it as text/html and under the plain-text types, and X11 advertises only text/html but answers a request for a plain-text type such as UTF8_STRING with the same markup, so a plain-text paste can receive raw HTML. Pass clear: true with no content to remove every representation, leaving clipboard_inspect reporting an empty clipboard; supply exactly one of content or clear: true.`,
   annotations: { destructiveHint: true, openWorldHint: false },
   input: z
     .object({
@@ -31,7 +32,7 @@ export const clipboardWrite = tool('clipboard_write', {
         .enum(['text', 'html'])
         .default('text')
         .describe(
-          `Format of the content. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. Linux X11 and Wayland publish only text/html. Ignored when clear is true.`,
+          `Format of the content. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. On Linux there is no stripped fallback: Wayland also offers the markup under the plain-text types, and X11 hands the same markup to a plain-text request. Ignored when clear is true.`,
         ),
       clear: z
         .boolean()
@@ -79,30 +80,35 @@ export const clipboardWrite = tool('clipboard_write', {
       recovery:
         'Content is too large to write to the clipboard. Truncate or summarize before writing.',
     },
+    {
+      reason: 'clipboard_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The platform clipboard helper is missing from PATH, or it cannot reach the desktop session (no display or compositor).',
+      recovery:
+        'Install the clipboard helper (Linux X11: apt install xclip, plus xsel for clear; Wayland: apt install wl-clipboard; Windows: PowerShell 5.1+), or run the server inside the desktop session so DISPLAY or WAYLAND_DISPLAY names a live display, then retry.',
+    },
   ],
 
   async handler(input, ctx) {
     const svc = getClipboardService();
 
-    if (input.clear) {
-      ctx.log.info('clipboard_write', { clear: true });
-      return await svc.clear(ctx);
-    }
-
-    // The input schema rejects this pair; a caller invoking the handler
-    // directly still must not reach the backend with nothing to write.
-    if (!hasContent(input)) {
-      throw validationError(
-        'clipboard_write needs content to write, or clear: true to empty the clipboard.',
-      );
-    }
-    ctx.log.info('clipboard_write', {
-      format: input.format,
-      bytes: Buffer.byteLength(input.content, 'utf8'),
-    });
     try {
-      const result = await svc.write(input.content, input.format, ctx);
-      return result;
+      if (input.clear) {
+        ctx.log.info('clipboard_write', { clear: true });
+        return await svc.clear(ctx);
+      }
+      // The input schema rejects this pair; a caller invoking the handler
+      // directly still must not reach the backend with nothing to write.
+      if (!hasContent(input)) {
+        throw validationError(
+          'clipboard_write needs content to write, or clear: true to empty the clipboard.',
+        );
+      }
+      ctx.log.info('clipboard_write', {
+        format: input.format,
+        bytes: Buffer.byteLength(input.content, 'utf8'),
+      });
+      return await svc.write(input.content, input.format, ctx);
     } catch (err) {
       if (isContentTooLarge(err)) {
         throw ctx.fail(
@@ -114,6 +120,12 @@ export const clipboardWrite = tool('clipboard_write', {
             ...ctx.recoveryFor('content_too_large'),
           },
         );
+      }
+      if (isClipboardOutcome(err) && err.category === 'clipboard_unavailable') {
+        throw ctx.fail('clipboard_unavailable', err.message, {
+          platform: err.platform,
+          recovery: { hint: err.recoveryHint },
+        });
       }
       throw err;
     }

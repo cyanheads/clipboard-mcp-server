@@ -3,10 +3,12 @@
  * @module tests/tools/clipboard-read.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getContentBlocks } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { clipboardRead } from '@/mcp-server/tools/definitions/clipboard-read.tool.js';
 import { SIZE_LIMITS } from '@/services/clipboard/clipboard-service.js';
+import { clipboardOutcome } from '@/services/clipboard/types.js';
 
 vi.mock('@/services/clipboard/clipboard-service.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/clipboard/clipboard-service.js')>();
@@ -218,45 +220,109 @@ describe('clipboardRead', () => {
   });
 
   describe('error: format_unavailable', () => {
-    it('throws format_unavailable when backend says not found', async () => {
+    it('throws format_unavailable when the backend reports the format absent', async () => {
       const svc = mockService({
-        read: Promise.reject(new Error('HTML format not found on clipboard')),
+        read: Promise.reject(
+          clipboardOutcome('macOS', 'HTML format not found on clipboard', {
+            category: 'format_unavailable',
+          }),
+        ),
       });
       mockGetService.mockReturnValueOnce(svc);
 
       const ctx = createMockContext({ errors: clipboardRead.errors });
       const input = clipboardRead.input.parse({ format: 'html' });
       await expect(clipboardRead.handler(input, ctx)).rejects.toMatchObject({
-        data: { reason: 'format_unavailable' },
+        data: {
+          reason: 'format_unavailable',
+          requestedFormat: 'html',
+          recovery: { hint: expect.stringContaining('clipboard_inspect') },
+        },
       });
     });
 
-    it('throws format_unavailable for text when backend says not found (empty clipboard)', async () => {
-      // Backend throws "text format not found" when clipboard has no text type
+    it('throws format_unavailable for text when the backend reports an empty clipboard', async () => {
       const svc = mockService({
-        read: Promise.reject(new Error('text format not found on clipboard')),
+        read: Promise.reject(
+          clipboardOutcome('Linux Wayland', 'wl-paste exited 1: Nothing is copied', {
+            category: 'empty',
+          }),
+        ),
       });
       mockGetService.mockReturnValueOnce(svc);
 
       const ctx = createMockContext({ errors: clipboardRead.errors });
       const input = clipboardRead.input.parse({ format: 'text' });
       await expect(clipboardRead.handler(input, ctx)).rejects.toMatchObject({
+        message: expect.stringMatching(/empty/i),
         data: { reason: 'format_unavailable' },
       });
     });
 
-    it('throws format_unavailable for rtf when backend returns null (no RTF on clipboard)', async () => {
-      // Backend throws "RTF format not found" when public.rtf is absent
+    it('does not read message text: an untyped "not found" error is not format_unavailable', async () => {
       const svc = mockService({
-        read: Promise.reject(new Error('RTF format not found on clipboard')),
+        read: Promise.reject(new Error('xclip not found — install with: apt install xclip')),
       });
       mockGetService.mockReturnValueOnce(svc);
 
       const ctx = createMockContext({ errors: clipboardRead.errors });
       const input = clipboardRead.input.parse({ format: 'rtf' });
-      await expect(clipboardRead.handler(input, ctx)).rejects.toMatchObject({
-        data: { reason: 'format_unavailable' },
+      const failure = clipboardRead.handler(input, ctx);
+      await expect(failure).rejects.toThrow('xclip not found — install with: apt install xclip');
+      await expect(failure).rejects.not.toHaveProperty('data.reason');
+    });
+  });
+
+  describe('error: clipboard_unavailable', () => {
+    it('carries the backend-specific recovery hint on the wire', async () => {
+      const svc = mockService({
+        read: Promise.reject(
+          clipboardOutcome('Linux X11', "xclip exited 1: Error: Can't open display: :98", {
+            category: 'clipboard_unavailable',
+            recoveryHint: 'Set DISPLAY to a running X server, then retry.',
+          }),
+        ),
       });
+      mockGetService.mockReturnValueOnce(svc);
+
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      const input = clipboardRead.input.parse({ format: 'text' });
+      await expect(clipboardRead.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: {
+          reason: 'clipboard_unavailable',
+          platform: 'Linux X11',
+          recovery: { hint: 'Set DISPLAY to a running X server, then retry.' },
+        },
+      });
+    });
+
+    it('maps an unavailable clipboard during the auto-mode inspection', async () => {
+      const svc = {
+        inspect: vi.fn().mockRejectedValueOnce(
+          clipboardOutcome('Linux Wayland', 'wl-paste not found', {
+            category: 'clipboard_unavailable',
+            recoveryHint: 'Install wl-clipboard (apt install wl-clipboard), then retry.',
+          }),
+        ),
+        read: vi.fn(),
+      } as unknown as ReturnType<typeof getClipboardService>;
+      mockGetService.mockReturnValueOnce(svc);
+
+      const ctx = createMockContext({ errors: clipboardRead.errors });
+      await expect(
+        clipboardRead.handler(clipboardRead.input.parse({ format: 'auto' }), ctx),
+      ).rejects.toMatchObject({ data: { reason: 'clipboard_unavailable' } });
+      expect(svc.read).not.toHaveBeenCalled();
+    });
+
+    it('declares clipboard_unavailable with a recovery naming install commands and session variables', () => {
+      const entry = clipboardRead.errors?.find((e) => e.reason === 'clipboard_unavailable');
+      expect(entry?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(entry?.recovery).toMatch(/apt install xclip/);
+      expect(entry?.recovery).toMatch(/apt install wl-clipboard/);
+      expect(entry?.recovery).toMatch(/DISPLAY/);
+      expect(entry?.recovery).toMatch(/WAYLAND_DISPLAY/);
     });
   });
 
@@ -299,7 +365,11 @@ describe('clipboardRead', () => {
 
     it('throws format_unavailable when RTF not present', async () => {
       const svc = mockService({
-        read: Promise.reject(new Error('RTF format not found on clipboard')),
+        read: Promise.reject(
+          clipboardOutcome('Windows', 'RTF format not found on clipboard', {
+            category: 'format_unavailable',
+          }),
+        ),
       });
       mockGetService.mockReturnValueOnce(svc);
 
@@ -644,7 +714,11 @@ describe('clipboardRead handler — image block on content[] (#6)', () => {
 
   it('attaches no content block when the image read fails', async () => {
     const svc = mockService({
-      read: Promise.reject(new Error('Image format not found on clipboard')),
+      read: Promise.reject(
+        clipboardOutcome('macOS', 'Image format not found on clipboard', {
+          category: 'format_unavailable',
+        }),
+      ),
     });
     mockGetService.mockReturnValueOnce(svc);
 

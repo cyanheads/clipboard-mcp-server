@@ -7,6 +7,7 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { clipboardWrite } from '@/mcp-server/tools/definitions/clipboard-write.tool.js';
 import { SIZE_LIMITS } from '@/services/clipboard/clipboard-service.js';
+import { clipboardOutcome } from '@/services/clipboard/types.js';
 
 vi.mock('@/services/clipboard/clipboard-service.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/clipboard/clipboard-service.js')>();
@@ -28,11 +29,19 @@ describe('clipboardWrite', () => {
 
   it('qualifies the HTML plain-text fallback as a macOS and Windows capability', () => {
     expect(clipboardWrite.description).toContain('macOS and Windows');
-    expect(clipboardWrite.description).toContain('Linux X11 and Wayland publish only text/html');
     expect(clipboardWrite.input.shape.format.description).toContain('macOS and Windows');
-    expect(clipboardWrite.input.shape.format.description).toContain(
-      'Linux X11 and Wayland publish only text/html',
-    );
+  });
+
+  it('states that a Linux HTML write reaches plain-text paste targets as raw markup', () => {
+    for (const text of [
+      clipboardWrite.description,
+      clipboardWrite.input.shape.format.description,
+    ]) {
+      expect(text).toContain('On Linux');
+      expect(text).toMatch(/plain-text types/);
+      expect(text).toMatch(/X11/);
+      expect(text).not.toMatch(/publish only text\/html/);
+    }
   });
 
   describe('write text', () => {
@@ -386,6 +395,28 @@ describe('clipboardWrite — explicit clear (#24)', () => {
       await expect(
         clipboardWrite.handler(clipboardWrite.input.parse({ clear: true }), ctx),
       ).rejects.toThrow('xsel exited 1');
+    });
+
+    it('maps an unavailable clipboard during clear to clipboard_unavailable (#36)', async () => {
+      const clearMock = vi.fn().mockRejectedValueOnce(
+        clipboardOutcome('Linux X11', 'xsel not found', {
+          category: 'clipboard_unavailable',
+          recoveryHint: 'Install xsel (apt install xsel), then retry.',
+        }),
+      );
+      mockGetService.mockReturnValueOnce({ clear: clearMock } as unknown as ReturnType<
+        typeof getClipboardService
+      >);
+
+      const ctx = createMockContext({ errors: clipboardWrite.errors });
+      await expect(
+        clipboardWrite.handler(clipboardWrite.input.parse({ clear: true }), ctx),
+      ).rejects.toMatchObject({
+        data: {
+          reason: 'clipboard_unavailable',
+          recovery: { hint: 'Install xsel (apt install xsel), then retry.' },
+        },
+      });
     });
   });
 

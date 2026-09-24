@@ -8,7 +8,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getClipboardService, isContentTooLarge } from '@/services/clipboard/clipboard-service.js';
 import type { ByteRange, ClipboardFormat, RangedReadResult } from '@/services/clipboard/types.js';
-import { FORMAT_PRIORITY } from '@/services/clipboard/types.js';
+import { FORMAT_PRIORITY, isClipboardOutcome } from '@/services/clipboard/types.js';
 
 /** Auto-mode priority order: richest format wins (image > html > rtf > text). */
 const AUTO_PRIORITY: ClipboardFormat[] = [...FORMAT_PRIORITY].reverse();
@@ -16,12 +16,15 @@ const AUTO_PRIORITY: ClipboardFormat[] = [...FORMAT_PRIORITY].reverse();
 /**
  * Shape a backend read into tool output. Image bytes are additionally attached
  * to `content[]` as a real image block, so a client reading only `content[]`
- * receives the same payload a `structuredContent` client does.
+ * receives the same payload a `structuredContent` client does. A response
+ * holding no image bytes attaches no block.
  */
 function toOutput(result: RangedReadResult, ctx: Pick<Context, 'content'>) {
   const content =
     result.format === 'image' ? result.content.toString('base64') : result.content.toString('utf8');
-  if (result.format === 'image') ctx.content.image(content, 'image/png');
+  if (result.format === 'image' && result.content.byteLength > 0) {
+    ctx.content.image(content, 'image/png');
+  }
   return {
     format: result.format,
     content,
@@ -42,6 +45,7 @@ export const clipboardRead = tool('clipboard_read', {
     '"image" returns base64-encoded PNG, with pixel dimensions whenever the capture carries a readable PNG header. ' +
     '"html" returns raw HTML source. "rtf" returns raw RTF markup. "text" returns plain text. ' +
     'If the requested format is not present, returns a format_unavailable error — use "auto" when unsure, or call clipboard_inspect first. ' +
+    'A text, HTML, or RTF format that is present but zero bytes long returns empty content, not an error. ' +
     'Content above the format size limit (512KB text/HTML/RTF, 5MB image) is retrieved in slices with offset/limit: ' +
     'omit both for the whole payload (errors with content_too_large if it exceeds the limit), or pass them to read a bounded window and ' +
     'continue from the returned nextOffset until complete is true.',
@@ -55,7 +59,7 @@ export const clipboardRead = tool('clipboard_read', {
           '(priority: image > html > rtf > text). "image" returns base64-encoded PNG data, with pixel dimensions ' +
           'whenever the capture carries a readable PNG header. ' +
           '"html" returns raw HTML source as copied from a browser. "rtf" returns raw RTF markup. ' +
-          '"text" returns plain text. If the requested format is not on the clipboard, the tool returns an error. ' +
+          '"text" returns plain text. If the requested format is not on the clipboard, the tool returns a format_unavailable error. ' +
           'For "auto", offset/limit apply to the format auto resolves to.',
       ),
     offset: z
@@ -122,9 +126,16 @@ export const clipboardRead = tool('clipboard_read', {
     {
       reason: 'format_unavailable',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Requested format is not present on the clipboard.',
+      when: 'Requested format is not present on the clipboard, or the clipboard is empty.',
       recovery:
         'Call clipboard_inspect to see available formats, then retry with a supported format or use "auto".',
+    },
+    {
+      reason: 'clipboard_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The platform clipboard helper is missing from PATH, or it cannot reach the desktop session (no display or compositor).',
+      recovery:
+        'Install the clipboard helper (Linux X11: apt install xclip; Wayland: apt install wl-clipboard; Windows: PowerShell 5.1+), or run the server inside the desktop session so DISPLAY or WAYLAND_DISPLAY names a live display, then retry.',
     },
     {
       reason: 'content_too_large',
@@ -151,43 +162,25 @@ export const clipboardRead = tool('clipboard_read', {
         ? { offset: input.offset ?? 0, limit: input.limit ?? Number.MAX_SAFE_INTEGER }
         : undefined;
 
-    if (input.format === 'auto') {
-      // Inspect to find the richest available format, then read it.
-      const inspection = await svc.inspect(ctx);
-      if (inspection.primaryFormat === 'empty') {
-        throw ctx.fail('format_unavailable', 'Clipboard is empty — no recognized format present.', {
-          ...ctx.recoveryFor('format_unavailable'),
-        });
-      }
-      // Find the richest format in priority order
-      const target = AUTO_PRIORITY.find((f) => inspection.availableFormats.includes(f));
-      if (!target) {
-        throw ctx.fail('format_unavailable', 'Clipboard has no recognized semantic format.', {
-          ...ctx.recoveryFor('format_unavailable'),
-        });
-      }
-      try {
-        return toOutput(await svc.read(target, ctx, range), ctx);
-      } catch (err) {
-        if (isContentTooLarge(err)) {
+    // The format actually read — for "auto", whatever inspection resolves to.
+    let format: ClipboardFormat | 'auto' = input.format;
+    try {
+      if (format === 'auto') {
+        // Inspect to find the richest available format, then read it.
+        const inspection = await svc.inspect(ctx);
+        const target = AUTO_PRIORITY.find((f) => inspection.availableFormats.includes(f));
+        if (!target) {
           throw ctx.fail(
-            'content_too_large',
-            `Clipboard content is ${err.bytes} bytes, limit is ${err.limit} bytes.`,
-            {
-              bytes: err.bytes,
-              limit: err.limit,
-              format: target,
-              ...ctx.recoveryFor('content_too_large'),
-            },
+            'format_unavailable',
+            inspection.rawTypes.length === 0
+              ? 'Clipboard is empty — no recognized format present.'
+              : 'Clipboard has no recognized semantic format.',
+            { ...ctx.recoveryFor('format_unavailable') },
           );
         }
-        throw err;
+        format = target;
       }
-    }
-
-    // Explicit format request
-    try {
-      return toOutput(await svc.read(input.format, ctx, range), ctx);
+      return toOutput(await svc.read(format, ctx, range), ctx);
     } catch (err) {
       if (isContentTooLarge(err)) {
         throw ctx.fail(
@@ -196,20 +189,24 @@ export const clipboardRead = tool('clipboard_read', {
           {
             bytes: err.bytes,
             limit: err.limit,
-            format: input.format,
+            format,
             ...ctx.recoveryFor('content_too_large'),
           },
         );
       }
-      // Map "not found" message from backend to format_unavailable contract entry
-      if (err instanceof Error && err.message.toLowerCase().includes('not found')) {
+      if (isClipboardOutcome(err)) {
+        if (err.category === 'clipboard_unavailable') {
+          throw ctx.fail('clipboard_unavailable', err.message, {
+            platform: err.platform,
+            recovery: { hint: err.recoveryHint },
+          });
+        }
         throw ctx.fail(
           'format_unavailable',
-          `Format "${input.format}" is not present on the clipboard.`,
-          {
-            requestedFormat: input.format,
-            ...ctx.recoveryFor('format_unavailable'),
-          },
+          err.category === 'empty'
+            ? 'Clipboard is empty — no recognized format present.'
+            : `Format "${format}" is not present on the clipboard.`,
+          { requestedFormat: format, ...ctx.recoveryFor('format_unavailable') },
         );
       }
       throw err;
@@ -231,7 +228,11 @@ export const clipboardRead = tool('clipboard_read', {
 
     if (result.format === 'image') {
       // The bytes ride content[] as an image block instead of a base64 blob in text.
-      lines.push('*(Image bytes attached as an image block; base64 in structuredContent.content)*');
+      lines.push(
+        result.byteSize > 0
+          ? '*(Image bytes attached as an image block; base64 in structuredContent.content)*'
+          : '*(No image bytes in this response — nothing is attached.)*',
+      );
     } else {
       lines.push('');
       // Fence the payload: clipboard bytes this tool did not author must not be

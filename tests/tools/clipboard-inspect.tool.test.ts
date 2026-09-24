@@ -3,10 +3,11 @@
  * @module tests/tools/clipboard-inspect.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { clipboardInspect } from '@/mcp-server/tools/definitions/clipboard-inspect.tool.js';
-import { inspectUnreadable } from '@/services/clipboard/types.js';
+import { clipboardOutcome, inspectUnreadable } from '@/services/clipboard/types.js';
 
 // Mock the clipboard service module
 vi.mock('@/services/clipboard/clipboard-service.js', () => ({
@@ -137,6 +138,38 @@ describe('clipboardInspect — surfaced failures (#23)', () => {
     await expect(clipboardInspect.handler(clipboardInspect.input.parse({}), ctx)).rejects.toThrow(
       /unreadable output/i,
     );
+  });
+
+  it('fails clipboard_unavailable with the backend recovery hint when the helper cannot run (#36)', async () => {
+    serviceThrowing(
+      clipboardOutcome(
+        'Linux Wayland',
+        'wl-paste exited 1: Failed to connect to a Wayland server',
+        {
+          category: 'clipboard_unavailable',
+          recoveryHint: 'Set WAYLAND_DISPLAY to a live compositor socket, then retry.',
+        },
+      ),
+    );
+
+    const ctx = createMockContext({ errors: clipboardInspect.errors });
+    await expect(
+      clipboardInspect.handler(clipboardInspect.input.parse({}), ctx),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: {
+        reason: 'clipboard_unavailable',
+        platform: 'Linux Wayland',
+        recovery: { hint: 'Set WAYLAND_DISPLAY to a live compositor socket, then retry.' },
+      },
+    });
+  });
+
+  it('declares clipboard_unavailable naming install commands and session variables', () => {
+    const entry = clipboardInspect.errors?.find((e) => e.reason === 'clipboard_unavailable');
+    expect(entry?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(entry?.recovery).toMatch(/apt install xclip/);
+    expect(entry?.recovery).toMatch(/WAYLAND_DISPLAY/);
   });
 
   it('rethrows an unrelated backend failure unchanged', async () => {
