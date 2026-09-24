@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-09-24
+
+macOS and Windows writes go through stdin-fed helper scripts that keep text typed and reach 1 MiB, Windows HTML uses CF_HTML framing, and empty clipboards, absent formats, and missing helpers now return typed errors.
+
 ## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-09-19
 
 HTML clipboard writes preserve plain-text fidelity; whole-value configuration placeholders use defaults.

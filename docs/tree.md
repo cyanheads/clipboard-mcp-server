@@ -1,6 +1,6 @@
 # clipboard-mcp-server - Directory Structure
 
-Generated on: 2026-09-19 18:34:22
+Generated on: 2026-09-24 20:51:37
 
 ```text
 clipboard-mcp-server/
@@ -150,6 +150,7 @@ clipboard-mcp-server/
 │   ├── services/
 │   │   └── clipboard/
 │   │       ├── byte-window.ts
+│   │       ├── cf-html.ts
 │   │       ├── clipboard-service.ts
 │   │       ├── linux-wayland-backend.ts
 │   │       ├── linux-x11-backend.ts
@@ -171,18 +172,22 @@ clipboard-mcp-server/
 │   ├── services/
 │   │   └── clipboard/
 │   │       ├── byte-window.test.ts
+│   │       ├── cf-html.test.ts
 │   │       ├── clipboard-service.test.ts
 │   │       ├── linux-wayland-backend.test.ts
 │   │       ├── linux-x11-backend.test.ts
 │   │       ├── macos-backend.test.ts
+│   │       ├── macos-native.test.ts
 │   │       ├── png-dimensions.test.ts
 │   │       ├── png-fixtures.ts
+│   │       ├── scripted-spawn.ts
 │   │       ├── types.test.ts
 │   │       └── windows-backend.test.ts
 │   └── tools/
 │       ├── clipboard-inspect.tool.test.ts
 │       ├── clipboard-read.tool.test.ts
-│       └── clipboard-write.tool.test.ts
+│       ├── clipboard-write.tool.test.ts
+│       └── native-outcomes.test.ts
 ├── .env.example
 ├── .gitattributes
 ├── .gitignore
