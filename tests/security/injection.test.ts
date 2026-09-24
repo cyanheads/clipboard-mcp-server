@@ -136,9 +136,10 @@ describe('Security: injection prevention', () => {
   it('the Windows command line is a constant far under the 32,767-character limit', async () => {
     for (const format of ['text', 'html'] as const) {
       const call = await recordWrite(new WindowsBackend(), 'y'.repeat(SIZE_LIMITS.WRITE), format);
-      // libuv wraps each argument in quotes and escapes embedded quotes.
-      const quoted = [call.command, ...call.args].map((arg) => `"${arg.replace(/"/g, '\\"')}"`);
-      expect(quoted.join(' ').length).toBeLessThan(4096);
+      // libuv quotes each argument and escapes at most every character once, so
+      // twice its length plus two quotes and a separator bounds the command line.
+      const bound = [call.command, ...call.args].reduce((sum, arg) => sum + 2 * arg.length + 3, 0);
+      expect(bound).toBeLessThan(4096);
     }
   });
 
