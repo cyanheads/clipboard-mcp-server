@@ -1,10 +1,58 @@
 /**
- * @fileoverview Tests for shared domain utilities in types.ts — stripHtmlTags, buildInspectFormats.
+ * @fileoverview Tests for shared domain utilities in types.ts — stripHtmlTags, buildInspectFormats,
+ * and the classified-outcome sentinel.
  * @module tests/services/clipboard/types.test
  */
 
 import { describe, expect, it } from 'vitest';
-import { buildInspectFormats, stripHtmlTags } from '@/services/clipboard/types.js';
+import {
+  buildInspectFormats,
+  clipboardOutcome,
+  inspectUnreadable,
+  isClipboardOutcome,
+  stripHtmlTags,
+} from '@/services/clipboard/types.js';
+
+describe('clipboardOutcome (#36)', () => {
+  it('builds an Error carrying its category, platform, and cause', () => {
+    const cause = Object.assign(new Error('spawn xclip ENOENT'), { code: 'ENOENT' });
+    const outcome = clipboardOutcome(
+      'Linux X11',
+      'xclip not found',
+      { category: 'clipboard_unavailable', recoveryHint: 'apt install xclip' },
+      cause,
+    );
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome).toMatchObject({
+      message: 'xclip not found',
+      category: 'clipboard_unavailable',
+      platform: 'Linux X11',
+      recoveryHint: 'apt install xclip',
+      cause,
+    });
+    expect(isClipboardOutcome(outcome)).toBe(true);
+  });
+
+  it.each(['empty', 'format_unavailable'] as const)(
+    'builds a %s outcome with no hint',
+    (category) => {
+      const outcome = clipboardOutcome('Linux Wayland', 'x', { category });
+      expect(outcome.category).toBe(category);
+      expect(outcome).not.toHaveProperty('recoveryHint');
+      expect(outcome).not.toHaveProperty('cause');
+    },
+  );
+
+  it.each([
+    ['a plain Error', new Error('format not found on clipboard')],
+    ['the unreadable-inspection sentinel', inspectUnreadable('macOS', 'x')],
+    ['a look-alike with a non-true marker', { _clipboardOutcome: 'yes', category: 'empty' }],
+    ['null', null],
+    ['a string', 'format_unavailable'],
+  ])('rejects %s', (_label, value) => {
+    expect(isClipboardOutcome(value)).toBe(false);
+  });
+});
 
 describe('stripHtmlTags', () => {
   describe('HTML fallback correctness (#34)', () => {

@@ -3,6 +3,8 @@
  * @module services/clipboard/types
  */
 
+import { serializationError } from '@cyanheads/mcp-ts-core/errors';
+
 /** A semantic clipboard format identifier. */
 export type ClipboardFormat = 'text' | 'html' | 'rtf' | 'image';
 
@@ -61,6 +63,56 @@ export function isInspectUnreadable(err: unknown): err is Error & InspectUnreada
   );
 }
 
+/**
+ * What a native clipboard helper's outcome means, as classified by the
+ * backend that ran it. Tools branch on this, never on helper message text.
+ *
+ * - `empty` — nothing is on the clipboard (no selection owner, nothing copied).
+ * - `format_unavailable` — the clipboard holds content, but not the requested representation.
+ * - `clipboard_unavailable` — the helper is missing, or it cannot reach the desktop session.
+ */
+export type ClipboardOutcomeCategory = 'empty' | 'format_unavailable' | 'clipboard_unavailable';
+
+/** Category-specific fields: an unavailable clipboard always says how to recover. */
+export type ClipboardOutcomeDetails =
+  | { category: 'empty' | 'format_unavailable' }
+  | {
+      category: 'clipboard_unavailable';
+      /** Next step for the caller — the install command or the session variable to fix. */
+      recoveryHint: string;
+    };
+
+/**
+ * Sentinel thrown by a backend for a classified helper outcome. Helper
+ * failures a backend does not recognize stay ordinary errors.
+ */
+export type ClipboardOutcomeError = Error & {
+  _clipboardOutcome: true;
+  /** Platform whose helper produced the outcome. */
+  platform: string;
+} & ClipboardOutcomeDetails;
+
+/** Build a classified-outcome sentinel. */
+export function clipboardOutcome(
+  platform: string,
+  message: string,
+  details: ClipboardOutcomeDetails,
+  cause?: unknown,
+): ClipboardOutcomeError {
+  const error = cause === undefined ? new Error(message) : new Error(message, { cause });
+  return Object.assign(error, { _clipboardOutcome: true as const, platform }, details);
+}
+
+/** Type guard for the classified-outcome sentinel. */
+export function isClipboardOutcome(err: unknown): err is ClipboardOutcomeError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    '_clipboardOutcome' in err &&
+    (err as { _clipboardOutcome: unknown })._clipboardOutcome === true
+  );
+}
+
 /** One `{ type, bytes }` pair as a platform's inspection helper emits it. */
 interface NativeTypeEntry {
   bytes: number;
@@ -92,6 +144,74 @@ export function parseNativeTypeEntries(raw: string, platform: string): NativeTyp
     }
     return { type, bytes };
   });
+}
+
+/** The window a ranged read helper returned for a present representation. */
+export interface RangedReadWindow {
+  /** Base64 of the requested `[offset, offset + limit)` byte window. */
+  contentBase64: string;
+  /** Image height in pixels (image reads only). */
+  height?: number;
+  /** Byte size of the full representation. */
+  total: number;
+  /** Image width in pixels (image reads only). */
+  width?: number;
+}
+
+/**
+ * Parse the `{ present, total, contentBase64, width?, height? }` envelope a
+ * macOS or Windows ranged read helper prints. `present: false` is the helper
+ * reporting the representation absent (`format_unavailable`). Anything else
+ * that is not a well-formed envelope is a SerializationError: the helper's
+ * output was unreadable, which is neither the caller's input being wrong nor
+ * the format being absent. The response can carry clipboard bytes, so it never
+ * rides the error.
+ */
+export function parseRangedReadEnvelope(
+  raw: string,
+  platform: string,
+  formatName: string,
+): RangedReadWindow {
+  const unreadable = () =>
+    serializationError(
+      `${platform} clipboard helper returned an unreadable response while reading ${formatName}.`,
+      { platform, format: formatName, responseBytes: raw.length },
+    );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw unreadable();
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw unreadable();
+  const envelope = parsed as {
+    contentBase64?: unknown;
+    height?: unknown;
+    present?: unknown;
+    total?: unknown;
+    width?: unknown;
+  };
+  if (typeof envelope.present !== 'boolean') throw unreadable();
+  if (!envelope.present) {
+    throw clipboardOutcome(platform, `${formatName} format not found on clipboard`, {
+      category: 'format_unavailable',
+    });
+  }
+  const { total, contentBase64, width, height } = envelope;
+  if (
+    typeof total !== 'number' ||
+    typeof contentBase64 !== 'string' ||
+    (width !== undefined && typeof width !== 'number') ||
+    (height !== undefined && typeof height !== 'number')
+  ) {
+    throw unreadable();
+  }
+  return {
+    total,
+    contentBase64,
+    ...(width !== undefined && { width }),
+    ...(height !== undefined && { height }),
+  };
 }
 
 /** Result of a clipboard inspection operation. */
@@ -305,14 +425,19 @@ export interface ClipboardBackend {
 
   /**
    * Read clipboard content in the specified format, bounded to `range`.
-   * Throws if the format is not present — callers should inspect first if unsure.
+   * A format that is not present throws a `format_unavailable` (or, on an empty
+   * clipboard, `empty`) outcome; a present zero-byte text, HTML, or RTF
+   * representation is returned as empty content. A zero-byte image is too on
+   * Linux; macOS and Windows cannot decode one and report it absent.
    */
   read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult>;
 
   /**
    * Write content to the clipboard.
    * HTML fallback behavior is backend-dependent: macOS and Windows also publish
-   * stripped plain text, while X11 and Wayland publish only text/html.
+   * stripped plain text. The Linux helpers carry one payload, so an HTML write
+   * has no stripped fallback — Wayland offers the markup under the plain-text
+   * types too, and an `xclip`-owned X11 selection answers any target with it.
    */
   write(content: string, format: 'text' | 'html'): Promise<WriteResult>;
 }
