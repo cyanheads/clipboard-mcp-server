@@ -7,7 +7,7 @@
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
 | `clipboard_read` | Read the current clipboard contents in a requested format. For `auto`, returns the richest explicitly-set format available (image > html > rtf > text). Images are returned as base64-encoded PNG with dimensions. | `format: "text" \| "html" \| "rtf" \| "image" \| "auto"` | `readOnlyHint: true`, `openWorldHint: false` |
-| `clipboard_write` | Write content to the clipboard. `text` sets plain text. `html` publishes HTML on every platform; macOS and Windows also publish a stripped plain-text fallback. | `content: string`, `format: "text" \| "html"` | `destructiveHint: true` (replaces current contents) |
+| `clipboard_write` | Write content to the clipboard. `text` sets plain text. `html` publishes HTML on every platform; macOS and Windows also publish a stripped plain-text fallback, while on Linux the markup is the only payload and plain-text requests can receive it too. | `content: string`, `format: "text" \| "html"` | `destructiveHint: true` (replaces current contents) |
 | `clipboard_inspect` | List the explicitly-set types on the clipboard with byte sizes and a semantic summary. Useful for deciding which format to request before calling `clipboard_read`. No content returned. | _(none)_ | `readOnlyHint: true`, `openWorldHint: false` |
 
 ### Resources
@@ -27,9 +27,9 @@ None. Pure data/action server.
 The primary use case: agents that need to receive content a user has copied (a URL, a code snippet, an error message, HTML from a browser selection) without requiring the user to paste it into the conversation. Write support lets agents stage output for the user to paste elsewhere.
 
 **Platform backends:**
-- **macOS**: `pbcopy`/`pbpaste` for text, JXA/NSPasteboard for rich types (HTML, RTF, image)
+- **macOS**: `pbpaste` for text reads; JXA/NSPasteboard for inspection, rich-type reads (HTML, RTF, image), and every write
 - **Linux**: `xclip` (X11) or `wl-clipboard` (Wayland) — detected at startup
-- **Windows**: .NET `System.Windows.Forms.Clipboard` via PowerShell for text and rich types
+- **Windows**: .NET `System.Windows.Forms.Clipboard` via PowerShell for text and rich types; the CF_HTML (`HTML Format`) framing is built and parsed in TypeScript
 
 The tool surface is platform-agnostic — same tools, same schemas, same behavior. Platform differences are encapsulated in the service layer. Feature availability varies by platform (see Platform Capabilities below).
 
@@ -58,10 +58,24 @@ The service uses a **backend adapter pattern** — a common interface (`Clipboar
 
 | Backend | Platform | Text | HTML | RTF | Image | Inspect |
 |:--------|:---------|:-----|:-----|:----|:------|:--------|
-| `MacosBackend` | darwin | `pbcopy`/`pbpaste` | JXA NSPasteboard | JXA NSPasteboard | JXA NSPasteboard (TIFF→PNG) | JXA `pb.types` |
+| `MacosBackend` | darwin | `pbpaste` read; JXA `setStringForType` write | JXA NSPasteboard | JXA NSPasteboard | JXA NSPasteboard (TIFF→PNG) | JXA `pb.types` |
 | `LinuxX11Backend` | linux (X11) | `xclip -selection clipboard` | `xclip -t text/html` | `xclip -t text/rtf` | `xclip -t image/png` | `xclip -o -t TARGETS` |
-| `LinuxWaylandBackend` | linux (Wayland) | `wl-paste` / `wl-copy` | `wl-paste -t text/html` | `wl-paste -t text/rtf` | `wl-paste -t image/png` | `wl-paste --list-types` |
-| `WindowsBackend` | win32 | PowerShell .NET Forms.Clipboard | PowerShell .NET Forms.Clipboard | PowerShell .NET | PowerShell .NET (BitmapSource→PNG) | PowerShell `GetDataObject().GetFormats()` |
+| `LinuxWaylandBackend` | linux (Wayland) | `wl-paste --no-newline` / `wl-copy` | `wl-paste --no-newline -t text/html` | `wl-paste --no-newline -t text/rtf` | `wl-paste --no-newline -t image/png` | `wl-paste --list-types` |
+| `WindowsBackend` | win32 | PowerShell .NET Forms.Clipboard (`UnicodeText`) | PowerShell moves raw `HTML Format` bytes; `cf-html.ts` builds and parses the CF_HTML envelope | PowerShell .NET | PowerShell .NET (BitmapSource→PNG) | PowerShell `GetDataObject().GetFormats()` |
+
+Both Linux backends decide whether a format is present from the type listing (`TARGETS` / `--list-types`) before reading it, never from a conversion succeeding: an `xclip`-owned selection — the state this server's own X11 writes leave — answers any requested target with its one buffer. A listed but zero-byte representation reads as empty content. `wl-paste` appends `\n` to every type it treats as text unless given `--no-newline`, so every payload read and size measurement passes it.
+
+**Classified helper outcomes.** Each backend maps its helper's result onto one of three categories, thrown as a typed sentinel (`clipboardOutcome()` / `isClipboardOutcome()` in `types.ts`); the tools branch on the category and never read message text. Unrecognized helper failures stay ordinary errors.
+
+| Category | Tool reason | Linux X11 (`xclip` 0.13 / git builds) | Linux Wayland (`wl-clipboard` ≤ 2.1 / ≥ 2.2) | macOS / Windows |
+|:---|:---|:---|:---|:---|
+| `empty` | `format_unavailable` | `Error: target TARGETS not available` / `There is no owner for the CLIPBOARD selection` | `No selection` / `Nothing is copied` | — |
+| `format_unavailable` | `format_unavailable` | type absent from `TARGETS`; a race after listing: `Error: target <T> not available` / `cannot convert CLIPBOARD selection to target '<T>'` | type absent from `--list-types`; after listing: `No suitable type of content copied` / `Clipboard content is not available as requested type …` | helper reports the representation absent |
+| `clipboard_unavailable` | `clipboard_unavailable` | `xclip`/`xsel` `ENOENT`; `Can't open display` | `wl-paste`/`wl-copy` `ENOENT`; `Failed to connect to a Wayland server` | Windows `powershell.exe` `ENOENT` |
+
+A `clipboard_unavailable` sentinel carries a backend-specific recovery hint — the install command, or the session variable (`DISPLAY`, `WAYLAND_DISPLAY`) to fix — which the tools put on the wire as `data.recovery.hint`.
+
+A macOS or Windows read helper whose output is not a well-formed `{ present, total, contentBase64 }` envelope fails as a SerializationError (-32070) from `parseRangedReadEnvelope()` — never a `ValidationError`, which would blame the caller's input, and never `format_unavailable`. The error carries no helper output, since that output can hold clipboard bytes.
 
 **Backend selection at startup:**
 1. Check `process.platform`
@@ -83,7 +97,7 @@ The service is thin: no retries (clipboard ops are local and near-instant), no H
 
 ## Implementation Order
 
-1. `ClipboardService` — platform guard, `readText`/`writeText` via pbcopy/pbpaste, `readRich`/`writeHtml`/`inspectTypes` via JXA subprocess
+1. `ClipboardService` — platform guard, `readText` via pbpaste, rich reads, writes, and inspection via JXA subprocess
 2. `clipboard_inspect` — safest, read-only, good smoke test for service layer
 3. `clipboard_read` — adds format routing and image path; depends on service
 4. `clipboard_write` — adds write path; most risk (destructive)
@@ -110,17 +124,34 @@ macOS copies images as TIFF internally. The tool always returns PNG (converting 
 
 ### HTML write: platform-dependent representations
 
-On macOS and Windows, HTML writes publish both HTML and an auto-generated, tag-stripped plain-text fallback. This matches browser clipboard behavior and gives plain-text-only paste targets a usable representation. Linux X11 and Wayland publish `text/html` only because their current command-line backends do not provide the same multi-representation ownership contract.
+On macOS and Windows, HTML writes publish both HTML and an auto-generated, tag-stripped plain-text fallback. This matches browser clipboard behavior and gives plain-text-only paste targets a usable representation.
 
-### pbcopy/pbpaste for text, JXA for everything else
+On Linux the command-line helpers carry exactly one payload per owner, so there is no stripped fallback and a plain-text paste can receive the raw markup:
 
-`pbcopy`/`pbpaste` are the canonical macOS text clipboard tools — fast, no dependencies, handle unicode and emoji correctly (verified). JXA via `osascript -l JavaScript` is required for rich types (HTML, RTF, image) and for `inspect`. The service layer picks the right backend per operation; callers don't see this distinction.
+- **Wayland:** `wl-copy -t text/html` offers the same bytes under `text/html` plus `text/plain`, `text/plain;charset=utf-8`, `TEXT`, `STRING`, and `UTF8_STRING` (upstream `wl-copy` adds those aliases to every textual type). `clipboard_inspect` then lists both `html` and `text`, and a `text` read returns the markup.
+- **X11:** `xclip -t text/html` advertises only `TARGETS` and `text/html`, so `clipboard_inspect` lists `html` alone and a `text` read fails `format_unavailable` — but `xclip` answers a request for any other target (`UTF8_STRING`, `STRING`, …) with the same markup, labelled `text/html`. A plain-text requester that accepts that reply gets the markup (`xclip -o -t UTF8_STRING` does); one that checks the reply type gets nothing (`xsel -o` returns an empty string).
 
-### `pbcopy` stdin encoding
+Publishing a stripped fallback on Linux would need a helper that can own several representations at once.
 
-`pbpaste` outputs UTF-8. `pbcopy` reads stdin as UTF-8. Confirmed unicode and emoji round-trip correctly (`Hello 世界 🌍`).
+### macOS: pbpaste reads text, one stdin-fed JXA script writes
 
----
+`pbpaste` reads text (run under `LC_ALL=en_US.UTF-8` so its output bytes are the clipboard's UTF-8 bytes whatever the parent locale). JXA via `osascript -l JavaScript` handles inspection, HTML/RTF/image reads, clear, and every write. The service layer picks the right helper per operation; callers don't see this distinction.
+
+Writes do not use `pbcopy`: it re-types input that begins with an RTF (`{\rtf`) or EPS (`%!PS-Adobe-2.0 EPSF-2.0`) header as that type, so a literal text write could leave no text representation, and it has no flag to turn that off. The JXA writer publishes text with `setStringForType` as `public.utf8-plain-text` whatever its leading bytes.
+
+### Writes: fixed script, constant argv, payload on stdin (macOS and Windows)
+
+Every macOS and Windows write runs one static script — `JXA_WRITE` / `PS_WRITE` — with the same argv for every payload. The payload goes on stdin as a JSON envelope of base64 UTF-8 fields, `{ "text": …, "html"?: … }`, which the script parses as data (JXA `NSFileHandle.fileHandleWithStandardInput`, PowerShell `[Console]::OpenStandardInput()` + `ConvertFrom-Json`). Each script checks every pasteboard/clipboard set and exits non-zero on failure, which the backend reports as an error.
+
+Why: embedding the payload in the command line capped writes far below the 1 MiB contract — macOS `ARG_MAX` (1 MiB, shared with the environment) failed HTML writes above ~390 KB with `E2BIG`, and Windows' 32,767-character command line would fail text above ~24 KB and HTML above ~12 KB. Stdin has no such limit, and payload bytes never reach script source, so there is nothing to escape. Rejected: a temp file (lifecycle and permissions for no gain over stdin) and PowerShell `-EncodedCommand` (still argv).
+
+### Windows HTML: CF_HTML is TypeScript's job; PowerShell only moves bytes
+
+Windows stores HTML as CF_HTML (`HTML Format`): a UTF-8 header of `Name:Value` lines whose `StartHTML`/`EndHTML`/`StartFragment`/`EndFragment` values are byte offsets into the data. `src/services/clipboard/cf-html.ts` builds and parses it.
+
+- **Write.** `buildCfHtml()` wraps the HTML in `Version:0.9` plus fixed-width zero-padded offsets and a minimal `<html><body>` context. `PS_WRITE` stores the envelope as a `MemoryStream`, which WinForms copies verbatim (a string `SetData(DataFormats.Html, …)` stores raw UTF-8 with no header). The tag-stripped fallback goes out as `UnicodeText`; `DataFormats.Text` would encode it in the ANSI code page and drop characters such as `😀`.
+- **Read.** The read script returns the representation's total size, the offset past its trailing NUL padding, a SHA-256 of every byte, a 64 KiB prefix, and the raw byte window TypeScript asks for — no CF_HTML parsing. `parseCfHtmlHeader()` validates the header (CRLF/LF/CR line endings, zero-padded offsets, `StartHTML:-1`/`EndHTML:-1`, optional selection offsets) and resolves `[StartFragment, EndFragment)`; `totalByteSize`, `offset`, and `limit` apply to that fragment. A window inside the prefix takes one helper call; a window beyond it takes a second, and the read fails if the two calls report different hashes — the clipboard changed in between. Node holds at most prefix plus window. A malformed header fails with a SerializationError naming the field; header text is never returned as HTML. A payload with no `Version:` header is returned whole, minus trailing NULs.
+- **Why the fragment.** It is what macOS (`public.html`) and Linux (`text/html`) expose, and it round-trips `clipboard_write` exactly. Context-only material (e.g. a `<head><style>` block a producer places before the fragment) is not returned.
 
 ## Tool Contracts
 
@@ -156,21 +187,22 @@ errors: [
   {
     reason: 'format_unavailable',
     code: JsonRpcErrorCode.NotFound,
-    when: 'Requested format is not present on the clipboard',
+    when: 'Requested format is not present on the clipboard, or the clipboard is empty',
     recovery: 'Call clipboard_inspect to see available formats, then retry with a supported format or use "auto".',
   },
   {
     reason: 'content_too_large',
-    code: JsonRpcErrorCode.InvalidParams,
-    when: 'Clipboard content exceeds size limit (512KB text/HTML/RTF, 5MB image)',
+    code: JsonRpcErrorCode.ValidationError,
+    when: 'Clipboard content exceeds size limit (512KB text/HTML/RTF, 5MB image) and no offset/limit was given',
     data: { bytes: number, limit: number, format: string },
-    recovery: 'Content is too large to return. Use clipboard_inspect to see available formats and sizes, then decide whether to request a smaller format.',
+    recovery: 'Retry with offset/limit to read a bounded slice and follow nextOffset, or request a smaller format.',
   },
   {
     reason: 'clipboard_unavailable',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Required clipboard tool not found on this platform',
-    recovery: 'Install the platform clipboard tool: macOS (built-in), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+).',
+    when: 'The platform clipboard helper is missing from PATH, or it cannot reach the desktop session (no display or compositor)',
+    data: { platform: string },  // data.recovery.hint is the backend's specific install command or session variable
+    recovery: 'Install the clipboard helper (Linux X11: apt install xclip; Wayland: apt install wl-clipboard; Windows: PowerShell 5.1+), or run the server inside the desktop session so DISPLAY or WAYLAND_DISPLAY names a live display, then retry.',
   },
 ]
 
@@ -188,7 +220,8 @@ input: z.object({
     .describe(
       'Format of the content. "text" writes plain text. ' +
       '"html" writes HTML; on macOS and Windows it also publishes an auto-generated, ' +
-      'tag-stripped plain-text fallback. Linux X11 and Wayland publish only text/html.'
+      'tag-stripped plain-text fallback. On Linux there is no stripped fallback: Wayland also ' +
+      'offers the markup under the plain-text types, and X11 hands the same markup to a plain-text request.'
     ),
 })
 
@@ -202,7 +235,7 @@ output: z.object({
 errors: [
   {
     reason: 'content_too_large',
-    code: JsonRpcErrorCode.InvalidParams,
+    code: JsonRpcErrorCode.ValidationError,
     when: 'Write content exceeds the 1MB size limit',
     data: { bytes: number, limit: number },
     recovery: 'Content is too large to write to the clipboard. Truncate or summarize before writing.',
@@ -210,8 +243,8 @@ errors: [
   {
     reason: 'clipboard_unavailable',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Required clipboard tool not found on this platform',
-    recovery: 'Install the platform clipboard tool: macOS (built-in), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+).',
+    when: 'The platform clipboard helper is missing from PATH, or it cannot reach the desktop session (no display or compositor)',
+    recovery: 'Install the clipboard helper (Linux X11: apt install xclip, plus xsel for clear; Wayland: apt install wl-clipboard; Windows: PowerShell 5.1+), or run the server inside the desktop session so DISPLAY or WAYLAND_DISPLAY names a live display, then retry.',
   },
 ]
 
@@ -244,10 +277,16 @@ output: z.object({
 
 errors: [
   {
+    reason: 'inspect_unreadable',
+    code: JsonRpcErrorCode.SerializationError,
+    when: 'The platform clipboard helper returned output this server could not read',
+    recovery: 'Retry clipboard_inspect once; if it fails again, copy the content afresh.',
+  },
+  {
     reason: 'clipboard_unavailable',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Required clipboard tool not found on this platform',
-    recovery: 'Install the platform clipboard tool: macOS (built-in), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+).',
+    when: 'The platform clipboard helper is missing from PATH, or it cannot reach the desktop session (no display or compositor)',
+    recovery: 'Install the clipboard helper (Linux X11: apt install xclip; Wayland: apt install wl-clipboard; Windows: PowerShell 5.1+), or run the server inside the desktop session so DISPLAY or WAYLAND_DISPLAY names a live display, then retry.',
   },
 ]
 
@@ -272,15 +311,15 @@ Each tool's `format()` function must render all fields from the output schema �
 
 ### Command injection prevention
 
-The server shells out to platform-specific clipboard tools (`pbcopy`, `xclip`, `wl-copy`, `powershell`, `osascript`). Every subprocess is a potential injection vector.
+The server shells out to platform-specific clipboard tools (`pbpaste`, `osascript`, `xclip`, `xsel`, `wl-paste`, `wl-copy`, `powershell`). Every subprocess is a potential injection vector.
 
-**Hard rule: raw content is never interpolated into command strings.** Text content is piped via stdin where the platform tool supports it. The macOS and Windows rich-format scripts receive only JSON-quoted base64 literals inside fixed script templates.
+**Hard rule: content never reaches a command line or script source.** Every write sends its payload on stdin: raw bytes to `xclip`/`wl-copy`, and a JSON envelope of base64 fields to the static macOS and Windows writer scripts, whose argv is identical for every payload. Read scripts interpolate only validated non-negative integers (byte offsets and limits).
 
 | Vector | Risk | Mitigation |
 |:-------|:-----|:-----------|
-| `clipboard_write` content → subprocess | Content with shell metacharacters could escape | Use `child_process.spawn` with `shell: false`; pass raw text via stdin or JSON-quoted base64 through a fixed script template. |
-| JXA scripts via `osascript` (macOS) | String interpolation into JXA could allow code execution | Encode both HTML and its plain-text fallback as base64, then embed only JSON-quoted base64 literals in a fixed JXA template. |
-| PowerShell commands (Windows) | Script injection via clipboard content | Encode text and HTML representations as base64, then embed only JSON-quoted base64 literals in fixed PowerShell templates. |
+| `clipboard_write` content → subprocess | Content with shell metacharacters could escape | Use `child_process.spawn` with `shell: false`; every payload travels on stdin, never in argv. |
+| JXA scripts via `osascript` (macOS) | String interpolation into JXA could allow code execution | One static writer script (`JXA_WRITE`); the payload is a stdin JSON envelope of base64 fields, parsed as data. |
+| PowerShell commands (Windows) | Script injection via clipboard content | One static writer script (`PS_WRITE`); the payload is a stdin JSON envelope of base64 fields, parsed with `ConvertFrom-Json`. |
 | `xclip`/`wl-paste` arguments (Linux) | Flag injection via content | Content goes to stdin; MIME types for `-t` flag come from validated enums, not user input. |
 | Clipboard READ content | Malicious clipboard content could be crafted to inject into downstream processing | Not our problem — the server faithfully returns what's on the clipboard. But: never use read content in subsequent shell commands internally without sanitization (defense in depth). |
 
@@ -314,9 +353,11 @@ Every tool gets a test file. Backend adapters are mocked — no actual clipboard
 
 | Tool | Happy paths | Error paths | Edge cases |
 |:-----|:-----------|:------------|:-----------|
-| `clipboard_inspect` | Text on clipboard → returns types + sizes | Empty clipboard → `primaryFormat: "empty"` | Multiple rich types simultaneously (HTML + text + image from browser copy) |
-| `clipboard_read` | Read text, HTML, RTF, image independently | Format not present → `format_unavailable` error; clipboard tool missing → `clipboard_unavailable`; `auto` on empty clipboard → `format_unavailable` | `auto` with only text; `auto` with image; unicode/emoji round-trip; very large content near size cap |
-| `clipboard_write` | Write text, verify via read; on macOS and Windows, write HTML and verify both representations; on Linux, verify `text/html` | Clipboard tool missing → `clipboard_unavailable`; content at 1MB+1 → `content_too_large` | Unicode, emoji, HTML with special chars (`<script>`, `&amp;`), empty string, very large content |
+| `clipboard_inspect` | Text on clipboard → returns types + sizes | Empty clipboard → `primaryFormat: "empty"`; helper missing or display unreachable → `clipboard_unavailable` | Multiple rich types simultaneously (HTML + text + image from browser copy) |
+| `clipboard_read` | Read text, HTML, RTF, image independently | Format not present → `format_unavailable` error; clipboard tool missing or display unreachable → `clipboard_unavailable`; `auto` on empty clipboard → `format_unavailable` | `auto` with only text; `auto` with image; zero-byte representation → empty success (no image block for a zero-byte image); unicode/emoji round-trip; very large content near size cap |
+| `clipboard_write` | Write text, verify via read; on macOS and Windows, write HTML and verify both representations; on Linux, verify `text/html` and what plain-text requests receive | Clipboard tool missing or display unreachable → `clipboard_unavailable`; content at 1MB+1 → `content_too_large` | Unicode, emoji, HTML with special chars (`<script>`, `&amp;`), empty string, very large content; X11 write resolves while the forked `xclip` keeps serving |
+
+`tests/tools/native-outcomes.test.ts` runs the three tools through `runToolContract` over the real service and backends, faking only `spawn` with modeled helpers that print the verbatim diagnostics of both `wl-clipboard` and both `xclip` generations.
 
 ### Backend adapter tests
 
@@ -324,12 +365,12 @@ Each backend gets its own test suite verifying the adapter contract:
 
 | Backend | Tests |
 |:--------|:------|
-| `MacosBackend` | `pbcopy`/`pbpaste` text round-trip, JXA type listing, JXA HTML/RTF/image read, HTML write dual-representation, TIFF→PNG conversion |
-| `LinuxX11Backend` | `xclip` text round-trip, MIME type listing via `-t TARGETS`, HTML/image read via `-t`, missing `xclip` detection |
-| `LinuxWaylandBackend` | `wl-paste`/`wl-copy` text round-trip, `--list-types`, HTML/image read, missing `wl-paste` detection |
-| `WindowsBackend` | PowerShell text round-trip, .NET Clipboard format listing, HTML/image read via .NET, PowerShell not available detection |
+| `MacosBackend` | `pbpaste` text read, JXA type listing, JXA HTML/RTF/image read, stdin-fed writer (constant argv, envelope on stdin, failed set → error); `macos-native.test.ts` (darwin only) runs the real scripts through `osascript` — see below |
+| `LinuxX11Backend` | `xclip` text round-trip, MIME type listing via `-t TARGETS`, presence decided from `TARGETS`, HTML/image read via `-t`, every `xclip`/`xsel` diagnostic classified (0.13 and git spellings), write settling on the foreground exit, missing `xclip`/`xsel` detection |
+| `LinuxWaylandBackend` | `wl-paste`/`wl-copy` text round-trip, `--list-types`, `--no-newline` on every payload read and measurement, HTML/image read, every `wl-paste`/`wl-copy` diagnostic classified (≤ 2.1 and ≥ 2.2 spellings), missing `wl-paste`/`wl-copy` detection |
+| `WindowsBackend` | PowerShell text read, .NET Clipboard format listing, stdin-fed writer (constant argv, CF_HTML `MemoryStream`, `UnicodeText` fallback), CF_HTML fragment reads through a modeled helper (one- and two-call paths, changed clipboard, malformed header, headerless payload), image read, PowerShell not available detection. `cf-html.test.ts` proves the CF_HTML grammar with byte-offset tests; native Windows paste interoperability is not exercised |
 
-All backend tests mock `child_process.spawn` — they verify the correct commands and arguments are constructed, not that the actual clipboard works.
+Most backend tests mock `child_process.spawn` — they verify the commands, arguments, and stdin constructed, not that the actual clipboard works. A mocked `spawn` cannot see an argv-size failure (`E2BIG`), a helper's format sniffing, or a runtime error inside a generated script, so `tests/services/clipboard/macos-native.test.ts` (skipped off darwin) runs `MacosBackend` against the real `osascript`: its `spawn` passes through after rewriting the script's single `$.NSPasteboard.generalPasteboard` to a uniquely named private pasteboard, refuses `pbcopy`/`pbpaste`, and checks the general pasteboard's `changeCount` is unchanged afterwards. It covers 1 MiB HTML and text writes, RTF/EPS-header text writes, byte-exact round-trips, reads below/at/past the end, and absent types.
 
 ### Platform integration tests
 
@@ -371,7 +412,8 @@ For each backend and each tool with string input:
 ### Mocking strategy
 
 - Backend adapters implement a `ClipboardBackend` interface — mock the interface, not the subprocess calls, for tool-level tests
-- Backend-level tests mock `child_process.spawn` to verify correct command construction
+- Backend-level tests mock `child_process.spawn` to verify correct command construction; the darwin-only native suite runs the real JXA against a private pasteboard
+- Integration tests (`tests/integration/`) put stub `pbpaste`/`osascript`/`xclip`/`xsel`/`wl-copy`/`wl-paste` first on the server's `PATH`, so they never touch the real clipboard
 - Integration tests run on real platform with real clipboard — only in environments where clipboard tools are available
 - CI matrix: macOS, Ubuntu (X11), Windows — each runs platform-specific integration tests
 
@@ -385,7 +427,7 @@ Not all formats are available on all platforms:
 |:-----------|:------|:--------------------|:--------|
 | Text read/write | Yes | Yes | Yes |
 | HTML read/write | Yes (JXA) | Yes (`text/html` MIME) | Yes (.NET) |
-| HTML plain-text fallback on write | Yes | No | Yes |
+| HTML plain-text fallback on write | Yes | No — plain-text requests can receive the HTML markup itself | Yes |
 | RTF read | Yes (JXA) | Partial (if app sets `text/rtf`) | Yes (.NET) |
 | Image read (PNG) | Yes (JXA, TIFF→PNG) | Yes (`image/png` MIME) | Yes (.NET, BitmapSource→PNG) |
 | Type inspection | Yes (`pb.types`) | Yes (`TARGETS` / `--list-types`) | Yes (`.GetFormats()`) |
@@ -394,7 +436,7 @@ Not all formats are available on all platforms:
 When a format is unavailable on a platform, `clipboard_read` returns `format_unavailable` with a message noting platform support. `clipboard_inspect` only reports formats actually present.
 
 **Required CLI tools:**
-- macOS: none (pbcopy/pbpaste are built-in; osascript is built-in)
+- macOS: none (`pbpaste` and `osascript` are built in)
 - Linux X11: `xclip` (`apt install xclip` / `pacman -S xclip`)
 - Linux Wayland: `wl-clipboard` (`apt install wl-clipboard`)
 - Windows: PowerShell 5.1+ (built-in on Windows 10+)
@@ -407,6 +449,6 @@ When a format is unavailable on a platform, `clipboard_read` returns `format_una
 - **File references not supported.** The clipboard can hold file paths (Finder copy), but interpreting them is out of scope.
 - **RTF write not supported at v1.** RTF output is available for read, but writing RTF requires generating valid RTF markup — deferred until there's demand.
 - **Linux byte sizes require full read.** `xclip`/`wl-paste` don't report sizes without reading content. For `inspect`, the backend reads each type to measure — adds latency for large items.
-- **Wayland clipboard ephemeral.** On Wayland, clipboard content is owned by the source process — if the process that copied exits, the clipboard empties. `clipboard_write` must invoke `wl-copy` as a detached background process (using `child_process.spawn` with `detached: true` and `unref()`) so the content persists after the MCP server process moves on. If the server itself exits, the background `wl-copy` process will also exit and the clipboard will empty.
-- **JXA subprocess latency (macOS).** Rich-type operations spawn an `osascript` process (~50–100ms on cold start). Text operations via pbcopy/pbpaste are faster (~5ms).
+- **Linux clipboard owned by a helper process.** On Wayland and X11, clipboard content is served by the process that copied it — when that process exits, the clipboard empties. `wl-copy` and `xclip -i` each fork a background owner that keeps serving the selection until another client takes it. `clipboard_write` spawns `wl-copy` detached (`detached: true`, then `unref()`), so the background `wl-copy` runs in its own session and keeps serving after the server exits — normally or by `SIGKILL`. Both write paths resolve on the foreground process's exit, not on `close`: the forked owner inherits the stdio pipes, so `close` would wait until another client took the selection.
+- **JXA subprocess latency (macOS).** Inspection, rich-type reads, and every write spawn an `osascript` process, measured at ~60–80 ms median each (a 1 MiB write included). `pbpaste` itself takes ~10 ms, but a text read inspects first — to tell an empty clipboard from empty text — so it costs about the same as a rich read, and `clipboard_write` reads the prior text before writing.
 - **Synthesized types (macOS).** macOS synthesizes some types on demand (e.g., TIFF from PNG). The service uses `pb.types` (explicit types only) to avoid false positives.

@@ -43,14 +43,16 @@ The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write
 - Size limits: 512 KB for text/HTML/RTF, 5 MB for images (raw bytes before base64 expansion)
 - Content above the limit reads via `offset`/`limit` slicing — pass both to read a bounded window (`limit` is at least 4, clamped to the format's size limit) and follow the returned `nextOffset` until `complete` is `true`
 - `image` returns base64-encoded PNG data, with `width`/`height` whenever the capture carries a readable PNG header
-- Typed errors: `format_unavailable` when the requested format isn't on the clipboard, `content_too_large` when no `offset`/`limit` was given and content exceeds the size limit
+- A text, HTML, or RTF format that is present but zero bytes long returns empty content, not an error
+- Typed errors: `format_unavailable` when the requested format isn't on the clipboard (or the clipboard is empty), `content_too_large` when no `offset`/`limit` was given and content exceeds the size limit, `clipboard_unavailable` when the platform helper is missing or can't reach the desktop session
 
 ---
 
 ### `clipboard_write` <sub>tool</sub>
 
 - Exactly one of `content` or `clear: true` — an empty `content`, both, or neither is rejected as invalid input
-- `format: "html"` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback, while Linux X11 and Wayland publish only `text/html`
+- `format: "html"` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback. Linux has no stripped fallback — Wayland also offers the markup under the plain-text types, and X11 advertises only `text/html` but answers a plain-text request (e.g. `UTF8_STRING`) with the same markup, so a plain-text paste can receive raw HTML
+- Typed `clipboard_unavailable` error when the platform helper is missing or can't reach the desktop session
 - `clear: true` removes every representation instead of writing (needs `xsel` alongside `xclip` on Linux X11) and returns `cleared: true`, `byteSize: 0`, no `format`
 - Returns `previousContent` — the plain text on the clipboard immediately before the write or clear, for undoing an unintended overwrite — absent when the clipboard was empty, held no text representation, or that text exceeded the 512 KB read limit
 - Size limit: 1 MB, past which a typed `content_too_large` error is returned
@@ -62,7 +64,7 @@ The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write
 
 - Returns `primaryFormat` (richest present — image > html > rtf > text — or `empty`) and `availableFormats`, the formats available to pass to `clipboard_read`
 - Returns `rawTypes` — every raw platform type identifier with byte size (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows); an entry whose size couldn't be measured carries `measurementFailed: true` and no `bytes`, never a false zero
-- Typed `inspect_unreadable` error when the platform helper's output cannot be read, instead of reporting an empty clipboard
+- Typed `inspect_unreadable` error when the platform helper's output cannot be read, instead of reporting an empty clipboard; typed `clipboard_unavailable` when the helper is missing or can't reach the desktop session
 
 ---
 
@@ -72,17 +74,17 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 Clipboard-specific:
 
-- Cross-platform backend detection at startup — macOS (pbcopy/pbpaste + osascript), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
+- Cross-platform backend detection at startup — macOS (pbpaste + osascript), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
 - Semantic format mapping — platform-native type identifiers (UTIs, TARGETS, Windows format names) mapped to `text`, `html`, `rtf`, `image` across all backends
-- Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; Linux X11 and Wayland publish `text/html` only
-- Image support — macOS and Windows backends decode PNG bytes and return width/height alongside base64 content
+- Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; on Linux the HTML is the only payload, which plain-text paste targets can also receive
+- Image support — every backend returns PNG as base64 with width/height (Linux backends read them from the PNG header)
 
 Agent-friendly output:
 
 - Size-guarded I/O — reads and writes over the format limit fail with a typed `content_too_large` error carrying byte/limit metadata, rather than truncating silently
 - Bounded continuation — `clipboard_read` slices oversized content with `offset`/`limit` and `nextOffset` instead of forcing a single all-or-nothing read
 - Undo support — `clipboard_write` returns `previousContent` so an unintended overwrite can be reverted
-- Discriminated failure — `format_unavailable`, `content_too_large`, and `inspect_unreadable` are typed reasons with recovery hints, not generic errors
+- Discriminated failure — `format_unavailable`, `content_too_large`, `inspect_unreadable`, and `clipboard_unavailable` are typed reasons with recovery hints, not generic errors; each backend classifies its helper's outcomes itself (across wl-clipboard and xclip release spellings), so an empty clipboard, an absent format, and an unreachable helper never blur together
 
 ---
 
@@ -135,7 +137,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 Bun 1.4.0+ or Node.js 24+.
 
-**macOS:** No additional tools required — `pbcopy`, `pbpaste`, and `osascript` are built in.
+**macOS:** No additional tools required — `pbpaste` and `osascript` are built in.
 
 **Linux X11:** `xclip` must be installed. `xsel` is additionally required for `clipboard_write`'s `clear` mode — it is the only one of the two that can hand the selection back rather than owning an empty one.
 
@@ -215,7 +217,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for the full developer protocol — tool patterns
 
 - Handlers throw, framework catches — no `try/catch` in tool logic
 - Use `ctx.log` for request-scoped logging
-- No Docker — this server needs direct host OS access (pbcopy/pbpaste, JXA/NSPasteboard, xclip, wl-clipboard, PowerShell), none of which work inside a container
+- No Docker — this server needs direct host OS access (pbpaste, JXA/NSPasteboard, xclip, wl-clipboard, PowerShell), none of which work inside a container
 
 ---
 
