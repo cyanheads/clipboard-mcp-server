@@ -15,7 +15,9 @@ import type {
   RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectFormats } from './types.js';
+import { buildInspectFormats, clipboardOutcome, isClipboardOutcome } from './types.js';
+
+const PLATFORM = 'Linux X11';
 
 const TEXT_TARGETS: readonly string[] = [
   'UTF8_STRING',
@@ -24,6 +26,23 @@ const TEXT_TARGETS: readonly string[] = [
   'TEXT',
   'STRING',
 ];
+
+/** X targets each semantic format is read from, in preference order. */
+const FORMAT_TARGETS: Record<ClipboardFormat, readonly string[]> = {
+  text: TEXT_TARGETS,
+  html: ['text/html'],
+  rtf: ['text/rtf', 'application/rtf'],
+  image: ['image/png'],
+};
+
+const XCLIP_INSTALL_HINT =
+  'Install xclip (apt install xclip on Debian/Ubuntu, pacman -S xclip on Arch, dnf install xclip on Fedora), then retry.';
+
+const XSEL_INSTALL_HINT =
+  'Clearing the X11 clipboard needs xsel alongside xclip: install it (apt install xsel on Debian/Ubuntu, pacman -S xsel on Arch, dnf install xsel on Fedora), then retry.';
+
+const DISPLAY_HINT =
+  'Run the server inside the X11 desktop session so DISPLAY names a running X server it may connect to (check XAUTHORITY too), then retry.';
 
 /** Map MIME type (or X TARGETS entry) → semantic format. */
 function mimeToFormat(mime: string): ClipboardFormat | null {
@@ -34,45 +53,61 @@ function mimeToFormat(mime: string): ClipboardFormat | null {
   return null;
 }
 
-/** Run xclip with the given args; optionally write stdin. Returns stdout as Buffer. */
-function runXclip(args: string[], stdin?: Buffer): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('xclip', args, {
-      shell: false,
-      stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-    });
-    if (stdin) child.stdin?.end(stdin);
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
-    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
-    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
-    child.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`xclip exited ${code}: ${Buffer.concat(err).toString('utf8').trim()}`));
-      } else {
-        resolve(Buffer.concat(out));
-      }
-    });
-    child.on('error', (err) => {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('xclip not found — install with: apt install xclip'));
-      } else {
-        reject(err);
-      }
-    });
-  });
+/** The `-t` target of an xclip invocation. */
+function targetOf(args: readonly string[]): string | undefined {
+  const index = args.indexOf('-t');
+  return index >= 0 ? args[index + 1] : undefined;
 }
 
 /**
- * xclip's wording when the CLIPBOARD selection has no owner at all — an empty
- * clipboard, not a failure. It exits non-zero either way, so the message is
- * what separates the two.
+ * Classify a non-zero xclip exit from its diagnostic. xclip 0.13 (the release
+ * most distributions ship) prints "Error: target <T> not available" both when
+ * nothing owns the selection and when the owner cannot convert to `T`; git
+ * builds print "There is no owner for the CLIPBOARD selection" and
+ * "'<owner>' (0x…) cannot convert CLIPBOARD selection to target '<T>'". An
+ * owner must answer TARGETS, so a failed TARGETS request means no owner. A
+ * diagnostic matching neither generation stays an ordinary error.
  */
-const NO_OWNER_PATTERN = /there is no owner for the .* selection/i;
+function xclipFailure(code: number | string | null, stderr: string, target?: string): Error {
+  const message = `xclip exited ${code}: ${stderr}`;
+  if (/Can't open display/.test(stderr)) {
+    return clipboardOutcome(PLATFORM, message, {
+      category: 'clipboard_unavailable',
+      recoveryHint: DISPLAY_HINT,
+    });
+  }
+  if (/There is no owner for the \S+ selection/i.test(stderr)) {
+    return clipboardOutcome(PLATFORM, message, { category: 'empty' });
+  }
+  if (/target \S+ not available|cannot convert \S+ selection to target/.test(stderr)) {
+    return clipboardOutcome(PLATFORM, message, {
+      category: target === 'TARGETS' ? 'empty' : 'format_unavailable',
+    });
+  }
+  return new Error(message);
+}
+
+/** Classify a spawn failure: a missing helper binary makes the clipboard unavailable. */
+function spawnFailure(helper: 'xclip' | 'xsel', error: Error): Error {
+  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return error;
+  return helper === 'xclip'
+    ? clipboardOutcome(
+        PLATFORM,
+        'xclip not found — install with: apt install xclip',
+        { category: 'clipboard_unavailable', recoveryHint: XCLIP_INSTALL_HINT },
+        error,
+      )
+    : clipboardOutcome(
+        PLATFORM,
+        'xsel not found — clearing the X11 clipboard needs it: apt install xsel',
+        { category: 'clipboard_unavailable', recoveryHint: XSEL_INSTALL_HINT },
+        error,
+      );
+}
 
 /**
- * Run xclip with `args`, streaming its stdout through `consume` instead of
- * buffering it — `consume` decides how much (if any) of the stream to retain.
+ * Run `xclip -o` with `args`, streaming its stdout through `consume` instead
+ * of buffering it — `consume` decides how much (if any) of the stream to retain.
  */
 function runXclipStream<T>(args: string[], consume: (stdout: Readable) => Promise<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -82,91 +117,118 @@ function runXclipStream<T>(args: string[], consume: (stdout: Readable) => Promis
     child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
     child.on('close', (code) => {
       resultPromise.then((result) => {
-        if (code !== 0) {
-          reject(new Error(`xclip exited ${code}: ${Buffer.concat(err).toString('utf8').trim()}`));
-        } else {
-          resolve(result);
-        }
+        if (code === 0) resolve(result);
+        else reject(xclipFailure(code, Buffer.concat(err).toString('utf8').trim(), targetOf(args)));
       }, reject);
     });
-    child.on('error', (error) => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('xclip not found — install with: apt install xclip'));
-      } else {
-        reject(error);
-      }
-    });
+    child.on('error', (error) => reject(spawnFailure('xclip', error)));
   });
 }
 
 /**
- * Run xclip and return the `[range.offset, range.offset + range.limit)` byte
- * window plus the stream's total size — xclip has no native range support,
- * so this streams stdout through `collectByteWindow` rather than buffering
- * the whole representation before slicing.
+ * Run `xclip -i` with `content` on stdin, resolving once xclip owns the
+ * selection (#40). xclip takes ownership, then forks a background process
+ * that keeps serving the selection until another client claims it — and that
+ * process inherits the stdio pipes, so `close` would not fire until then. The
+ * foreground process's exit 0 is the completion signal instead, as for wl-copy.
+ * A failed run never forks, so its outcome waits for `close`, by which point
+ * the whole diagnostic has been read.
  */
-function runXclipWindow(
-  args: string[],
-  range: ByteRange,
-): Promise<{ totalByteSize: number; window: Buffer }> {
-  return runXclipStream(args, (stdout) => collectByteWindow(stdout, range));
+function runXclipInput(args: string[], content: Buffer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('xclip', args, { shell: false, stdio: ['pipe', 'ignore', 'pipe'] });
+    const err: Buffer[] = [];
+    let stdinError: Error | undefined;
+    let settled = false;
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+
+    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
+    child.on('error', (error) => settle(spawnFailure('xclip', error)));
+    // xclip closing stdin early means it exited early; its exit status says why.
+    child.stdin?.on('error', (error: Error) => {
+      stdinError = error;
+    });
+    child.on('exit', (code) => {
+      if (code !== 0) return;
+      settle(stdinError && new Error(`xclip stdin write failed: ${stdinError.message}`));
+      // Release this end of the pipe the forked owner still holds.
+      child.stderr?.destroy();
+    });
+    child.on('close', (code, signal) => {
+      if (code === 0) return;
+      settle(
+        xclipFailure(code ?? signal, Buffer.concat(err).toString('utf8').trim(), targetOf(args)),
+      );
+    });
+
+    child.stdin?.end(content);
+  });
 }
 
-/** Run xclip and count its stdout bytes without retaining any of them. */
-function runXclipCount(args: string[]): Promise<number> {
-  return runXclipStream(args, (stdout) => countBytes(stdout));
+/** A range covering a whole stream — for the TARGETS listing, which is always small. */
+const WHOLE_STREAM: ByteRange = { offset: 0, limit: Number.MAX_SAFE_INTEGER };
+
+/** The targets the selection owner offers — empty when nothing owns it. */
+async function listTargets(): Promise<string[]> {
+  let listing: Buffer;
+  try {
+    ({ window: listing } = await runXclipStream(
+      ['-o', '-selection', 'clipboard', '-t', 'TARGETS'],
+      (stdout) => collectByteWindow(stdout, WHOLE_STREAM),
+    ));
+  } catch (error) {
+    if (isClipboardOutcome(error) && error.category === 'empty') return [];
+    throw error;
+  }
+  return listing
+    .toString('utf8')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /**
- * Run xsel with the given args. Returns stdout as Buffer.
+ * Run xsel with the given args.
  *
  * xclip owns the read and write paths, but it has no way to give a selection
  * back: `xclip -i` takes ownership unconditionally, so an empty write leaves a
  * zero-byte representation that still reads as text. `xsel --clear` sets the
  * selection owner to `None`, which is what actually empties the clipboard.
  */
-function runXsel(args: string[]): Promise<Buffer> {
+function runXsel(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn('xsel', args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
-    const out: Buffer[] = [];
+    const child = spawn('xsel', args, { shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
     const err: Buffer[] = [];
-    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
     child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
     child.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`xsel exited ${code}: ${Buffer.concat(err).toString('utf8').trim()}`));
-      } else {
-        resolve(Buffer.concat(out));
+      if (code === 0) {
+        resolve();
+        return;
       }
+      const stderr = Buffer.concat(err).toString('utf8').trim();
+      const message = `xsel exited ${code}: ${stderr}`;
+      reject(
+        /Can't open display/.test(stderr)
+          ? clipboardOutcome(PLATFORM, message, {
+              category: 'clipboard_unavailable',
+              recoveryHint: DISPLAY_HINT,
+            })
+          : new Error(message),
+      );
     });
-    child.on('error', (error) => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('xsel not found — clearing the X11 clipboard needs it: apt install xsel'));
-      } else {
-        reject(error);
-      }
-    });
+    child.on('error', (error) => reject(spawnFailure('xsel', error)));
   });
 }
 
 /** Linux X11 clipboard backend using xclip. */
 export class LinuxX11Backend implements ClipboardBackend {
   async inspect(): Promise<InspectResult> {
-    // xclip -o -selection clipboard -t TARGETS lists available MIME types
-    let buf: Buffer;
-    try {
-      buf = await runXclip(['-o', '-selection', 'clipboard', '-t', 'TARGETS']);
-    } catch (error) {
-      if (error instanceof Error && NO_OWNER_PATTERN.test(error.message)) {
-        return { rawTypes: [], ...buildInspectFormats(new Set()) };
-      }
-      throw error;
-    }
-    const targets = buf
-      .toString('utf8')
-      .split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const targets = await listTargets();
 
     const rawTypes: RawTypeEntry[] = [];
     const semanticSet = new Set<ClipboardFormat>();
@@ -176,17 +238,14 @@ export class LinuxX11Backend implements ClipboardBackend {
       if (fmt) semanticSet.add(fmt);
       // Measure size by reading the content for each known semantic type
       // We only read for recognized MIME types to limit latency
-      if (
-        TEXT_TARGETS.includes(target) ||
-        target === 'text/html' ||
-        target === 'text/rtf' ||
-        target === 'application/rtf' ||
-        target === 'image/png'
-      ) {
+      if (fmt) {
         try {
           // Stream and count — clipboard_inspect is metadata-only, so the
           // representation is never retained just to report its size (#26).
-          const bytes = await runXclipCount(['-o', '-selection', 'clipboard', '-t', target]);
+          const bytes = await runXclipStream(
+            ['-o', '-selection', 'clipboard', '-t', target],
+            countBytes,
+          );
           rawTypes.push({ type: target, bytes });
         } catch {
           // TARGETS advertised this type but reading it failed — report the
@@ -201,63 +260,45 @@ export class LinuxX11Backend implements ClipboardBackend {
     return { rawTypes, ...buildInspectFormats(semanticSet) };
   }
 
+  /**
+   * Presence is decided from TARGETS, never from a conversion succeeding: an
+   * `xclip`-owned selection — the state this backend's own writes leave —
+   * answers any requested target with its one buffer. A listed representation
+   * is read as-is, so a zero-byte one is an empty success.
+   */
   async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
-    switch (format) {
-      case 'text': {
-        let lastError: unknown;
-        for (const target of TEXT_TARGETS) {
-          try {
-            const { window, totalByteSize } = await runXclipWindow(
-              ['-o', '-selection', 'clipboard', '-t', target],
-              range,
-            );
-            return { format: 'text', content: window, totalByteSize };
-          } catch (error) {
-            if (error instanceof Error && error.message.startsWith('xclip not found')) throw error;
-            lastError = error;
-          }
-        }
-        throw lastError;
-      }
-      case 'html': {
-        const { window, totalByteSize } = await runXclipWindow(
-          ['-o', '-selection', 'clipboard', '-t', 'text/html'],
-          range,
+    const offered = await listTargets();
+    if (offered.length === 0) {
+      throw clipboardOutcome(PLATFORM, 'The clipboard is empty.', { category: 'empty' });
+    }
+    const candidates = FORMAT_TARGETS[format].filter((target) => offered.includes(target));
+    if (candidates.length === 0) {
+      throw clipboardOutcome(
+        PLATFORM,
+        `No ${format} representation on the clipboard (offered: ${offered.join(', ')}).`,
+        { category: 'format_unavailable' },
+      );
+    }
+
+    let lastError: unknown;
+    for (const target of candidates) {
+      try {
+        const { window, totalByteSize } = await runXclipStream(
+          ['-o', '-selection', 'clipboard', '-t', target],
+          (stdout) => collectByteWindow(stdout, range),
         );
-        if (totalByteSize === 0) throw new Error('HTML format not found on clipboard');
-        return { format: 'html', content: window, totalByteSize };
-      }
-      case 'rtf': {
-        // Try text/rtf first, then application/rtf
-        let result: { totalByteSize: number; window: Buffer };
-        try {
-          result = await runXclipWindow(['-o', '-selection', 'clipboard', '-t', 'text/rtf'], range);
-        } catch {
-          result = await runXclipWindow(
-            ['-o', '-selection', 'clipboard', '-t', 'application/rtf'],
-            range,
-          );
-        }
-        if (result.totalByteSize === 0) throw new Error('RTF format not found on clipboard');
-        return { format: 'rtf', content: result.window, totalByteSize: result.totalByteSize };
-      }
-      case 'image': {
-        const { window, totalByteSize } = await runXclipWindow(
-          ['-o', '-selection', 'clipboard', '-t', 'image/png'],
-          range,
-        );
-        if (totalByteSize === 0) throw new Error('Image format not found on clipboard');
         // xclip hands over opaque bytes with no dimension API — read them out of
         // the PNG header so Linux reads carry what macOS and Windows report.
         // The header only lives in the window when the window starts at byte 0.
-        return {
-          format: 'image',
-          content: window,
-          totalByteSize,
-          ...(range.offset === 0 ? readPngDimensions(window) : {}),
-        };
+        const dimensions =
+          format === 'image' && range.offset === 0 ? readPngDimensions(window) : {};
+        return { format, content: window, totalByteSize, ...dimensions };
+      } catch (error) {
+        if (isClipboardOutcome(error) && error.category === 'clipboard_unavailable') throw error;
+        lastError = error;
       }
     }
+    throw lastError;
   }
 
   async write(
@@ -265,12 +306,9 @@ export class LinuxX11Backend implements ClipboardBackend {
     format: 'text' | 'html',
   ): Promise<{ format: 'text' | 'html'; byteSize: number }> {
     const buf = Buffer.from(content, 'utf8');
-    if (format === 'text') {
-      await runXclip(['-i', '-selection', 'clipboard', '-t', 'UTF8_STRING'], buf);
-      return { format: 'text', byteSize: buf.byteLength };
-    }
-    await runXclip(['-i', '-selection', 'clipboard', '-t', 'text/html'], buf);
-    return { format: 'html', byteSize: buf.byteLength };
+    const target = format === 'text' ? 'UTF8_STRING' : 'text/html';
+    await runXclipInput(['-i', '-selection', 'clipboard', '-t', target], buf);
+    return { format, byteSize: buf.byteLength };
   }
 
   async clear(): Promise<void> {
