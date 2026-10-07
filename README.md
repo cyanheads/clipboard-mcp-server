@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -39,33 +39,24 @@ The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write
 
 ### `clipboard_read` <sub>tool</sub>
 
-- `auto` returns the richest format explicitly present — priority: image > html > rtf > text — moving on to the next one when a listed format can't be read (an image no decoder accepts); `format` requests a specific one instead
-- Size limits: 512 KB for text/HTML/RTF, 5 MB for images (raw bytes before base64 expansion)
-- Content above the limit reads via `offset`/`limit` slicing — pass `offset` to read a bounded window (`limit` is optional, at least 4, and clamped to the format's size limit) and follow the returned `nextOffset` until `complete` is `true`
-- Every read returns `representationId`, an opaque token for the value and format it was cut from — the same across full and sliced reads of an unchanged value. Pass it back with each `nextOffset`: if another application copied in between (even a same-size replacement), or `auto` now resolves to a different format, the continuation returns no bytes and fails with `representation_changed`. Linux and Windows derive it from a SHA-256 of the full representation, macOS from `NSPasteboard.changeCount`
-- `image` returns base64-encoded PNG data, with `width`/`height` whenever the capture carries a readable PNG header. Only a response holding the whole image attaches an image block; image slices are PNG byte chunks, not standalone images — a partial slice carries its base64 and byte range in the text, and the chunks are base64-decoded separately and their bytes concatenated in offset order
-- A text, HTML, RTF, or image format that is present but zero bytes long returns empty content, not an error (a zero-byte image attaches no image block)
-- Typed errors: `format_unavailable` when the requested format isn't on the clipboard (or the clipboard is empty), `content_too_large` when no `offset`/`limit` was given and content exceeds the size limit, `representation_changed` when the clipboard changed after the slice that returned the given `representationId`, or while the read itself was running, `clipboard_unavailable` when the platform helper is missing or can't reach the desktop session, `inspect_unreadable` when `auto` can't read the clipboard's type listing (an explicit format reads without it)
+- Read `text`, `html`, `rtf`, or `image`; `auto` selects the richest present format (image > html > rtf > text). Whole-read limits: 512 KB text/HTML/RTF, 5 MB image
+- Returns `format`, `content`, byte sizes, `complete`, and `representationId`; images are base64 PNG with optional `width`/`height`. Failures carry `format_unavailable`, `content_too_large`, `representation_changed`, `clipboard_unavailable`, or `inspect_unreadable`
+- For larger values, use byte `offset`/`limit` (minimum limit 4, capped per format), then pass each `nextOffset` as `offset` along with `representationId` until complete. Image slices are byte chunks: decode each separately and concatenate in order; only a whole image attaches an image block
 
 ---
 
 ### `clipboard_write` <sub>tool</sub>
 
-- Exactly one of `content` or `clear: true` — an empty `content`, both, or neither is rejected as invalid input
-- `format: "html"` writes HTML; macOS and Windows also publish an auto-generated, tag-stripped plain-text fallback. Linux has no stripped fallback — Wayland also offers the markup under the plain-text types, and X11 advertises only `text/html` but answers a plain-text request (e.g. `UTF8_STRING`) with the same markup, so a plain-text paste can receive raw HTML
-- Typed `clipboard_unavailable` error when the platform helper is missing or can't reach the desktop session
-- `clear: true` removes every representation instead of writing (needs `xsel` alongside `xclip` on Linux X11) and returns `cleared: true`, `byteSize: 0`, no `format`
-- Returns `previousContent` — the plain text on the clipboard immediately before the write or clear, for undoing an unintended overwrite — absent when the clipboard was empty, held no text representation, or that text exceeded the 512 KB read limit
-- Size limit: 1 MB, past which a typed `content_too_large` error is returned
-- Not registered when `CLIPBOARD_READ_ONLY` is set, which gates clearing along with writing
+- Supply non-empty `content` or `clear: true`, exclusively; `format` accepts `text` or `html`, with a 1 MB write limit. HTML gets a stripped plain-text fallback on macOS/Windows; Linux plain-text pastes can receive markup
+- Returns `format`/`byteSize`, or `cleared: true` with zero bytes; optional `previousContent` holds prior plain text within the 512 KB read limit. Failures carry `content_too_large` or `clipboard_unavailable`; X11 clear requires `xsel`
+- `CLIPBOARD_READ_ONLY` disables both writes and clears by removing the tool from `tools/list`
 
 ---
 
 ### `clipboard_inspect` <sub>tool</sub>
 
-- Returns `primaryFormat` (richest present — image > html > rtf > text — or `empty`) and `availableFormats` — only the formats `clipboard_read` can return, each backed by at least one representation that was read (the one exception: an image whose bytes no decoder accepts is listed, but reading it as `image` fails `format_unavailable`, and `auto` moves on to the next format)
-- Returns `rawTypes` — every raw platform type identifier (UTIs on macOS, TARGETS on X11/Wayland, format names on Windows) with its measured `bytes`, where `0` means present and empty; a type the platform doesn't size (e.g. `TARGETS`) has no `bytes`, and one whose data was nil or unreadable carries `measurementFailed: true` and no `bytes` — never a false zero
-- Typed `inspect_unreadable` error when the platform helper's output cannot be read, instead of reporting an empty clipboard; typed `clipboard_unavailable` when the helper is missing or can't reach the desktop session
+- Returns `primaryFormat` (image > html > rtf > text, or `empty`) and `availableFormats` for choosing a read format
+- `rawTypes` lists platform identifiers with measured `bytes`, or `measurementFailed` when unreadable. Failures carry `inspect_unreadable` or `clipboard_unavailable`
 
 ---
 
@@ -170,8 +161,9 @@ pacman -S wl-clipboard      # Arch
 | `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. `auto` resolves to `stateful`. This server defaults to `stateless` — it keeps no per-session state. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `notice`, `warning`, `error`). | `info` |
+| `LOG_TOOL_FAILURE_PAYLOADS` | Log failed tool arguments/results, capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (16384). Redaction is by key name; secrets inside clipboard content are not redacted. | `false` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
-| `CLIPBOARD_READ_ONLY` | Serve the clipboard read-only. When `true`, `clipboard_write` is not registered — absent from `tools/list` and uncallable, though still shown in a disabled state on the manifest and landing page. Accepts `true/false/1/0/yes/no/on/off`; an unrecognized value fails startup. | `false` |
+| `CLIPBOARD_READ_ONLY` | Serve the clipboard read-only. When `true`, `clipboard_write` is absent from the manifest and `tools/list` and uncallable, but shown as disabled on the landing page and startup log. Accepts `true/false/1/0/yes/no/on/off`; an unrecognized value fails startup. | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 

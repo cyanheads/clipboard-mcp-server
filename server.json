@@ -12,18 +12,8 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/clipboard-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.2.5",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:stdio"
-        }
-      ],
       "environmentVariables": [
         {
           "name": "MCP_LOG_LEVEL",
@@ -34,7 +24,7 @@
         },
         {
           "name": "CLIPBOARD_READ_ONLY",
-          "description": "Serve the clipboard read-only. When true, clipboard_write is not registered: it is absent from tools/list and uncallable, though still listed in a disabled state on the manifest and landing page. Accepts true/false/1/0/yes/no/on/off.",
+          "description": "Serve the clipboard read-only. When true, clipboard_write is not registered: it is absent from tools/list and uncallable, absent from the manifest but shown as disabled on the landing page and startup log. Accepts true/false/1/0/yes/no/on/off.",
           "format": "string",
           "isRequired": false,
           "default": "false"
@@ -48,19 +38,15 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/clipboard-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.2.5",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:http"
-        }
-      ],
       "environmentVariables": [
+        {
+          "name": "MCP_TRANSPORT_TYPE",
+          "description": "Selects the HTTP transport.",
+          "format": "string",
+          "value": "http"
+        },
         {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",
@@ -112,7 +98,7 @@
         },
         {
           "name": "CLIPBOARD_READ_ONLY",
-          "description": "Serve the clipboard read-only. When true, clipboard_write is not registered: it is absent from tools/list and uncallable, though still listed in a disabled state on the manifest and landing page. Accepts true/false/1/0/yes/no/on/off.",
+          "description": "Serve the clipboard read-only. When true, clipboard_write is absent from the manifest and tools/list and uncallable, but shown as disabled on the landing page and startup log. Accepts true/false/1/0/yes/no/on/off.",
           "format": "string",
           "isRequired": false,
           "default": "false"

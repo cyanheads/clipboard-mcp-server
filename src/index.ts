@@ -18,7 +18,7 @@ import { initClipboardService } from './services/clipboard/clipboard-service.js'
  * then re-parse.
  *
  * Order matters. The framework loads `.env` lazily, on the first `config`
- * property read, and dotenv never overwrites a key already in `process.env`.
+ * property read, and process.loadEnvFile never overwrites a key already in `process.env`.
  * Reading a property first therefore loads `.env` before `??=` runs, leaving
  * precedence at shell env > `.env` > these defaults. Applying the defaults
  * before that read would shadow an operator's `.env` value.

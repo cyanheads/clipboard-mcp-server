@@ -23,7 +23,7 @@ const ServerConfigSchema = z.object({
   readOnly: envBoolean
     .default(false)
     .describe(
-      'Serve the clipboard read-only. When true, clipboard_write is not registered: it stays visible on the manifest and landing page but is absent from tools/list and uncallable. Defaults to false.',
+      'Serve the clipboard read-only. When true, clipboard_write is absent from the manifest and tools/list and uncallable, but shown as disabled on the landing page and startup log. Defaults to false.',
     ),
 });
 
