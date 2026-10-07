@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-10-07
+
+Framework maintenance repairs integer values supplied for string fields and adds request IDs to tool failures.
+
 ## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-09-24
 
 The integration test harness binds an OS-assigned port instead of a random one that could land on fetch-blocked port 3659. Test-only release; the published runtime is unchanged.
