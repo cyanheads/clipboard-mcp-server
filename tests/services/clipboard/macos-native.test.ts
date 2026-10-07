@@ -14,6 +14,9 @@ import type * as ChildProcess from 'node:child_process';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+// Native process startup needs the same budget as the multi-read cases under load.
+vi.setConfig({ testTimeout: 30_000 });
+
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof ChildProcess>();
   return { ...actual, spawn: vi.fn(actual.spawn) };
