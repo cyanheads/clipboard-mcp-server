@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -23,7 +23,7 @@
 
 ## Overview
 
-The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write, and inspect text, HTML, RTF, and image content from any MCP client. Runs as a stdio process or a local Streamable HTTP server.
+The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write, and inspect text, HTML, RTF, and image content.
 
 ### Tools
 
@@ -69,7 +69,7 @@ Clipboard-specific:
 - Cross-platform backend detection at startup — macOS (osascript/JXA), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
 - Semantic format mapping — platform-native type identifiers (UTIs, TARGETS, Windows format names) mapped to `text`, `html`, `rtf`, `image` across all backends
 - Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; on Linux the HTML is the only payload, which plain-text paste targets can also receive
-- Image support — every backend returns PNG as base64 with width/height (Linux backends read them from the PNG header)
+- Image support — every backend returns PNG as base64, with width/height when the returned bytes carry a readable PNG header (Linux backends read them from that header, so only a whole image or a slice starting at offset 0 has them)
 
 Agent-friendly output:
 
@@ -82,52 +82,54 @@ Agent-friendly output:
 
 ## Getting started
 
-Add the following to your MCP client configuration file.
-
-```json
-{
-  "mcpServers": {
-    "clipboard-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/clipboard-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
-```
-
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "clipboard-mcp-server": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@cyanheads/clipboard-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
+Add it to Claude Code:
 
 ```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
+claude mcp add clipboard-mcp-server -- npx -y @cyanheads/clipboard-mcp-server
 ```
+
+For other clients, add this to the MCP config file:
+
+```json
+{
+  "mcpServers": {
+    "clipboard-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/clipboard-mcp-server"]
+    }
+  }
+}
+```
+
+Linux needs a clipboard helper installed first — see [Prerequisites](#prerequisites). For a source build or Streamable HTTP, see [Running the server](#running-the-server).
+
+---
+
+## Configuration
+
+| Variable | Description | Default |
+|:---------|:------------|:--------|
+| `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
+| `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
+| `MCP_HTTP_HOST` | Hostname for HTTP server. | `127.0.0.1` |
+| `MCP_HTTP_ENDPOINT_PATH` | Endpoint path for the HTTP server. | `/mcp` |
+| `MCP_HTTP_MAX_BODY_BYTES` | Max inbound JSON-RPC request body, in bytes. Raised above the framework's 1 MiB default so a full-size `clipboard_write` survives JSON escaping (worst case costs 6 wire bytes per source byte). `0` disables the guard and defers to the reverse proxy. | `7340032` |
+| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. `auto` resolves to `stateful`. This server defaults to `stateless` — it keeps no per-session state. | `stateless` |
+| `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
+| `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `notice`, `warning`, `error`). | `info` |
+| `LOG_TOOL_FAILURE_PAYLOADS` | Log failed tool arguments/results, capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (16384). Redaction is by key name; secrets inside clipboard content are not redacted. | `false` |
+| `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
+| `CLIPBOARD_READ_ONLY` | Serve the clipboard read-only. When `true`, `clipboard_write` is absent from `tools/list` and uncallable, but listed as disabled in the server manifest, landing page, and startup log. Accepts `true/false/1/0/yes/no/on/off`; an unrecognized value fails startup. | `false` |
+
+See [`.env.example`](./.env.example) for the full list of optional overrides.
+
+---
+
+## Running the server
 
 ### Prerequisites
 
-Bun 1.4.0+ or Node.js 24+.
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+), plus the platform's clipboard helper:
 
 **macOS:** No additional tools required — `osascript` is built in.
 
@@ -147,48 +149,34 @@ pacman -S wl-clipboard      # Arch
 
 **Windows:** PowerShell 5.1+ (built-in on Windows 10 and later).
 
----
-
-## Configuration
-
-| Variable | Description | Default |
-|:---------|:------------|:--------|
-| `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
-| `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
-| `MCP_HTTP_HOST` | Hostname for HTTP server. | `127.0.0.1` |
-| `MCP_HTTP_ENDPOINT_PATH` | Endpoint path for the HTTP server. | `/mcp` |
-| `MCP_HTTP_MAX_BODY_BYTES` | Max inbound JSON-RPC request body, in bytes. Raised above the framework's 1 MiB default so a full-size `clipboard_write` survives JSON escaping (worst case costs 6 wire bytes per source byte). `0` disables the guard and defers to the reverse proxy. | `7340032` |
-| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. `auto` resolves to `stateful`. This server defaults to `stateless` — it keeps no per-session state. | `stateless` |
-| `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
-| `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `notice`, `warning`, `error`). | `info` |
-| `LOG_TOOL_FAILURE_PAYLOADS` | Log failed tool arguments/results, capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (16384). Redaction is by key name; secrets inside clipboard content are not redacted. | `false` |
-| `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
-| `CLIPBOARD_READ_ONLY` | Serve the clipboard read-only. When `true`, `clipboard_write` is absent from the manifest and `tools/list` and uncallable, but shown as disabled on the landing page and startup log. Accepts `true/false/1/0/yes/no/on/off`; an unrecognized value fails startup. | `false` |
-
-See [`.env.example`](./.env.example) for the full list of optional overrides.
-
----
-
-## Running the server
-
 ### Local development
 
-```sh
-# One-time build
-bun run rebuild
+- **Clone and install:**
 
-# Run the built server
-bun run start:stdio
-# or
-bun run start:http
-```
+  ```sh
+  git clone https://github.com/cyanheads/clipboard-mcp-server.git
+  cd clipboard-mcp-server && bun install
+  ```
 
-### Checks and tests
+- **Build and run:**
 
-```sh
-bun run devcheck   # Lint, format, typecheck, security
-bun run test       # Vitest test suite
-```
+  ```sh
+  # One-time build
+  bun run rebuild
+
+  # Run the built server
+  bun run start:stdio
+  # or
+  bun run start:http   # listens at http://127.0.0.1:3010/mcp
+  ```
+
+- **Run checks and tests:**
+
+  ```sh
+  bun run devcheck   # Lint, format, typecheck, security
+  bun run test       # Vitest test suite
+  bun run lint:mcp   # Validate MCP definitions against spec
+  ```
 
 ---
 

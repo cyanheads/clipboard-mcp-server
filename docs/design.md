@@ -102,7 +102,9 @@ The service is thin: no retries (clipboard ops are local and near-instant), no H
 
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
-| _(none)_ | — | No API keys or external config needed. Platform detected at startup via `process.platform`. |
+| `CLIPBOARD_READ_ONLY` | No | Serve the clipboard read-only: `clipboard_write` is absent from `tools/list` and uncallable, but listed as disabled in the server manifest, landing page, and startup log. Accepts `true/false/1/0/yes/no/on/off`; an unrecognized value fails startup. Default `false`. |
+
+No API keys are needed. The platform is detected at startup via `process.platform`.
 
 ---
 
@@ -277,23 +279,32 @@ annotations: { readOnlyHint: true, openWorldHint: false }
 
 ```ts
 input: z.object({
-  content: z.string()
-    .describe('Content to write to the clipboard.'),
+  content: z.string().optional()
+    .describe('Content to write to the clipboard. Required unless clear: true, which takes no content.'),
   format: z.enum(['text', 'html'])
     .default('text')
     .describe(
       'Format of the content. "text" writes plain text. ' +
       '"html" writes HTML; on macOS and Windows it also publishes an auto-generated, ' +
       'tag-stripped plain-text fallback. On Linux there is no stripped fallback: Wayland also ' +
-      'offers the markup under the plain-text types, and X11 hands the same markup to a plain-text request.'
+      'offers the markup under the plain-text types, and X11 hands the same markup to a plain-text request. ' +
+      'Ignored when clear is true.'
     ),
+  clear: z.boolean()
+    .default(false)
+    .describe('Set true to clear the clipboard instead of writing. Cannot be combined with content.'),
 })
+  // exactly one of a non-empty content or clear: true
 
 output: z.object({
-  format: z.enum(['text', 'html'])
-    .describe('Format written.'),
+  format: z.enum(['text', 'html']).optional()
+    .describe('Format written. Absent when this call cleared the clipboard.'),
   byteSize: z.number().int()
-    .describe('Byte size of the written content.'),
+    .describe('Byte size of the written content. Zero when the clipboard was cleared.'),
+  cleared: z.boolean().optional()
+    .describe('True when this call cleared the clipboard instead of writing content.'),
+  previousContent: z.string().optional()
+    .describe('Plain-text content on the clipboard before this write or clear, if any and within size limits.'),
 })
 
 errors: [
@@ -499,11 +510,11 @@ Not all formats are available on all platforms:
 | Type inspection | Yes (`pb.types`) | Yes (`TARGETS` / `--list-types`) | Yes (`.GetFormats()`) |
 | Byte size per type | Yes (nil data → `measurementFailed`) | Recognized types only, read to measure | Strings, byte arrays, and streams only |
 
-When a format is unavailable on a platform, `clipboard_read` returns `format_unavailable` with a message noting platform support. `clipboard_inspect` only reports formats actually present.
+When a requested format is not on the clipboard, `clipboard_read` returns `format_unavailable` (`Format "<format>" is not present on the clipboard.`). `clipboard_inspect` only reports formats actually present.
 
 **Required CLI tools:**
 - macOS: none (`osascript` is built in)
-- Linux X11: `xclip` (`apt install xclip` / `pacman -S xclip`)
+- Linux X11: `xclip`, plus `xsel` for `clipboard_write`'s `clear` (`apt install xclip xsel` / `pacman -S xclip xsel`)
 - Linux Wayland: `wl-clipboard` (`apt install wl-clipboard`)
 - Windows: PowerShell 5.1+ (built-in on Windows 10+)
 
