@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-28
+
+Publishes the clipboard-guide Agent Skill over MCP (skill://clipboard-guide/SKILL.md), adopts mcp-ts-core 0.13.18 with the MCP SDK at ^2.4.0, and adds the Agent Plugins root manifests.
+
 ## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-10-07
 
 Framework maintenance repairs integer values supplied for string fields and adds request IDs to tool failures.

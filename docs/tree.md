@@ -1,6 +1,6 @@
 # clipboard-mcp-server - Directory Structure
 
-Generated on: 2026-10-07 12:31:18
+Generated on: 2026-10-29 04:04:53
 
 ```text
 clipboard-mcp-server/
@@ -26,6 +26,7 @@ clipboard-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -38,6 +39,8 @@ clipboard-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -136,6 +139,9 @@ clipboard-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── clipboard-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -169,6 +175,8 @@ clipboard-mcp-server/
 │   │   └── http-transport.test.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── security/
 │   │   └── injection.test.ts
 │   ├── services/
@@ -203,7 +211,9 @@ clipboard-mcp-server/
 ├── devcheck.config.json
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
