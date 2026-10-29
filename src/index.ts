@@ -58,8 +58,10 @@ function buildInstructions(writeEnabled: boolean): string {
     ? 'There is no history — the clipboard is a single live slot, so clipboard_read returns whatever is on it right now and clipboard_write replaces it.'
     : 'There is no history — the clipboard is a single live slot, so clipboard_read returns whatever is on it right now.';
   const formats =
-    'A clipboard holds one item in several formats (text/html/rtf/image); call clipboard_inspect first to see what is present, and prefer clipboard_read with format "auto". Images come back as base64 PNG; read in offset/limit slices, they are PNG byte chunks to base64-decode and concatenate in offset order, not standalone images. When paging with nextOffset, pass back the returned representationId so a clipboard change between slices fails instead of mixing two values.';
-  return `${lead} ${slot} ${formats}`;
+    'A clipboard holds one item in several formats (text/html/rtf/image); clipboard_inspect shows what is present, and clipboard_read with format "auto" returns the richest one — an image whenever one is present — so name "html" or "text" when the user wants the copied text. Images come back as base64 PNG; read in offset/limit slices, they are PNG byte chunks to base64-decode and concatenate in offset order, not standalone images. When paging with nextOffset, pass back the returned representationId so a clipboard change between slices fails instead of mixing two values.';
+  const skill =
+    'The clipboard-guide skill (skill://clipboard-guide/SKILL.md) carries the gates for choosing a format, paging large values, and replacing the clipboard without losing what the user copied.';
+  return `${lead} ${slot} ${formats} ${skill}`;
 }
 
 await createApp({
@@ -71,6 +73,7 @@ await createApp({
   tools: [clipboardInspect, clipboardRead, writeTool],
   resources: [],
   prompts: [],
+  skills: 'skills',
   async setup(core) {
     await initClipboardService(core.config, core.storage);
   },

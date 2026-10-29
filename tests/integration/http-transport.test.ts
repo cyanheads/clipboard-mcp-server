@@ -89,9 +89,15 @@ describe('default HTTP launch', () => {
     const instructions = result.instructions ?? '';
     expect(instructions).toContain('There is no history');
     expect(instructions).toContain('single live slot');
-    expect(instructions).toContain('call clipboard_inspect first');
+    expect(instructions).toContain('clipboard_inspect shows what is present');
     expect(instructions).toContain('format "auto"');
+    expect(instructions).toContain('an image whenever one is present');
     expect(instructions).toContain('clipboard_write replaces it');
+  });
+
+  it('points at the published clipboard-guide skill', async () => {
+    const result = resultOf<InitializeResult>(await initialize(server.url));
+    expect(result.instructions ?? '').toContain('skill://clipboard-guide/SKILL.md');
   });
 
   it('explains image slices and the representationId continuation', async () => {
