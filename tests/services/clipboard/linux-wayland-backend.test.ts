@@ -13,6 +13,7 @@ import { spawn } from 'node:child_process';
 import { LinuxWaylandBackend } from '@/services/clipboard/linux-wayland-backend.js';
 import { REAL_PNG_13x7 } from './png-fixtures.js';
 import { requestedType, scriptedSpawn } from './scripted-spawn.js';
+import { URI_LIST, URI_LIST_OMITTED, URI_LIST_PATHS } from './uri-list-fixtures.js';
 
 const mockSpawn = vi.mocked(spawn);
 
@@ -185,6 +186,7 @@ describe('LinuxWaylandBackend', () => {
         expect(result).toEqual({
           primaryFormat: 'empty',
           availableFormats: [],
+          itemCount: 1,
           rawTypes: [{ type }],
         });
       },
@@ -221,6 +223,7 @@ describe('LinuxWaylandBackend', () => {
       expect(result).toEqual({
         primaryFormat: 'empty',
         availableFormats: [],
+        itemCount: 1,
         rawTypes: [{ type: 'text/html', measurementFailed: true }],
       });
     });
@@ -727,6 +730,7 @@ describe('LinuxWaylandBackend — typed outcomes from wl-clipboard diagnostics (
     await expect(new LinuxWaylandBackend().inspect()).resolves.toEqual({
       primaryFormat: 'empty',
       availableFormats: [],
+      itemCount: 0,
       rawTypes: [],
     });
     await expect(new LinuxWaylandBackend().read('text', FULL)).rejects.toMatchObject({
@@ -898,5 +902,235 @@ describe('LinuxWaylandBackend — streamed SHA-256 revision (#38)', () => {
     );
     mockSpawn.mockReturnValueOnce(listing('text/html')).mockReturnValueOnce(fakeChild({}));
     expect((await backend.read('html', FULL)).revision).toBe(sha256(Buffer.alloc(0)));
+  });
+});
+
+/**
+ * Serve a Wayland offer of `types`: `--list-types` lists them, and each listed
+ * type streams its value in `chunkSize`-byte chunks; any other type fails the
+ * way wl-clipboard 2.2 reports it. Returns the types requested, in order
+ * (`--list-types` for a listing).
+ */
+function offer(types: Record<string, string | Buffer>, chunkSize = 16) {
+  const requested: (string | undefined)[] = [];
+  mockSpawn.mockImplementation(((_command: string, args: readonly string[]) => {
+    if (args.includes('--list-types')) {
+      requested.push('--list-types');
+      return listing(...Object.keys(types));
+    }
+    const type = requestedType(args);
+    requested.push(type);
+    const value = type === undefined ? undefined : types[type];
+    if (value === undefined) {
+      return fakeChild({
+        exitCode: 1,
+        stderr: `Clipboard content is not available as requested type "${type}"`,
+      });
+    }
+    const bytes = Buffer.from(value);
+    const chunks = Array.from({ length: Math.ceil(bytes.byteLength / chunkSize) }, (_, i) =>
+      bytes.subarray(i * chunkSize, (i + 1) * chunkSize),
+    );
+    return fakeChild({ stdout: chunks });
+  }) as unknown as typeof spawn);
+  return requested;
+}
+
+describe('LinuxWaylandBackend — one item per offer (#57)', () => {
+  let backend: LinuxWaylandBackend;
+  beforeEach(() => {
+    backend = new LinuxWaylandBackend();
+    vi.resetAllMocks();
+  });
+
+  it('inspect reports one item for an offer', async () => {
+    offer({ 'text/plain': 'abc' });
+    expect((await backend.inspect()).itemCount).toBe(1);
+  });
+
+  it('inspect reports no items when nothing is copied', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'Nothing is copied' }));
+    expect((await backend.inspect()).itemCount).toBe(0);
+  });
+
+  it.each([
+    ['text', { 'text/plain': 'abc' }],
+    ['html', { 'text/html': '<b>x</b>' }],
+    ['rtf', { 'text/rtf': '{\\rtf1 x}' }],
+    ['image', { 'image/png': REAL_PNG_13x7 }],
+    ['files', { 'text/uri-list': 'file:///a' }],
+  ] as const)('a %s read reports one item and no item scope', async (format, types) => {
+    offer(types);
+    const result = await backend.read(format, FULL);
+    expect(result.itemCount).toBe(1);
+    expect(result).not.toHaveProperty('itemScope');
+  });
+
+  it('item 0 reads exactly what a read without item does', async () => {
+    offer({ 'text/plain': 'abc' });
+    const whole = await backend.read('text', FULL);
+    expect(await backend.read('text', FULL, 0)).toEqual(whole);
+  });
+
+  it.each([1, 2, 41])(
+    'item %i fails format_unavailable after listing the types, reading none',
+    async (item) => {
+      const requested = offer({ 'text/plain': 'abc', 'text/uri-list': 'file:///a' });
+      await expect(backend.read('text', FULL, item)).rejects.toMatchObject({
+        category: 'format_unavailable',
+        message: expect.stringContaining(`item ${item}`),
+      });
+      expect(requested).toEqual(['--list-types']);
+    },
+  );
+
+  it('item 1 when nothing is copied is still an empty clipboard', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'Nothing is copied' }));
+    await expect(backend.read('text', FULL, 1)).rejects.toMatchObject({ category: 'empty' });
+  });
+});
+
+describe('LinuxWaylandBackend — files from text/uri-list (#59)', () => {
+  let backend: LinuxWaylandBackend;
+  beforeEach(() => {
+    backend = new LinuxWaylandBackend();
+    vi.resetAllMocks();
+  });
+
+  const joined = Buffer.from(URI_LIST_PATHS.join('\n'));
+  const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('base64url');
+
+  it('inspect lists files, the richest format, beside the text and icon a file manager offers', async () => {
+    offer({
+      'text/uri-list': URI_LIST,
+      'text/plain;charset=utf-8': 'a b.txt',
+      'image/png': REAL_PNG_13x7,
+      'application/vnd.portal.filetransfer': 'abc123',
+    });
+    expect(await backend.inspect()).toEqual({
+      primaryFormat: 'files',
+      availableFormats: ['text', 'image', 'files'],
+      itemCount: 1,
+      rawTypes: [
+        { type: 'text/uri-list', bytes: Buffer.byteLength(URI_LIST) },
+        { type: 'text/plain;charset=utf-8', bytes: 7 },
+        { type: 'image/png', bytes: REAL_PNG_13x7.byteLength },
+        { type: 'application/vnd.portal.filetransfer' },
+      ],
+    });
+  });
+
+  it('reads file:///a%20b beside https://x.test as /a b', async () => {
+    offer({ 'text/uri-list': 'file:///a%20b\r\nhttps://x.test\r\n' });
+    expect((await backend.read('files', FULL)).content.toString('utf8')).toBe('/a b');
+  });
+
+  it('reads the local paths LF-joined, hashed, with the left-out count and one item', async () => {
+    const requested = offer({ 'text/uri-list': URI_LIST });
+    expect(await backend.read('files', FULL)).toEqual({
+      format: 'files',
+      content: joined,
+      totalByteSize: joined.byteLength,
+      revision: sha256(joined),
+      itemCount: 1,
+      omittedPaths: URI_LIST_OMITTED,
+    });
+    expect(requested).toEqual(['--list-types', 'text/uri-list']);
+    expect(mockSpawn).toHaveBeenLastCalledWith(
+      'wl-paste',
+      ['--no-newline', '-t', 'text/uri-list'],
+      expect.any(Object),
+    );
+  });
+
+  it('an unterminated one-line uri-list lists files, and the read returns its path', async () => {
+    offer({ 'text/uri-list': 'file:///a' });
+    expect(await backend.inspect()).toEqual({
+      primaryFormat: 'files',
+      availableFormats: ['files'],
+      itemCount: 1,
+      rawTypes: [{ type: 'text/uri-list', bytes: 9 }],
+    });
+    expect((await backend.read('files', FULL)).content.toString('utf8')).toBe('/a');
+  });
+
+  it('carries no left-out count when every path is listed', async () => {
+    offer({ 'text/uri-list': 'file:///a\r\nfile:///b\r\n' });
+    const paths = Buffer.from('/a\n/b');
+    expect(await backend.read('files', FULL)).toEqual({
+      format: 'files',
+      content: paths,
+      totalByteSize: paths.byteLength,
+      revision: sha256(paths),
+      itemCount: 1,
+    });
+  });
+
+  it('pages through the paths: every window reassembles them under one revision', async () => {
+    for (const limit of [1, 5, 13]) {
+      const pieces: Buffer[] = [];
+      for (let offset = 0; offset < joined.byteLength; offset += limit) {
+        offer({ 'text/uri-list': URI_LIST }, 7);
+        const slice = await backend.read('files', { offset, limit });
+        expect(slice.totalByteSize).toBe(joined.byteLength);
+        expect(slice.revision).toBe(sha256(joined));
+        pieces.push(slice.content);
+      }
+      expect(Buffer.concat(pieces).equals(joined)).toBe(true);
+    }
+    offer({ 'text/uri-list': URI_LIST });
+    const past = await backend.read('files', { offset: joined.byteLength + 10, limit: 10 });
+    expect(past.content.byteLength).toBe(0);
+    expect(past.totalByteSize).toBe(joined.byteLength);
+  });
+
+  it.each([
+    ['no file URI', 'https://x.test/\r\nurn:isbn:1\r\n'],
+    ['only remote hosts', 'file://other/srv/x\r\n'],
+    ['only paths it cannot list', 'file:///a%0Ab\r\nfile:///c%FF\r\n'],
+    ['only comments', '# file:///a\r\n'],
+    ['nothing', ''],
+  ])(
+    'a uri-list with %s offers no files: inspect leaves files out and a read is format_unavailable',
+    async (_label, list) => {
+      offer({ 'text/uri-list': list, 'text/plain': 'x' });
+      const inspected = await backend.inspect();
+      expect(inspected.availableFormats).toEqual(['text']);
+      expect(inspected.primaryFormat).toBe('text');
+      expect(inspected.rawTypes).toContainEqual({
+        type: 'text/uri-list',
+        bytes: Buffer.byteLength(list),
+      });
+      await expect(backend.read('files', FULL)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    },
+  );
+
+  it('an offer without text/uri-list has no files, and nothing is read to say so', async () => {
+    const requested = offer({ 'text/plain': '/home/u/a.txt' });
+    await expect(backend.read('files', FULL)).rejects.toMatchObject({
+      category: 'format_unavailable',
+      message: expect.stringMatching(/No files representation/),
+    });
+    expect(requested).toEqual(['--list-types']);
+  });
+
+  it('a uri-list that fails to read is a failed measurement, and files is not offered', async () => {
+    mockSpawn
+      .mockReturnValueOnce(listing('text/uri-list'))
+      .mockReturnValueOnce(fakeChild({ exitCode: 1, stderr: 'wl-paste: read failed' }));
+    expect(await backend.inspect()).toEqual({
+      primaryFormat: 'empty',
+      availableFormats: [],
+      itemCount: 1,
+      rawTypes: [{ type: 'text/uri-list', measurementFailed: true }],
+    });
+  });
+
+  it('characterization: a text read beside a uri-list reads the text and never reads the list', async () => {
+    const requested = offer({ 'text/uri-list': URI_LIST, 'text/plain': 'plain' });
+    expect((await backend.read('text', FULL)).content.toString('utf8')).toBe('plain');
+    expect(requested).toEqual(['--list-types', 'text/plain']);
   });
 });

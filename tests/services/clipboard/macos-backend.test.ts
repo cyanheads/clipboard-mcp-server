@@ -29,16 +29,42 @@ const FULL = { offset: 0, limit: 8 * 1024 * 1024 } as const;
 /** The pasteboard changeCount the modeled read scripts report as their revision. */
 const CHANGE_COUNT = '4217';
 
-/** The ranged-read envelope a JXA read script prints for a present representation, whole. */
+/**
+ * The ranged-read envelope a JXA read script prints for a present
+ * representation, whole, on a one-item pasteboard unless `extra` says otherwise.
+ */
 function jxaEnvelope(bytes: Buffer, extra: Record<string, number> = {}): string {
   return JSON.stringify({
     present: true,
     total: bytes.byteLength,
     contentBase64: bytes.toString('base64'),
     revision: CHANGE_COUNT,
+    itemCount: 1,
     ...extra,
   });
 }
+
+/** The `{ itemCount, hasFilePaths, types }` description the JXA inspection script prints. */
+function inspection(
+  types: unknown[],
+  { itemCount = types.length > 0 ? 1 : 0, hasFilePaths = false } = {},
+): string {
+  return JSON.stringify({ itemCount, hasFilePaths, types });
+}
+
+/** The JXA script text of an osascript invocation: the argument after `-e`. */
+function scriptOf(args: readonly string[]): string {
+  return args[args.indexOf('-e') + 1] ?? '';
+}
+
+/** The script of the most recent spawn. */
+function lastScript(): string {
+  const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+  return scriptOf(args);
+}
+
+/** Every format a read script exists for. */
+const READ_FORMATS = ['text', 'html', 'rtf', 'image', 'files'] as const;
 
 /** Create a fake child process that emits given stdout/stderr and closes with code. */
 function fakeChild(opts: {
@@ -84,7 +110,7 @@ describe('MacosBackend', () => {
 
   describe('inspect()', () => {
     it('returns empty result when no types on clipboard', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '[]' }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([]) }));
       const result = await backend.inspect();
       expect(result.primaryFormat).toBe('empty');
       expect(result.availableFormats).toEqual([]);
@@ -92,7 +118,7 @@ describe('MacosBackend', () => {
     });
 
     it('returns text format when only plain text is present', async () => {
-      const types = JSON.stringify([{ type: 'public.utf8-plain-text', bytes: 12 }]);
+      const types = inspection([{ type: 'public.utf8-plain-text', bytes: 12 }]);
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: types }));
       const result = await backend.inspect();
       expect(result.primaryFormat).toBe('text');
@@ -100,7 +126,7 @@ describe('MacosBackend', () => {
     });
 
     it('returns image as primaryFormat when image and text both present', async () => {
-      const types = JSON.stringify([
+      const types = inspection([
         { type: 'public.utf8-plain-text', bytes: 5 },
         { type: 'public.png', bytes: 1024 },
       ]);
@@ -114,15 +140,14 @@ describe('MacosBackend', () => {
     it.each(['public.png', 'public.tiff', 'com.apple.pict'])(
       'classifies supported image type %s as image',
       async (type) => {
-        mockSpawn.mockReturnValueOnce(
-          fakeChild({ stdout: JSON.stringify([{ type, bytes: 1024 }]) }),
-        );
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([{ type, bytes: 1024 }]) }));
 
         const result = await backend.inspect();
 
         expect(result).toEqual({
           primaryFormat: 'image',
           availableFormats: ['image'],
+          itemCount: 1,
           rawTypes: [{ type, bytes: 1024 }],
         });
       },
@@ -130,19 +155,20 @@ describe('MacosBackend', () => {
 
     it('retains a filename-list type without classifying it as an image', async () => {
       const type = 'NSFilenamesPboardType';
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify([{ type, bytes: 128 }]) }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([{ type, bytes: 128 }]) }));
 
       const result = await backend.inspect();
 
       expect(result).toEqual({
         primaryFormat: 'empty',
         availableFormats: [],
+        itemCount: 1,
         rawTypes: [{ type, bytes: 128 }],
       });
     });
 
     it('returns html as primaryFormat when html and text both present', async () => {
-      const types = JSON.stringify([
+      const types = inspection([
         { type: 'public.utf8-plain-text', bytes: 5 },
         { type: 'public.html', bytes: 200 },
       ]);
@@ -161,9 +187,9 @@ describe('MacosBackend', () => {
     it.each([
       ['a JSON string', '"public.utf8-plain-text"'],
       ['a JSON number', '42'],
-      ['an array of strings', '["public.html"]'],
-      ['entries missing a type', '[{"bytes":12}]'],
-      ['entries with a non-numeric size', '[{"type":"public.html","bytes":"big"}]'],
+      ['an array of strings', inspection(['public.html'])],
+      ['entries missing a type', inspection([{ bytes: 12 }])],
+      ['entries with a non-numeric size', inspection([{ type: 'public.html', bytes: 'big' }])],
     ])('surfaces %s as unreadable rather than an empty clipboard', async (_label, stdout) => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout }));
       await expect(backend.inspect()).rejects.toThrow(/unreadable/i);
@@ -178,21 +204,65 @@ describe('MacosBackend', () => {
     });
 
     it('still reports a genuinely empty pasteboard as an empty success', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '[]' }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([]) }));
       await expect(backend.inspect()).resolves.toEqual({
         primaryFormat: 'empty',
         availableFormats: [],
+        itemCount: 0,
         rawTypes: [],
       });
     });
   });
 
+  describe('inspect() — the description envelope (#57, #59)', () => {
+    it.each([
+      ['a bare type listing', '[]'],
+      ['null', 'null'],
+      ['a missing item count', JSON.stringify({ hasFilePaths: false, types: [] })],
+      [
+        'a non-integer item count',
+        JSON.stringify({ itemCount: 1.5, hasFilePaths: false, types: [] }),
+      ],
+      ['a negative item count', JSON.stringify({ itemCount: -1, hasFilePaths: false, types: [] })],
+      [
+        'a non-boolean file-path flag',
+        JSON.stringify({ itemCount: 1, hasFilePaths: 1, types: [] }),
+      ],
+      [
+        'a type listing that is not a list',
+        JSON.stringify({ itemCount: 0, hasFilePaths: false, types: {} }),
+      ],
+    ])('surfaces %s as unreadable', async (_label, stdout) => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout }));
+      await expect(backend.inspect()).rejects.toMatchObject({
+        _inspectUnreadable: true,
+        platform: 'macOS',
+      });
+    });
+
+    it('reports the pasteboard item count the script measured', async () => {
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: inspection([{ type: 'public.png', bytes: 75 }], { itemCount: 3 }) }),
+      );
+      await expect(backend.inspect()).resolves.toMatchObject({ itemCount: 3 });
+    });
+
+    it('the script counts pasteboardItems and flags only a path files can list before printing', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([]) }));
+      await backend.inspect();
+      const script = lastScript();
+      expect(script).toContain('const itemCount = Number(items.count);');
+      expect(script).toMatch(
+        /JSON\.stringify\(\{ itemCount: itemCount, hasFilePaths: filePaths\(items, 0, itemCount\)\.some\(listable\), types: result \}\);$/,
+      );
+    });
+  });
+
   describe('inspect() — nil data is a failed measurement (#41)', () => {
     it('the JXA listing reports nil data as measurementFailed, never as zero bytes', async () => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: '[]' }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([]) }));
       await backend.inspect();
-      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
-      const script = args.at(-1) ?? '';
+      const script = lastScript();
       expect(script).toContain('measurementFailed: true');
       expect(script).not.toMatch(/isNil\(\) \? 0/);
     });
@@ -203,17 +273,18 @@ describe('MacosBackend', () => {
         { type: 'public.utf8-plain-text', measurementFailed: true },
         { type: 'NSStringPboardType', measurementFailed: true },
       ];
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify(listing) }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection(listing) }));
       await expect(backend.inspect()).resolves.toEqual({
         primaryFormat: 'rtf',
         availableFormats: ['rtf'],
+        itemCount: 1,
         rawTypes: listing,
       });
     });
 
     it('a measured zero-byte text representation keeps text available', async () => {
       const listing = [{ type: 'public.utf8-plain-text', bytes: 0 }];
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify(listing) }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection(listing) }));
       await expect(backend.inspect()).resolves.toMatchObject({
         availableFormats: ['text'],
         rawTypes: listing,
@@ -233,20 +304,50 @@ describe('MacosBackend', () => {
       ['public.tiff', 'image'],
       ['com.apple.pict', 'image'],
     ])('characterization: %s maps to %s', async (type, format) => {
-      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify([{ type, bytes: 3 }]) }));
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([{ type, bytes: 3 }]) }));
       await expect(backend.inspect()).resolves.toMatchObject({ availableFormats: [format] });
     });
 
     it.each(['NSHTMLPboardType', 'NSRTFPboardType', 'NSRTFDPboardType'])(
       '%s, a name pb.types never lists, maps to no format',
       async (type) => {
-        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify([{ type, bytes: 3 }]) }));
+        mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([{ type, bytes: 3 }]) }));
         await expect(backend.inspect()).resolves.toMatchObject({
           availableFormats: [],
           primaryFormat: 'empty',
         });
       },
     );
+
+    it('public.file-url maps to files when an item resolves to a local path (#59)', async () => {
+      const listing = [
+        { type: 'public.file-url', bytes: 56 },
+        { type: 'NSFilenamesPboardType', bytes: 258 },
+        { type: 'public.png', bytes: 1024 },
+      ];
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: inspection(listing, { itemCount: 2, hasFilePaths: true }) }),
+      );
+      await expect(backend.inspect()).resolves.toEqual({
+        primaryFormat: 'files',
+        availableFormats: ['image', 'files'],
+        itemCount: 2,
+        rawTypes: listing,
+      });
+    });
+
+    it('public.file-url whose values yield no local path lists no files (#59)', async () => {
+      const listing = [{ type: 'public.file-url', bytes: 21 }];
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: inspection(listing, { hasFilePaths: false }) }),
+      );
+      await expect(backend.inspect()).resolves.toEqual({
+        primaryFormat: 'empty',
+        availableFormats: [],
+        itemCount: 1,
+        rawTypes: listing,
+      });
+    });
   });
 
   describe('read() text (#42)', () => {
@@ -258,13 +359,14 @@ describe('MacosBackend', () => {
         content: Buffer.from('hello world'),
         totalByteSize: 11,
         revision: CHANGE_COUNT,
+        itemCount: 1,
       });
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       const [command, args] = mockSpawn.mock.calls[0] as [string, string[]];
       expect(command).toBe('osascript');
-      const script = args.at(-1) ?? '';
-      expect(script).toContain("pb.dataForType('public.utf8-plain-text')");
-      expect(script).toContain("pb.dataForType('public.plain-text')");
+      const script = scriptOf(args);
+      expect(script).toContain("src.dataForType('public.utf8-plain-text')");
+      expect(script).toContain("src.dataForType('public.plain-text')");
       expect(script.indexOf('public.utf8-plain-text')).toBeLessThan(
         script.indexOf('public.plain-text'),
       );
@@ -280,7 +382,7 @@ describe('MacosBackend', () => {
     });
 
     it('spawns no pbpaste and pins no locale on any read', async () => {
-      for (const format of ['text', 'html', 'rtf', 'image'] as const) {
+      for (const format of READ_FORMATS) {
         mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('x')) }));
         await backend.read(format, FULL);
       }
@@ -295,9 +397,8 @@ describe('MacosBackend', () => {
     it('slices dataForType(public.html) directly, never through stringForType', async () => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('<p>x</p>')) }));
       await backend.read('html', FULL);
-      const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
-      const script = args.at(-1) ?? '';
-      expect(script).toContain("pb.dataForType('public.html')");
+      const script = lastScript();
+      expect(script).toContain("src.dataForType('public.html')");
       expect(script).not.toContain('stringForType');
       expect(script).not.toContain('dataUsingEncoding');
     });
@@ -356,10 +457,24 @@ describe('MacosBackend', () => {
       expect(result.content.toString('utf8')).toBe(rtfContent);
     });
 
-    it('throws when RTF not present (osascript returns null)', async () => {
-      // JXA returns 'null' string when public.rtf and com.apple.flat-rtfd are absent
+    it('throws when RTF is not present', async () => {
+      // The script prints { present: false } when neither public.rtf nor a decodable com.apple.flat-rtfd is there.
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
       await expect(backend.read('rtf', FULL)).rejects.toThrow(/not found/i);
+    });
+
+    it('reads public.rtf first and converts a flat RTFD to RTF markup only as its fallback (#54)', async () => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('{\\rtf1 x}')) }));
+      await backend.read('rtf', FULL);
+      const script = lastScript();
+      expect(script.indexOf("src.dataForType('public.rtf')")).toBeGreaterThan(-1);
+      expect(script.indexOf("src.dataForType('public.rtf')")).toBeLessThan(
+        script.indexOf("src.dataForType('com.apple.flat-rtfd')"),
+      );
+      expect(script).toContain('initWithRTFDDocumentAttributes(rtfd, $())');
+      expect(script).toContain('RTFFromRangeDocumentAttributes(');
+      // stringForType('public.rtf') is nil exactly when dataForType is, so it is no fallback.
+      expect(script).not.toContain('stringForType');
     });
   });
 
@@ -464,14 +579,15 @@ describe('MacosBackend', () => {
       expect(envelopeOf(call?.stdin).html).toBe(Buffer.from(html).toString('base64'));
     });
 
-    it('writes the tag-stripped plain-text fallback alongside HTML', async () => {
+    it('writes the plain-text rendering of the HTML alongside it', async () => {
       const fake = scriptedSpawn(() => ({ stdout: 'ok' }));
       mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
 
       await backend.write('<h1>Title</h1><script>alert(1)</script><p>Body</p>', 'html');
 
+      // A heading and a paragraph are separated by a blank line (#56); script content is dropped.
       expect(envelopeOf(fake.calls[0]?.stdin).text).toBe(
-        Buffer.from('Title Body').toString('base64'),
+        Buffer.from('Title\n\nBody').toString('base64'),
       );
     });
   });
@@ -481,7 +597,11 @@ describe('MacosBackend', () => {
       ['decimal', '<p>&#169; 2026</p>', '© 2026'],
       ['hexadecimal', '<p>&#xA9; 2026</p>', '© 2026'],
       ['astral', '<p>Smile &#x1F600;</p>', 'Smile 😀'],
-      ['nested in block elements', '<div><p>Caf&#233;</p><p>&#8212; open</p></div>', 'Café — open'],
+      [
+        'nested in block elements',
+        '<div><p>Caf&#233;</p><p>&#8212; open</p></div>',
+        'Café\n\n— open',
+      ],
     ])(
       'publishes the decoded %s reference in the plain-text fallback',
       async (_label, html, expected) => {
@@ -574,11 +694,10 @@ describe('MacosBackend — ranged helper scripts (#7)', () => {
   });
 
   it('interpolates offset and limit into the JXA read scripts as literal integers', async () => {
-    for (const format of ['text', 'html', 'rtf', 'image'] as const) {
+    for (const format of READ_FORMATS) {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('payload')) }));
       await backend.read(format, { offset: 5, limit: 7 });
-      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
-      const script = args.at(-1) ?? '';
+      const script = lastScript();
       expect(script).toContain('const location = Math.min(5, total);');
       expect(script).toContain('Math.min(7, total - location)');
       expect(script).toContain('subdataWithRange');
@@ -586,27 +705,31 @@ describe('MacosBackend — ranged helper scripts (#7)', () => {
   });
 
   it('clamps the slice location to the total instead of allocating an empty NSData (#33)', async () => {
-    for (const format of ['text', 'html', 'rtf', 'image'] as const) {
+    for (const format of READ_FORMATS) {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('payload')) }));
       await backend.read(format, { offset: 5, limit: 7 });
-      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
-      const script = args.at(-1) ?? '';
+      const script = lastScript();
       expect(script).not.toContain('initWithLength');
       expect(script.match(/subdataWithRange/g)).toHaveLength(1);
     }
   });
 
   it('tests every Objective-C nil with .isNil(), never JS truthiness (#33)', async () => {
-    for (const format of ['text', 'html', 'rtf', 'image'] as const) {
+    for (const format of READ_FORMATS) {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('payload')) }));
       await backend.read(format, { offset: 0, limit: 7 });
-      const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
-      const script = args.at(-1) ?? '';
+      const script = lastScript();
       expect(script).toContain('.isNil()');
       // A nil wrapper is truthy in JXA: `!x` and `x && …` never see it.
-      expect(script).not.toMatch(/!(html|data|d|img|rep|pngData|s)\b(?!\.)/);
-      expect(script).not.toMatch(/\b(html|data|d|img|rep|pngData|s) &&/);
-      expect(script).not.toMatch(/\b(html|data|d|img|rep|pngData|s) \?/);
+      expect(script).not.toMatch(
+        /!(html|data|d|img|rep|pngData|s|rtfd|attributed|value|url|host|path)\b(?!\.)/,
+      );
+      expect(script).not.toMatch(
+        /\b(html|data|d|img|rep|pngData|s|rtfd|attributed|value|url|host|path) &&/,
+      );
+      expect(script).not.toMatch(
+        /\b(html|data|d|img|rep|pngData|s|rtfd|attributed|value|url|host|path) \?/,
+      );
     }
   });
 
@@ -628,6 +751,7 @@ describe('MacosBackend — ranged helper scripts (#7)', () => {
           total: 10,
           contentBase64: Buffer.from('6789').toString('base64'),
           revision: CHANGE_COUNT,
+          itemCount: 1,
         }),
       }),
     );
@@ -646,14 +770,13 @@ describe('MacosBackend — changeCount revision (#38)', () => {
   });
 
   /** The generated read script for `format`. */
-  async function readScript(format: 'text' | 'html' | 'rtf' | 'image'): Promise<string> {
+  async function readScript(format: (typeof READ_FORMATS)[number]): Promise<string> {
     mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('x')) }));
     await backend.read(format, { offset: 0, limit: 4 });
-    const [, args] = mockSpawn.mock.calls.at(-1) as [string, string[]];
-    return args.at(-1) ?? '';
+    return lastScript();
   }
 
-  it.each(['text', 'html', 'rtf', 'image'] as const)(
+  it.each(READ_FORMATS)(
     'the %s script samples changeCount before its first data access and again when it reports',
     async (format) => {
       const script = await readScript(format);
@@ -661,25 +784,33 @@ describe('MacosBackend — changeCount revision (#38)', () => {
       expect(before).toBeGreaterThan(
         script.indexOf('const pb = $.NSPasteboard.generalPasteboard;'),
       );
-      expect(before).toBeLessThan(script.indexOf('dataForType'));
+      const firstAccess = Math.min(
+        ...['dataForType', 'stringForType', 'pasteboardItems']
+          .map((access) => script.indexOf(access))
+          .filter((index) => index >= 0),
+      );
+      expect(before).toBeLessThan(firstAccess);
       const report = script.lastIndexOf(
-        'JSON.stringify(Number(pb.changeCount) === changeCount ? result : { changed: true });',
+        'return JSON.stringify(Number(pb.changeCount) === changeCount ? result : { changed: true });',
       );
       expect(report).toBeGreaterThan(script.lastIndexOf('subdataWithRange'));
-      // The report is the script's last statement, so its value is what osascript prints.
-      expect(script.slice(report).trim().split('\n')).toHaveLength(1);
+      // The report is the run handler's last statement, so its value is what osascript prints.
+      expect(script.slice(report).trim().split('\n')).toEqual([
+        'return JSON.stringify(Number(pb.changeCount) === changeCount ? result : { changed: true });',
+        '}',
+      ]);
       expect(script).toContain('revision: String(changeCount)');
     },
   );
 
-  it('the empty-image envelope carries the revision too', async () => {
+  it('the empty-image envelope carries the revision and item count too', async () => {
     const script = await readScript('image');
     expect(script).toContain(
-      "result = { present: true, total: 0, contentBase64: '', revision: String(changeCount) };",
+      "result = { present: true, total: 0, contentBase64: '', revision: String(changeCount), itemCount: itemCount };",
     );
   });
 
-  it.each(['text', 'html', 'rtf', 'image'] as const)(
+  it.each(READ_FORMATS)(
     'a %s read whose script saw changeCount move fails representation_changed',
     async (format) => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ changed: true }) }));
@@ -704,7 +835,7 @@ describe('MacosBackend — typed absent-format outcome (#36)', () => {
     vi.resetAllMocks();
   });
 
-  it.each(['html', 'rtf', 'image'] as const)(
+  it.each(['html', 'rtf', 'image', 'files'] as const)(
     'an absent %s representation is format_unavailable',
     async (format) => {
       mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
@@ -726,5 +857,160 @@ describe('MacosBackend — typed absent-format outcome (#36)', () => {
     const failure = new MacosBackend().read('html', FULL);
     await expect(failure).rejects.toThrow(/osascript exited 1/);
     await expect(failure).rejects.not.toHaveProperty('category');
+  });
+});
+
+describe('MacosBackend — item selection and item count (#57)', () => {
+  let backend: MacosBackend;
+  beforeEach(() => {
+    backend = new MacosBackend();
+    vi.resetAllMocks();
+  });
+
+  it.each(READ_FORMATS)(
+    'a %s read passes item as an osascript argument after --, never as script text',
+    async (format) => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('x')) }));
+      await backend.read(format, FULL);
+      const [, whole] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('x')) }));
+      await backend.read(format, FULL, 271828);
+      const [, selected] = mockSpawn.mock.calls.at(-1) as [string, string[]];
+
+      expect(whole).toEqual(['-l', 'JavaScript', '-e', scriptOf(whole)]);
+      expect(selected).toEqual(['-l', 'JavaScript', '-e', scriptOf(whole), '--', '271828']);
+      expect(scriptOf(selected)).not.toContain('271828');
+      expect(scriptOf(selected)).toContain('function run(argv) {');
+    },
+  );
+
+  it.each([
+    ['text', 'joined'],
+    ['rtf', 'joined'],
+    ['html', 'first'],
+    ['image', 'first'],
+    ['files', 'all'],
+  ] as const)(
+    'a %s read with no item on a 3-item pasteboard reports itemScope %s',
+    async (format, scope) => {
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: jxaEnvelope(Buffer.from('x'), { itemCount: 3 }) }),
+      );
+      await expect(backend.read(format, FULL)).resolves.toMatchObject({
+        itemCount: 3,
+        itemScope: scope,
+      });
+    },
+  );
+
+  it.each(READ_FORMATS)(
+    'a %s read of one item, or of a one-item pasteboard, carries no itemScope',
+    async (format) => {
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({ stdout: jxaEnvelope(Buffer.from('x'), { itemCount: 3 }) }),
+      );
+      const selected = await backend.read(format, FULL, 1);
+      expect(selected.itemCount).toBe(3);
+      expect(selected).not.toHaveProperty('itemScope');
+
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('x')) }));
+      const single = await backend.read(format, FULL);
+      expect(single.itemCount).toBe(1);
+      expect(single).not.toHaveProperty('itemScope');
+    },
+  );
+
+  it.each(READ_FORMATS)(
+    'a present %s envelope without an item count is unreadable output',
+    async (format) => {
+      mockSpawn.mockReturnValueOnce(
+        fakeChild({
+          stdout: JSON.stringify({
+            present: true,
+            total: 1,
+            contentBase64: 'eA==',
+            revision: CHANGE_COUNT,
+          }),
+        }),
+      );
+      await expect(backend.read(format, FULL)).rejects.toMatchObject({
+        code: -32070,
+        data: { platform: 'macOS' },
+      });
+    },
+  );
+
+  it('an item past the last is the absent envelope, format_unavailable', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify({ present: false }) }));
+    await expect(backend.read('image', FULL, 3)).rejects.toMatchObject({
+      category: 'format_unavailable',
+    });
+  });
+});
+
+describe('MacosBackend — files (#59)', () => {
+  let backend: MacosBackend;
+  beforeEach(() => {
+    backend = new MacosBackend();
+    vi.resetAllMocks();
+  });
+
+  it('reads every item’s public.file-url through NSURL, not readObjectsForClasses or NSFilenamesPboardType', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('/a')) }));
+    await backend.read('files', FULL);
+    const script = lastScript();
+    expect(script).toContain("items.objectAtIndex(i).stringForType('public.file-url')");
+    expect(script).toContain('$.NSURL.URLWithString(value)');
+    expect(script).toContain('url.isFileURL');
+    expect(script).not.toContain('readObjectsForClasses');
+    expect(script).not.toContain('NSFilenamesPboardType');
+  });
+
+  it('a files read reports how many paths it left out', async () => {
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({ stdout: jxaEnvelope(Buffer.from('/a\n/b'), { itemCount: 3, omittedPaths: 1 }) }),
+    );
+    await expect(backend.read('files', FULL)).resolves.toEqual({
+      format: 'files',
+      content: Buffer.from('/a\n/b'),
+      totalByteSize: 5,
+      revision: CHANGE_COUNT,
+      itemCount: 3,
+      itemScope: 'all',
+      omittedPaths: 1,
+    });
+  });
+
+  it('inspection and the files read share one listable-path test, and a read with no listable path is absent', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: inspection([]) }));
+    await backend.inspect();
+    const inspectScript = lastScript();
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: jxaEnvelope(Buffer.from('/a')) }));
+    await backend.read('files', FULL);
+    const readScript = lastScript();
+
+    /** The JXA `listable` function a script defines. */
+    const listableOf = (script: string) => /function listable\(path\) \{[^}]*\}/.exec(script)?.[0];
+    // A path holding a CR or LF cannot be listed one per line.
+    expect(listableOf(inspectScript)).toBe(
+      'function listable(path) {\n  return !/[\\r\\n]/.test(path);\n}',
+    );
+    expect(listableOf(readScript)).toBe(listableOf(inspectScript));
+
+    expect(readScript).toContain('const listed = paths.filter(listable);');
+    expect(readScript).toMatch(
+      /if \(listed\.length > 0\) \{\n\s*const data = \$\(listed\.join\('\\n'\)\)/,
+    );
+    expect(readScript).toContain('omittedPaths: paths.length - listed.length');
+    // Only a listable path makes the read present: paths that are all left out leave it absent.
+    expect(readScript).not.toContain('paths.length > 0');
+  });
+
+  it('a files read that left nothing out carries no omittedPaths', async () => {
+    mockSpawn.mockReturnValueOnce(
+      fakeChild({ stdout: jxaEnvelope(Buffer.from('/a'), { omittedPaths: 0 }) }),
+    );
+    const result = await backend.read('files', FULL);
+    expect(result).not.toHaveProperty('omittedPaths');
   });
 });

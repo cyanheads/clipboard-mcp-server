@@ -18,7 +18,7 @@ function hasContent<T extends { content?: string | undefined }>(
 
 export const clipboardWrite = tool('clipboard_write', {
   title: 'Write Clipboard',
-  description: `Write content to the clipboard, replacing the current contents, or clear the clipboard outright. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. On Linux the HTML itself is the only payload, with no stripped fallback: Wayland offers it as text/html and under the plain-text types, and X11 advertises only text/html but answers a request for a plain-text type such as UTF8_STRING with the same markup, so a plain-text paste can receive raw HTML. Pass clear: true with no content to remove every representation, leaving clipboard_inspect reporting an empty clipboard; supply exactly one of content or clear: true.`,
+  description: `Write content to the clipboard, replacing the current contents, or clear the clipboard outright. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback that keeps line breaks and separates table cells with tabs, but drops list markers and numbering. On Linux the HTML itself is the only payload, with no stripped fallback: Wayland offers it as text/html and under the plain-text types, and X11 advertises only text/html but answers a request for a plain-text type such as UTF8_STRING with the same markup, so a plain-text paste can receive raw HTML. Pass clear: true with no content to remove every representation, leaving clipboard_inspect reporting an empty clipboard; supply exactly one of content or clear: true.`,
   annotations: { destructiveHint: true, openWorldHint: false },
   input: z
     .object({
@@ -32,7 +32,7 @@ export const clipboardWrite = tool('clipboard_write', {
         .enum(['text', 'html'])
         .default('text')
         .describe(
-          `Format of the content. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback. On Linux there is no stripped fallback: Wayland also offers the markup under the plain-text types, and X11 hands the same markup to a plain-text request. Ignored when clear is true.`,
+          `Format of the content. "text" writes plain text. "html" writes HTML; on macOS and Windows it also publishes an auto-generated, tag-stripped plain-text fallback that keeps line breaks and separates table cells with tabs, but drops list markers and numbering. On Linux there is no stripped fallback: Wayland also offers the markup under the plain-text types, and X11 hands the same markup to a plain-text request. Ignored when clear is true.`,
         ),
       clear: z
         .boolean()
@@ -67,9 +67,7 @@ export const clipboardWrite = tool('clipboard_write', {
       .string()
       .optional()
       .describe(
-        'Plain-text content that was on the clipboard before this write or clear, if any and within size limits. ' +
-          'Write it back with clipboard_write to undo an unintended overwrite. Absent if the clipboard was ' +
-          'empty, held no text representation, or the prior content exceeded the read size limit.',
+        'Plain-text content that was on the clipboard before this write or clear, if any and within size limits. Write it back with clipboard_write to undo an unintended overwrite. Absent if the clipboard was empty, held no text representation, or the prior content exceeded the read size limit.',
       ),
   }),
   errors: [

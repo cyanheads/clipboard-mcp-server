@@ -5,34 +5,26 @@
 
 import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
-import { collectByteWindow, collectHashedByteWindow, countBytes } from './byte-window.js';
-import { readPngDimensions } from './png-dimensions.js';
+import { collectByteWindow } from './byte-window.js';
+import { inspectSelection, type LinuxSelection, readSelection } from './linux-selection.js';
 import type {
   ByteRange,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
-  RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectResult, clipboardOutcome, isClipboardOutcome } from './types.js';
+import { clipboardOutcome, isClipboardOutcome } from './types.js';
 
 const PLATFORM = 'Linux X11';
 
-const TEXT_TARGETS: readonly string[] = [
-  'UTF8_STRING',
-  'text/plain',
-  'text/plain;charset=utf-8',
-  'TEXT',
-  'STRING',
-];
-
 /** X targets each semantic format is read from, in preference order. */
 const FORMAT_TARGETS: Record<ClipboardFormat, readonly string[]> = {
-  text: TEXT_TARGETS,
+  text: ['UTF8_STRING', 'text/plain', 'text/plain;charset=utf-8', 'TEXT', 'STRING'],
   html: ['text/html'],
   rtf: ['text/rtf', 'application/rtf'],
   image: ['image/png'],
+  files: ['text/uri-list'],
 };
 
 const XCLIP_INSTALL_HINT =
@@ -43,15 +35,6 @@ const XSEL_INSTALL_HINT =
 
 const DISPLAY_HINT =
   'Run the server inside the X11 desktop session so DISPLAY names a running X server it may connect to (check XAUTHORITY too), then retry.';
-
-/** Map MIME type (or X TARGETS entry) → semantic format. */
-function mimeToFormat(mime: string): ClipboardFormat | null {
-  if (TEXT_TARGETS.includes(mime)) return 'text';
-  if (mime === 'text/html') return 'html';
-  if (mime === 'text/rtf' || mime === 'application/rtf') return 'rtf';
-  if (mime === 'image/png') return 'image';
-  return null;
-}
 
 /** The `-t` target of an xclip invocation. */
 function targetOf(args: readonly string[]): string | undefined {
@@ -225,6 +208,15 @@ function runXsel(args: string[]): Promise<void> {
   });
 }
 
+/** The X11 CLIPBOARD selection, as xclip lists and converts it. */
+const X11_SELECTION: LinuxSelection = {
+  platform: PLATFORM,
+  formatTypes: FORMAT_TARGETS,
+  listTypes: listTargets,
+  streamType: (target, consume) =>
+    runXclipStream(['-o', '-selection', 'clipboard', '-t', target], consume),
+};
+
 /** Linux X11 clipboard backend using xclip. */
 export class LinuxX11Backend implements ClipboardBackend {
   /**
@@ -232,69 +224,17 @@ export class LinuxX11Backend implements ClipboardBackend {
    * ICCCM side-effect target (`DELETE`) or a parameterized one (`MULTIPLE`) is
    * unsafe, so every other target is listed without a size.
    */
-  async inspect(): Promise<InspectResult> {
-    const rawTypes: RawTypeEntry[] = [];
-    for (const target of await listTargets()) {
-      if (!mimeToFormat(target)) {
-        rawTypes.push({ type: target });
-        continue;
-      }
-      try {
-        // Stream and count — clipboard_inspect is metadata-only, so the
-        // representation is never retained just to report its size (#26).
-        const bytes = await runXclipStream(
-          ['-o', '-selection', 'clipboard', '-t', target],
-          countBytes,
-        );
-        rawTypes.push({ type: target, bytes });
-      } catch {
-        rawTypes.push({ type: target, measurementFailed: true });
-      }
-    }
-    return buildInspectResult(rawTypes, mimeToFormat);
+  inspect(): Promise<InspectResult> {
+    return inspectSelection(X11_SELECTION);
   }
 
   /**
    * Presence is decided from TARGETS, never from a conversion succeeding: an
    * `xclip`-owned selection — the state this backend's own writes leave —
-   * answers any requested target with its one buffer. A listed representation
-   * is read as-is, so a zero-byte one is an empty success.
+   * answers any requested target with its one buffer.
    */
-  async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
-    const offered = await listTargets();
-    if (offered.length === 0) {
-      throw clipboardOutcome(PLATFORM, 'The clipboard is empty.', { category: 'empty' });
-    }
-    const candidates = FORMAT_TARGETS[format].filter((target) => offered.includes(target));
-    if (candidates.length === 0) {
-      throw clipboardOutcome(
-        PLATFORM,
-        `No ${format} representation on the clipboard (offered: ${offered.join(', ')}).`,
-        { category: 'format_unavailable' },
-      );
-    }
-
-    let lastError: unknown;
-    for (const target of candidates) {
-      try {
-        // Every read streams the whole representation, so hashing it on the way
-        // through identifies the value the window was cut from.
-        const { window, totalByteSize, sha256 } = await runXclipStream(
-          ['-o', '-selection', 'clipboard', '-t', target],
-          (stdout) => collectHashedByteWindow(stdout, range),
-        );
-        // xclip hands over opaque bytes with no dimension API — read them out of
-        // the PNG header so Linux reads carry what macOS and Windows report.
-        // The header only lives in the window when the window starts at byte 0.
-        const dimensions =
-          format === 'image' && range.offset === 0 ? readPngDimensions(window) : {};
-        return { format, content: window, totalByteSize, revision: sha256, ...dimensions };
-      } catch (error) {
-        if (isClipboardOutcome(error) && error.category === 'clipboard_unavailable') throw error;
-        lastError = error;
-      }
-    }
-    throw lastError;
+  read(format: ClipboardFormat, range: ByteRange, item?: number): Promise<ReadResult> {
+    return readSelection(X11_SELECTION, format, range, item);
   }
 
   async write(

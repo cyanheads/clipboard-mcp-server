@@ -11,6 +11,10 @@
  */
 
 import type * as ChildProcess from 'node:child_process';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -31,7 +35,7 @@ import { clipboardInspect } from '@/mcp-server/tools/definitions/clipboard-inspe
 import { clipboardRead } from '@/mcp-server/tools/definitions/clipboard-read.tool.js';
 import { ClipboardService, getClipboardService } from '@/services/clipboard/clipboard-service.js';
 import { MacosBackend } from '@/services/clipboard/macos-backend.js';
-import { REAL_PNG_13x7 } from './png-fixtures.js';
+import { buildSolidPng, PNG_SIGNATURE, REAL_PNG_13x7 } from './png-fixtures.js';
 
 const actual = await vi.importActual<typeof ChildProcess>('node:child_process');
 const mockSpawn = vi.mocked(spawn);
@@ -119,6 +123,110 @@ JSON.stringify(out);`);
   );
 }
 
+/**
+ * Replace the private pasteboard's contents with one `NSPasteboardItem` per
+ * entry of `items`, written together by `writeObjects` — the multi-item
+ * pasteboard a multi-selection copy in Photos or Finder leaves.
+ */
+function seedItems(items: readonly Record<string, Buffer>[]): void {
+  const payload = items.map((types) =>
+    Object.fromEntries(
+      Object.entries(types).map(([type, bytes]) => [type, bytes.toString('base64')]),
+    ),
+  );
+  jxa(
+    `ObjC.import('AppKit');
+const input = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+const items = JSON.parse(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(input, $.NSUTF8StringEncoding)));
+const objects = items.map((types) => {
+  const item = $.NSPasteboardItem.alloc.init;
+  for (const t of Object.keys(types)) {
+    if (!item.setDataForType($.NSData.alloc.initWithBase64EncodedStringOptions(types[t], 0), t)) throw new Error('seed failed: ' + t);
+  }
+  return item;
+});
+const pb = ${pasteboardRef()};
+pb.clearContents;
+if (!pb.writeObjects($(objects))) throw new Error('writeObjects failed');
+'ok';`,
+    JSON.stringify(payload),
+  );
+}
+
+/** A URL `seedUrls` writes: a file path, that file's reference URL (`file:///.file/id=…`), or any URL string. */
+type UrlSeed = { path: string } | { reference: string } | { url: string };
+
+/** Replace the private pasteboard's contents with one NSURL per entry, written by `writeObjects`. */
+function seedUrls(urls: readonly UrlSeed[]): void {
+  jxa(
+    `ObjC.import('AppKit');
+const input = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+const urls = JSON.parse(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(input, $.NSUTF8StringEncoding)));
+const objects = urls.map((u) => {
+  if (u.path !== undefined) return $.NSURL.fileURLWithPath(u.path);
+  if (u.reference !== undefined) {
+    const reference = $.NSURL.fileURLWithPath(u.reference).fileReferenceURL;
+    if (reference.isNil()) throw new Error('no file reference URL for ' + u.reference);
+    return reference;
+  }
+  return $.NSURL.URLWithString(u.url);
+});
+const pb = ${pasteboardRef()};
+pb.clearContents;
+if (!pb.writeObjects($(objects))) throw new Error('writeObjects failed');
+'ok';`,
+    JSON.stringify(urls),
+  );
+}
+
+/**
+ * The flat RTFD and RTF AppKit writes for `rtfSource`, with a PNG file
+ * attachment when `attachment` is set. Built from RTF data because JXA on
+ * macOS 27 does not bridge `NSAttributedString initWithString:`.
+ */
+function attributedForms(
+  rtfSource: string,
+  { attachment = false } = {},
+): { rtf: Buffer; rtfd: Buffer } {
+  const forms = JSON.parse(
+    jxa(`ObjC.import('AppKit');
+const source = $(${JSON.stringify(rtfSource)}).dataUsingEncoding($.NSUTF8StringEncoding);
+const s = $.NSMutableAttributedString.alloc.initWithRTFDocumentAttributes(source, $());
+if (s.isNil()) throw new Error('RTF source did not parse');
+if (${attachment}) {
+  const wrapper = $.NSFileWrapper.alloc.initRegularFileWithContents($.NSData.alloc.initWithBase64EncodedStringOptions(${JSON.stringify(REAL_PNG_13x7.toString('base64'))}, 0));
+  wrapper.preferredFilename = 'dot.png';
+  s.appendAttributedString($.NSAttributedString.attributedStringWithAttachment($.NSTextAttachment.alloc.initWithFileWrapper(wrapper)));
+}
+const range = { location: 0, length: Number(s.length) };
+JSON.stringify({
+  rtfd: ObjC.unwrap(s.RTFDFromRangeDocumentAttributes(range, $()).base64EncodedStringWithOptions(0)),
+  rtf: ObjC.unwrap(s.RTFFromRangeDocumentAttributes(range, $()).base64EncodedStringWithOptions(0)),
+});`),
+  ) as { rtf: string; rtfd: string };
+  return { rtf: Buffer.from(forms.rtf, 'base64'), rtfd: Buffer.from(forms.rtfd, 'base64') };
+}
+
+/** `png` re-encoded by NSBitmapImageRep as `fileType` (an `NSBitmapImageFileType` constant name). */
+function encodeAs(png: Buffer, fileType: string): Buffer {
+  return Buffer.from(
+    jxa(`ObjC.import('AppKit');
+const rep = $.NSBitmapImageRep.imageRepWithData($.NSData.alloc.initWithBase64EncodedStringOptions(${JSON.stringify(png.toString('base64'))}, 0));
+ObjC.unwrap(rep.representationUsingTypeProperties($.${fileType}, {}).base64EncodedStringWithOptions(0));`),
+    'base64',
+  );
+}
+
+/** The plain text AppKit parses out of RTF markup — `null` when it is not RTF it can read. */
+function rtfPlainText(rtf: Buffer): string | null {
+  return JSON.parse(
+    jxa(`ObjC.import('AppKit');
+const data = $.NSData.alloc.initWithBase64EncodedStringOptions(${JSON.stringify(rtf.toString('base64'))}, 0);
+const s = $.NSAttributedString.alloc.initWithRTFDocumentAttributes(data, $());
+JSON.stringify(s.isNil() ? null : ObjC.unwrap(s.string));`),
+  ) as string | null;
+}
+
 describe.skipIf(!onDarwin)('MacosBackend against a private pasteboard (real osascript)', () => {
   let changeCountBefore = 0;
   const backend = new MacosBackend();
@@ -135,7 +243,9 @@ describe.skipIf(!onDarwin)('MacosBackend against a private pasteboard (real osas
           `test isolation: refusing to spawn ${command} (it targets the general pasteboard)`,
         );
       }
-      const script = args.at(-1) ?? '';
+      // The script follows `-e`; a read of one item passes `-- <item>` after it.
+      const scriptIndex = args.indexOf('-e') + 1;
+      const script = args[scriptIndex] ?? '';
       const references = script.split(GENERAL).length - 1;
       if (references !== 1) {
         throw new Error(
@@ -152,7 +262,7 @@ describe.skipIf(!onDarwin)('MacosBackend against a private pasteboard (real osas
           `${CHANGE_COUNT_SAMPLE}\n${midReadMutation}`,
         );
       }
-      return actual.spawn(command, [...args.slice(0, -1), rewritten], options);
+      return actual.spawn(command, args.with(scriptIndex, rewritten), options);
     }) as unknown as typeof spawn);
   });
 
@@ -196,15 +306,6 @@ describe.skipIf(!onDarwin)('MacosBackend against a private pasteboard (real osas
       30_000,
     );
 
-    it('an RTF read prefers com.apple.flat-rtfd over public.rtf', async () => {
-      seed({
-        'com.apple.flat-rtfd': Buffer.from('rtfd-bytes'),
-        'public.rtf': Buffer.from('{\\rtf1 plain}'),
-      });
-      const result = await backend.read('rtf', { offset: 0, limit: 64 });
-      expect(result.content.toString()).toBe('rtfd-bytes');
-    });
-
     it('an image read converts a TIFF-only pasteboard to PNG with its dimensions', async () => {
       jxa(
         `ObjC.import('AppKit');
@@ -224,6 +325,125 @@ if (!pb.setDataForType($.NSBitmapImageRep.imageRepWithData(png).TIFFRepresentati
       seed({ 'public.utf8-plain-text': Buffer.from('hello') });
       await expect(backend.read(format, { offset: 0, limit: 16 })).rejects.toMatchObject({
         category: 'format_unavailable',
+      });
+    });
+  });
+
+  describe('#54 — RTF reads return RTF markup', () => {
+    const SOURCE = '{\\rtf1\\ansi {\\b Styled} RTFD sample text}';
+    const TEXT = 'Styled RTFD sample text';
+
+    it('with public.rtf beside a flat RTFD, rtf returns public.rtf byte for byte', async () => {
+      const { rtf, rtfd } = attributedForms(SOURCE);
+      expect(rtfd.subarray(0, 4).toString('latin1')).toBe('rtfd');
+      seed({ 'com.apple.flat-rtfd': rtfd, 'public.rtf': rtf });
+      const result = await backend.read('rtf', { offset: 0, limit: 64 * MiB });
+      expect(result.content.equals(rtf)).toBe(true);
+      expect(result.totalByteSize).toBe(rtf.byteLength);
+      expect(result.content.subarray(0, 5).toString('latin1')).toBe('{\\rtf');
+    });
+
+    it('a non-empty public.rtf wins over a decodable flat RTFD of different text', async () => {
+      const { rtfd } = attributedForms(SOURCE);
+      const plain = Buffer.from('{\\rtf1 plain}');
+      seed({ 'com.apple.flat-rtfd': rtfd, 'public.rtf': plain });
+      const result = await backend.read('rtf', { offset: 0, limit: 64 * MiB });
+      expect(result.content.equals(plain)).toBe(true);
+      expect(result.totalByteSize).toBe(plain.byteLength);
+    });
+
+    it('a non-empty public.rtf wins over flat-RTFD bytes that are not a package', async () => {
+      seed({
+        'com.apple.flat-rtfd': Buffer.from('rtfd-bytes'),
+        'public.rtf': Buffer.from('{\\rtf1 plain}'),
+      });
+      const result = await backend.read('rtf', { offset: 0, limit: 64 });
+      expect(result.content.toString()).toBe('{\\rtf1 plain}');
+    });
+
+    it.each([
+      ['plain', false],
+      ['with an attachment', true],
+    ])(
+      'a flat RTFD alone (%s) lists rtf and reads as RTF markup carrying its text and styling',
+      async (_label, attachment) => {
+        const { rtfd } = attributedForms(SOURCE, { attachment });
+        seed({ 'com.apple.flat-rtfd': rtfd });
+        const inspection = await backend.inspect();
+        expect(inspection.availableFormats).toEqual(['rtf']);
+        expect(inspection.rawTypes).toContainEqual({
+          type: 'com.apple.flat-rtfd',
+          bytes: rtfd.byteLength,
+        });
+
+        const whole = await backend.read('rtf', { offset: 0, limit: 64 * MiB });
+        expect(whole.content.subarray(0, 6).toString('latin1')).toBe('{\\rtf1');
+        expect(whole.content.includes(0)).toBe(false);
+        expect(whole.content.toString('latin1')).toMatch(/\\b(?![a-z])/);
+        // The attachment is dropped: no U+FFFC object-replacement character survives.
+        expect(rtfPlainText(whole.content)).toBe(TEXT);
+        expect(whole.totalByteSize).toBe(whole.content.byteLength);
+        expect(whole.totalByteSize).not.toBe(rtfd.byteLength);
+
+        // The conversion runs again for every slice and yields the same document.
+        const middle = await backend.read('rtf', { offset: 3, limit: 9 });
+        expect(middle.content.equals(whole.content.subarray(3, 12))).toBe(true);
+        expect(middle.totalByteSize).toBe(whole.totalByteSize);
+        const past = await backend.read('rtf', { offset: whole.totalByteSize + 4, limit: 9 });
+        expect(past.content.byteLength).toBe(0);
+        expect(past.totalByteSize).toBe(whole.totalByteSize);
+      },
+      30_000,
+    );
+
+    it('an undecodable flat RTFD alone fails rtf with format_unavailable, and auto moves on', async () => {
+      seed({
+        'com.apple.flat-rtfd': Buffer.from('rtfd-bytes'),
+        'public.utf8-plain-text': Buffer.from('abc'),
+      });
+      expect((await backend.inspect()).availableFormats).toEqual(['text', 'rtf']);
+      await expect(backend.read('rtf', { offset: 0, limit: 64 })).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+
+      vi.mocked(getClipboardService).mockReturnValue(new ClipboardService(backend));
+      const auto = await runToolContract(clipboardRead, { format: 'auto' });
+      expect(auto.structuredContent).toMatchObject({ format: 'text', content: 'abc' });
+    }, 30_000);
+
+    it('a flat RTFD package that fails to deserialize reads like any undecodable one', async () => {
+      // A truncated package raises NSDeserializeException in the conversion instead of returning nil.
+      const truncated = attributedForms(SOURCE, { attachment: true }).rtfd.subarray(0, 40);
+      expect(truncated.subarray(0, 4).toString('latin1')).toBe('rtfd');
+      seed({ 'com.apple.flat-rtfd': truncated, 'public.utf8-plain-text': Buffer.from('abc') });
+      await expect(backend.read('rtf', { offset: 0, limit: 64 })).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+      vi.mocked(getClipboardService).mockReturnValue(new ClipboardService(backend));
+      const auto = await runToolContract(clipboardRead, { format: 'auto' });
+      expect(auto.structuredContent).toMatchObject({ format: 'text', content: 'abc' });
+
+      seed({ 'public.rtf': Buffer.alloc(0), 'com.apple.flat-rtfd': truncated });
+      await expect(backend.read('rtf', { offset: 0, limit: 64 })).resolves.toMatchObject({
+        format: 'rtf',
+        content: Buffer.alloc(0),
+        totalByteSize: 0,
+      });
+    }, 30_000);
+
+    it('a zero-length public.rtf beside a decodable flat RTFD reads the converted RTFD', async () => {
+      const { rtfd } = attributedForms(SOURCE);
+      seed({ 'public.rtf': Buffer.alloc(0), 'com.apple.flat-rtfd': rtfd });
+      const result = await backend.read('rtf', { offset: 0, limit: 64 * MiB });
+      expect(rtfPlainText(result.content)).toBe(TEXT);
+    });
+
+    it('a zero-length public.rtf beside an undecodable flat RTFD is an empty rtf success', async () => {
+      seed({ 'public.rtf': Buffer.alloc(0), 'com.apple.flat-rtfd': Buffer.from('rtfd-bytes') });
+      await expect(backend.read('rtf', { offset: 0, limit: 64 })).resolves.toMatchObject({
+        format: 'rtf',
+        content: Buffer.alloc(0),
+        totalByteSize: 0,
       });
     });
   });
@@ -470,6 +690,7 @@ if (!pb.setDataForType($.NSBitmapImageRep.imageRepWithData(png).TIFFRepresentati
         content: Buffer.alloc(0),
         totalByteSize: 0,
         revision: String(privateChangeCount()),
+        itemCount: 1,
       });
     });
 
@@ -493,6 +714,7 @@ if (!pb.setDataForType($.NSBitmapImageRep.imageRepWithData(png).TIFFRepresentati
           totalByteSize: 0,
           complete: true,
           representationId: `image:${privateChangeCount()}`,
+          itemCount: 1,
         });
         expect(result.content.some((block) => block.type === 'image')).toBe(false);
       }
@@ -631,6 +853,399 @@ if (!pb.setDataForType($.NSBitmapImageRep.imageRepWithData(png).TIFFRepresentati
       });
       expect(stale.structuredContent).not.toHaveProperty('content');
     }, 30_000);
+  });
+
+  describe('#57 — multi-item pasteboards', () => {
+    const WHOLE = { offset: 0, limit: 64 * MiB } as const;
+    const PNGS = [buildSolidPng(10, 10), buildSolidPng(20, 20), buildSolidPng(30, 30)];
+
+    it('3 × PNG: inspect counts the items; no item reads the first and says so; item reads each', async () => {
+      seedItems(PNGS.map((png) => ({ 'public.png': png })));
+      await expect(backend.inspect()).resolves.toMatchObject({
+        itemCount: 3,
+        availableFormats: ['image'],
+        primaryFormat: 'image',
+      });
+
+      const whole = await backend.read('image', WHOLE);
+      expect(whole).toMatchObject({ width: 10, height: 10, itemCount: 3, itemScope: 'first' });
+
+      for (const [index, side] of [10, 20, 30].entries()) {
+        const one = await backend.read('image', WHOLE, index);
+        expect(one).toMatchObject({ width: side, height: side, itemCount: 3 });
+        expect(one).not.toHaveProperty('itemScope');
+      }
+      await expect(backend.read('image', WHOLE, 3)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    }, 30_000);
+
+    it('3 × HTML: no item reads the first item; item reads its own markup', async () => {
+      seedItems([0, 1, 2].map((n) => ({ 'public.html': Buffer.from(`<p>item ${n}</p>`) })));
+      const whole = await backend.read('html', WHOLE);
+      expect(whole.content.toString()).toBe('<p>item 0</p>');
+      expect(whole).toMatchObject({ itemCount: 3, itemScope: 'first' });
+
+      const one = await backend.read('html', WHOLE, 1);
+      expect(one.content.toString()).toBe('<p>item 1</p>');
+      await expect(backend.read('text', WHOLE, 1)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('3 × text: no item reads every item joined; item reads its own text', async () => {
+      seedItems([0, 1, 2].map((n) => ({ 'public.utf8-plain-text': Buffer.from(`item ${n}`) })));
+      const whole = await backend.read('text', WHOLE);
+      expect(whole.content.toString()).toBe('item 0\nitem 1\nitem 2');
+      expect(whole).toMatchObject({ itemCount: 3, itemScope: 'joined' });
+
+      const one = await backend.read('text', WHOLE, 1);
+      expect(one.content.toString()).toBe('item 1');
+      expect(one).not.toHaveProperty('itemScope');
+    });
+
+    it('3 × RTF and flat RTFD: no item reads one combined document; item reads its own public.rtf', async () => {
+      // Each item's flat RTFD carries other text than its public.rtf, so a read of the RTFD shows.
+      const forms = [0, 1, 2].map((n) => ({
+        rtf: attributedForms(`{\\rtf1\\ansi item ${n}}`).rtf,
+        rtfd: attributedForms(`{\\rtf1\\ansi rtfd ${n}}`).rtfd,
+      }));
+      seedItems(forms.map(({ rtf, rtfd }) => ({ 'public.rtf': rtf, 'com.apple.flat-rtfd': rtfd })));
+      // AppKit builds a multi-item pasteboard's joined public.rtf from each item's flat RTFD.
+      const whole = await backend.read('rtf', WHOLE);
+      expect(rtfPlainText(whole.content)).toBe('rtfd 0\nrtfd 1\nrtfd 2');
+      expect(whole).toMatchObject({ itemCount: 3, itemScope: 'joined' });
+
+      const one = await backend.read('rtf', WHOLE, 1);
+      expect(one.content.equals(forms[1]?.rtf ?? Buffer.alloc(0))).toBe(true);
+    }, 30_000);
+
+    it('a text item then a PNG item: each format reads the item carrying it', async () => {
+      seedItems([
+        { 'public.utf8-plain-text': Buffer.from('caption') },
+        { 'public.png': PNGS[1] ?? REAL_PNG_13x7 },
+      ]);
+      await expect(backend.inspect()).resolves.toMatchObject({
+        itemCount: 2,
+        availableFormats: ['text', 'image'],
+      });
+      await expect(backend.read('image', WHOLE)).resolves.toMatchObject({
+        width: 20,
+        itemScope: 'first',
+      });
+      await expect(backend.read('image', WHOLE, 1)).resolves.toMatchObject({ width: 20 });
+      await expect(backend.read('image', WHOLE, 0)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+      expect((await backend.read('text', WHOLE, 0)).content.toString()).toBe('caption');
+      await expect(backend.read('text', WHOLE, 1)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    }, 30_000);
+
+    it('an item carrying its image only as JPEG or GIF reads it as PNG, as the whole pasteboard does', async () => {
+      const jpeg = encodeAs(buildSolidPng(10, 10), 'NSBitmapImageFileTypeJPEG');
+      const gif = encodeAs(buildSolidPng(20, 20), 'NSBitmapImageFileTypeGIF');
+      seed({ 'public.jpeg': jpeg });
+      const whole = await backend.read('image', WHOLE);
+      expect(whole).toMatchObject({ width: 10, height: 10, itemCount: 1 });
+      const only = await backend.read('image', WHOLE, 0);
+      expect(only).toMatchObject({ width: 10, height: 10, itemCount: 1 });
+      expect(only.content.equals(whole.content)).toBe(true);
+
+      seedItems([{ 'public.jpeg': jpeg }, { 'com.compuserve.gif': gif }]);
+      await expect(backend.inspect()).resolves.toMatchObject({
+        itemCount: 2,
+        availableFormats: ['image'],
+      });
+      for (const [index, side] of [10, 20].entries()) {
+        const one = await backend.read('image', WHOLE, index);
+        expect(one).toMatchObject({ width: side, height: side, itemCount: 2 });
+        expect(one.content.subarray(0, 8).equals(PNG_SIGNATURE)).toBe(true);
+      }
+    }, 30_000);
+
+    it('an item holding only UTF-16 text reads as its UTF-8 translation', async () => {
+      seedItems([
+        { 'public.html': Buffer.from('<p>x</p>') },
+        { 'public.utf16-plain-text': Buffer.from('héllo', 'utf16le') },
+      ]);
+      expect((await backend.read('text', WHOLE, 1)).content.toString()).toBe('héllo');
+    });
+
+    it('a single item: itemCount 1 and no itemScope; item 0 reads the same value; item 1 is format_unavailable', async () => {
+      seed({ 'public.utf8-plain-text': Buffer.from('solo') });
+      await expect(backend.inspect()).resolves.toMatchObject({ itemCount: 1 });
+      const whole = await backend.read('text', WHOLE);
+      expect(whole).toMatchObject({ itemCount: 1, content: Buffer.from('solo') });
+      expect(whole).not.toHaveProperty('itemScope');
+      const one = await backend.read('text', WHOLE, 0);
+      expect(one.content.equals(whole.content)).toBe(true);
+      await expect(backend.read('text', WHOLE, 1)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('an empty pasteboard: itemCount 0, and item 0 is format_unavailable', async () => {
+      seed({});
+      await expect(backend.inspect()).resolves.toEqual({
+        primaryFormat: 'empty',
+        availableFormats: [],
+        itemCount: 0,
+        rawTypes: [],
+      });
+      await expect(backend.read('text', WHOLE, 0)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('an item read pages through its own bytes under one revision', async () => {
+      const texts = ['first item', 'second item, a longer one é', 'third'];
+      seedItems(texts.map((text) => ({ 'public.utf8-plain-text': Buffer.from(text) })));
+      const count = String(privateChangeCount());
+      const expected = Buffer.from(texts[1] ?? '');
+      const chunks: Buffer[] = [];
+      let offset = 0;
+      for (;;) {
+        const slice = await backend.read('text', { offset, limit: 5 }, 1);
+        expect(slice).toMatchObject({ revision: count, totalByteSize: expected.byteLength });
+        if (slice.content.byteLength === 0) break;
+        chunks.push(slice.content);
+        offset += slice.content.byteLength;
+      }
+      expect(offset).toBe(expected.byteLength);
+      expect(Buffer.concat(chunks).equals(expected)).toBe(true);
+    }, 60_000);
+
+    it('an item read whose pasteboard is rewritten between its changeCount samples fails representation_changed', async () => {
+      seedItems([0, 1, 2].map((n) => ({ 'public.utf8-plain-text': Buffer.from(`item ${n}`) })));
+      midReadMutation = `pb.clearContents;\npb.setDataForType($.NSData.alloc.initWithBase64EncodedStringOptions(${JSON.stringify(Buffer.from('BBBB').toString('base64'))}, 0), 'public.utf8-plain-text');`;
+      try {
+        await expect(backend.read('text', { offset: 0, limit: 4 }, 1)).rejects.toMatchObject({
+          category: 'representation_changed',
+        });
+      } finally {
+        midReadMutation = undefined;
+      }
+    });
+  });
+
+  describe('#59 — files', () => {
+    const WHOLE = { offset: 0, limit: 64 * MiB } as const;
+    let dir = '';
+    let doc0 = '';
+    let doc1 = '';
+    let accented = '';
+    let broken = '';
+    let carriageReturn = '';
+    let folder = '';
+
+    beforeAll(() => {
+      dir = realpathSync(mkdtempSync(join(tmpdir(), 'clipboard-files-')));
+      doc0 = join(dir, 'doc0.txt');
+      doc1 = join(dir, 'doc1.txt');
+      // A space and a combining accent (e + U+0301), as the file system stores it.
+      accented = join(dir, 'doc 2 é.txt');
+      broken = join(dir, 'line\nbreak.txt');
+      carriageReturn = join(dir, 'carriage\rreturn.txt');
+      folder = join(dir, 'folder');
+      for (const file of [doc0, doc1, accented, broken, carriageReturn]) writeFileSync(file, 'x');
+      mkdirSync(folder);
+    });
+
+    afterAll(() => {
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('file URLs read as their paths in item order, one per line with no trailing newline', async () => {
+      const paths = [doc0, doc1, folder, accented];
+      seedUrls(paths.map((path) => ({ path })));
+      await expect(backend.inspect()).resolves.toMatchObject({
+        itemCount: 4,
+        availableFormats: ['files'],
+        primaryFormat: 'files',
+      });
+
+      const result = await backend.read('files', WHOLE);
+      expect(result.content.toString()).toBe(paths.join('\n'));
+      expect(result).toMatchObject({
+        format: 'files',
+        totalByteSize: Buffer.byteLength(paths.join('\n')),
+        itemCount: 4,
+        itemScope: 'all',
+      });
+      expect(result).not.toHaveProperty('omittedPaths');
+    });
+
+    it('item reads one file’s path; an item past the last is format_unavailable', async () => {
+      seedUrls([doc0, doc1, accented].map((path) => ({ path })));
+      const one = await backend.read('files', WHOLE, 2);
+      expect(one.content.toString()).toBe(accented);
+      expect(one).not.toHaveProperty('itemScope');
+      await expect(backend.read('files', WHOLE, 3)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('file reference URLs read as the paths they resolve to', async () => {
+      seedUrls([{ reference: doc0 }, { reference: accented }]);
+      expect(contents()['public.file-url']?.toString()).toMatch(/^file:\/\/\/\.file\/id=/);
+      const result = await backend.read('files', WHOLE);
+      expect(result.content.toString()).toBe([doc0, accented].join('\n'));
+    });
+
+    it('file URLs beside an https URL list only the file paths', async () => {
+      seedUrls([{ path: doc0 }, { url: 'https://example.com/a?b=1' }, { path: doc1 }]);
+      await expect(backend.inspect()).resolves.toMatchObject({
+        itemCount: 3,
+        availableFormats: ['files'],
+      });
+      const result = await backend.read('files', WHOLE);
+      expect(result.content.toString()).toBe([doc0, doc1].join('\n'));
+      await expect(backend.read('files', WHOLE, 1)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('a public.file-url holding a web URL or a bare word yields no path: no files, and the read is format_unavailable', async () => {
+      seedItems([
+        { 'public.file-url': Buffer.from('https://example.com/y') },
+        { 'public.file-url': Buffer.from('not a url at all') },
+      ]);
+      const inspection = await backend.inspect();
+      expect(inspection.rawTypes.map((entry) => entry.type)).toContain('public.file-url');
+      expect(inspection.availableFormats).toEqual([]);
+      await expect(backend.read('files', WHOLE)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('a file URL naming another host is skipped; localhost names this one', async () => {
+      seedItems([
+        { 'public.file-url': Buffer.from('file://otherhost/etc/hosts') },
+        {
+          'public.file-url': Buffer.from(
+            pathToFileURL(doc0).href.replace('file:///', 'file://localhost/'),
+          ),
+        },
+      ]);
+      const result = await backend.read('files', WHOLE);
+      expect(result.content.toString()).toBe(doc0);
+    });
+
+    it('a file URL naming LOCALHOST in any case names this machine', async () => {
+      seedItems([
+        {
+          'public.file-url': Buffer.from(
+            pathToFileURL(doc0).href.replace('file:///', 'file://LocalHost/'),
+          ),
+        },
+      ]);
+      await expect(backend.inspect()).resolves.toMatchObject({ availableFormats: ['files'] });
+      expect((await backend.read('files', WHOLE)).content.toString()).toBe(doc0);
+    });
+
+    it('a path containing only a carriage return is left out and counted; alone it lists no files', async () => {
+      seedUrls([{ path: doc0 }, { path: carriageReturn }]);
+      const result = await backend.read('files', WHOLE);
+      expect(result.content.toString()).toBe(doc0);
+      expect(result).toMatchObject({ omittedPaths: 1, itemCount: 2 });
+
+      seedUrls([{ path: carriageReturn }]);
+      expect((await backend.inspect()).availableFormats).toEqual([]);
+      await expect(backend.read('files', WHOLE)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('a path containing a line break is left out and counted', async () => {
+      seedUrls([{ path: doc0 }, { path: broken }, { path: doc1 }]);
+      expect((await backend.inspect()).availableFormats).toEqual(['files']);
+      const result = await backend.read('files', WHOLE);
+      expect(result.content.toString()).toBe([doc0, doc1].join('\n'));
+      expect(result).toMatchObject({ omittedPaths: 1, itemCount: 3 });
+
+      // The item holding the line-break path alone has no path to list.
+      await expect(backend.read('files', WHOLE, 1)).rejects.toMatchObject({
+        category: 'format_unavailable',
+      });
+    });
+
+    it('when every path has a line break, files is not listed and the read is format_unavailable, whole and by item', async () => {
+      seedUrls([{ path: broken }]);
+      const inspection = await backend.inspect();
+      expect(inspection.rawTypes.map((entry) => entry.type)).toContain('public.file-url');
+      expect(inspection.availableFormats).not.toContain('files');
+      for (const item of [undefined, 0]) {
+        await expect(backend.read('files', WHOLE, item)).rejects.toMatchObject({
+          category: 'format_unavailable',
+        });
+      }
+    });
+
+    it('a lone line-break path beside text: inspect lists text only, and auto reads the text', async () => {
+      seedItems([
+        {
+          'public.file-url': Buffer.from(pathToFileURL(broken).href),
+          'public.utf8-plain-text': Buffer.from('caption'),
+        },
+      ]);
+      vi.mocked(getClipboardService).mockReturnValue(new ClipboardService(backend));
+      const inspection = await runToolContract(clipboardInspect, {});
+      expect(inspection.structuredContent).toMatchObject({
+        primaryFormat: 'text',
+        availableFormats: ['text'],
+        itemCount: 1,
+      });
+      const auto = await runToolContract(clipboardRead, { format: 'auto' });
+      expect(auto.structuredContent).toMatchObject({ format: 'text', content: 'caption' });
+      expect(auto.structuredContent).not.toHaveProperty('notice');
+    }, 30_000);
+
+    it('a file URL beside an image: inspect ranks files first; image still reads the image', async () => {
+      seedItems([
+        { 'public.file-url': Buffer.from(pathToFileURL(doc0).href), 'public.png': REAL_PNG_13x7 },
+      ]);
+      await expect(backend.inspect()).resolves.toMatchObject({
+        availableFormats: ['image', 'files'],
+        primaryFormat: 'files',
+      });
+      await expect(backend.read('image', WHOLE)).resolves.toMatchObject({ width: 13, height: 7 });
+      expect((await backend.read('files', WHOLE)).content.toString()).toBe(doc0);
+    });
+
+    it('a legacy NSFilenamesPboardType writer reads as files, one item per path', async () => {
+      jxa(`ObjC.import('AppKit');
+const pb = ${pasteboardRef()};
+pb.clearContents;
+pb.declareTypesOwner($(['NSFilenamesPboardType']), $());
+if (!pb.setPropertyListForType($(${JSON.stringify([doc0, doc1])}), 'NSFilenamesPboardType')) throw new Error('seed failed');
+'ok';`);
+      await expect(backend.inspect()).resolves.toMatchObject({
+        itemCount: 2,
+        availableFormats: ['files'],
+      });
+      expect((await backend.read('files', WHOLE)).content.toString()).toBe([doc0, doc1].join('\n'));
+    });
+
+    it('a files read pages through its bytes under one revision, past the end included', async () => {
+      const paths = [doc0, accented, doc1];
+      seedUrls(paths.map((path) => ({ path })));
+      const count = String(privateChangeCount());
+      const expected = Buffer.from(paths.join('\n'));
+      const chunks: Buffer[] = [];
+      let offset = 0;
+      for (;;) {
+        const slice = await backend.read('files', { offset, limit: 25 });
+        expect(slice).toMatchObject({ revision: count, totalByteSize: expected.byteLength });
+        if (slice.content.byteLength === 0) break;
+        chunks.push(slice.content);
+        offset += slice.content.byteLength;
+      }
+      expect(Buffer.concat(chunks).equals(expected)).toBe(true);
+      const past = await backend.read('files', { offset: expected.byteLength + 7, limit: 25 });
+      expect(past).toMatchObject({ content: Buffer.alloc(0), totalByteSize: expected.byteLength });
+    }, 60_000);
   });
 });
 

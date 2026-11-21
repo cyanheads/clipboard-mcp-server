@@ -85,6 +85,7 @@ describe('clipboardInspect', () => {
     const output = {
       primaryFormat: 'html' as const,
       availableFormats: ['text' as const, 'html' as const],
+      itemCount: 1,
       rawTypes: [
         { type: 'public.utf8-plain-text', bytes: 15 },
         { type: 'public.html', bytes: 350 },
@@ -98,7 +99,12 @@ describe('clipboardInspect', () => {
   });
 
   it('formats empty clipboard result', () => {
-    const output = { primaryFormat: 'empty' as const, availableFormats: [], rawTypes: [] };
+    const output = {
+      primaryFormat: 'empty' as const,
+      availableFormats: [],
+      itemCount: 0,
+      rawTypes: [],
+    };
     const blocks = clipboardInspect.format!(output);
     const text = blocks.find((b) => b.type === 'text')?.text ?? '';
     expect(text).toContain('empty');
@@ -191,6 +197,7 @@ describe('clipboardInspect — surfaced failures (#23)', () => {
     const mockInspect = vi.fn().mockResolvedValueOnce({
       primaryFormat: 'image' as const,
       availableFormats: ['image' as const],
+      itemCount: 1,
       rawTypes: [{ type: 'image/png', measurementFailed: true }],
     });
     mockGetService.mockReturnValueOnce({ inspect: mockInspect } as ReturnType<
@@ -211,6 +218,7 @@ describe('clipboardInspect — surfaced failures (#23)', () => {
       const blocks = clipboardInspect.format!({
         primaryFormat: 'text' as const,
         availableFormats: ['text' as const],
+        itemCount: 1,
         rawTypes,
       });
       return blocks.find((b) => b.type === 'text')?.text ?? '';
@@ -258,6 +266,161 @@ describe('clipboardInspect — surfaced failures (#23)', () => {
     });
   });
 
+  describe('format() — raw type names read back as written (#58)', () => {
+    function render(rawTypes: { bytes?: number; measurementFailed?: true; type: string }[]) {
+      const blocks = clipboardInspect.format!({
+        primaryFormat: 'text' as const,
+        availableFormats: ['text' as const],
+        itemCount: 1,
+        rawTypes,
+      });
+      return blocks.find((b) => b.type === 'text')?.text ?? '';
+    }
+
+    /** A table row's cell separators: pipes no backslash escapes. */
+    function separators(row: string): number {
+      let count = 0;
+      for (let i = 0; i < row.length; i++) if (row[i] === '|' && row[i - 1] !== '\\') count++;
+      return count;
+    }
+
+    it('renders a type holding a pipe, a backtick, and emphasis as one literal cell', () => {
+      const text = render([{ type: 'com.example.a|b`c**x**', bytes: 3 }]);
+      expect(text).toContain('| ``com.example.a\\|b`c**x**`` | 3 |');
+    });
+
+    it.each([
+      ['a trailing backtick', 'ends.with`', '| `` ends.with` `` | 3 |'],
+      ['a leading backtick', '`starts', '| `` `starts `` | 3 |'],
+      ['leading and trailing spaces', ' padded ', '| `  padded  ` | 3 |'],
+      ['a backtick run', 'a``b```c', '| ````a``b```c```` | 3 |'],
+    ])('keeps %s in one cell with its Bytes cell intact', (_label, type, row) => {
+      const text = render([
+        { type: 'public.utf8-plain-text', bytes: 5 },
+        { type, bytes: 3 },
+      ]);
+      expect(text).toContain(row);
+      expect(separators(row)).toBe(3);
+      expect(text).toContain('| `public.utf8-plain-text` | 5 |');
+    });
+
+    it.each([
+      ['LF', 'x\n\n# Injected'],
+      ['CR', 'com.example.carriage\rreturn'],
+      ['CRLF', 'com.example\r\n- list'],
+      ['NUL', 'com.example.nul\u0000byte'],
+      // GFM parsers disagree on `\\|` in a cell: cmark-gfm reads one escaped pipe, micromark a backslash and a cell break.
+      ['backslash before a pipe', 'back\\|slash'],
+    ])('renders every type as a fenced JSON block when one holds a %s', (_label, odd) => {
+      const rawTypes = [
+        { type: 'public.utf8-plain-text', bytes: 5 },
+        { type: odd, bytes: 3 },
+        { type: 'TARGETS' },
+        { type: 'image/png', measurementFailed: true as const },
+      ];
+      const text = render(rawTypes);
+      const fence = /\n(`{3,})json\n([\s\S]*)\n\1$/.exec(text);
+      expect(fence?.[2]).toBeDefined();
+      expect(JSON.parse(fence?.[2] ?? '')).toEqual(rawTypes);
+      expect(text).not.toContain('| Type | Bytes |');
+      // Nothing of the odd type sits outside the fence as live Markdown.
+      const outside = text.slice(0, fence?.index ?? text.length);
+      expect(outside).toBe(
+        '**Primary format:** text\n**Available formats:** text\n**Item count:** 1\n\n**Raw types:**',
+      );
+    });
+
+    it('characterization: ordinary types keep their current rows', () => {
+      const text = render([
+        { type: 'public.utf8-plain-text', bytes: 1234 },
+        { type: 'TARGETS' },
+        { type: 'image/png', measurementFailed: true },
+      ]);
+      expect(text).toContain(
+        '| Type | Bytes |\n|:-----|------:|\n| `public.utf8-plain-text` | 1,234 |\n| `TARGETS` | unknown |\n| `image/png` | unknown (measurementFailed: true) |',
+      );
+    });
+
+    it('leaves structuredContent untouched: the handler returns the service result as is', async () => {
+      const rawTypes = [{ type: 'com.example.a|b`c**x**', bytes: 3 }];
+      const inspection = {
+        primaryFormat: 'text' as const,
+        availableFormats: ['text' as const],
+        itemCount: 1,
+        rawTypes,
+      };
+      mockGetService.mockReturnValueOnce({
+        inspect: vi.fn().mockResolvedValueOnce(inspection),
+      } as unknown as ReturnType<typeof getClipboardService>);
+      const ctx = createMockContext({ errors: clipboardInspect.errors });
+      const result = await clipboardInspect.handler(clipboardInspect.input.parse({}), ctx);
+      expect(clipboardInspect.output.parse(result)).toEqual(inspection);
+    });
+  });
+
+  describe('itemCount and files (#57, #59)', () => {
+    it('returns and renders the clipboard item count', async () => {
+      const inspection = {
+        primaryFormat: 'image' as const,
+        availableFormats: ['image' as const],
+        itemCount: 3,
+        rawTypes: [{ type: 'public.png', bytes: 75 }],
+      };
+      mockGetService.mockReturnValueOnce({
+        inspect: vi.fn().mockResolvedValueOnce(inspection),
+      } as unknown as ReturnType<typeof getClipboardService>);
+      const ctx = createMockContext({ errors: clipboardInspect.errors });
+      const result = clipboardInspect.output.parse(
+        await clipboardInspect.handler(clipboardInspect.input.parse({}), ctx),
+      );
+      expect(result.itemCount).toBe(3);
+      const text = clipboardInspect.format!(result).find((b) => b.type === 'text')?.text ?? '';
+      expect(text).toContain('**Item count:** 3');
+    });
+
+    it.each([0, 1])('renders an item count of %i', (itemCount) => {
+      const text =
+        clipboardInspect.format!({
+          primaryFormat: itemCount === 0 ? ('empty' as const) : ('text' as const),
+          availableFormats: itemCount === 0 ? [] : ['text' as const],
+          itemCount,
+          rawTypes: [],
+        }).find((b) => b.type === 'text')?.text ?? '';
+      expect(text).toContain(`**Item count:** ${itemCount}`);
+    });
+
+    it('accepts files as the primary and an available format', () => {
+      const parsed = clipboardInspect.output.parse({
+        primaryFormat: 'files',
+        availableFormats: ['text', 'image', 'files'],
+        itemCount: 3,
+        rawTypes: [{ type: 'public.file-url', bytes: 56 }],
+      });
+      expect(parsed.primaryFormat).toBe('files');
+      const text = clipboardInspect.format!(parsed).find((b) => b.type === 'text')?.text ?? '';
+      expect(text).toContain('**Primary format:** files');
+      expect(text).toContain('**Available formats:** text, image, files');
+    });
+
+    it('rejects an output with no item count', () => {
+      expect(() =>
+        clipboardInspect.output.parse({
+          primaryFormat: 'empty',
+          availableFormats: [],
+          rawTypes: [],
+        }),
+      ).toThrow();
+    });
+
+    it('ranks files first and points itemCount at clipboard_read', () => {
+      expect(clipboardInspect.description).toMatch(/files > image > html > rtf > text/);
+      expect(clipboardInspect.output.shape.primaryFormat.description).toMatch(
+        /files > image > html > rtf > text/,
+      );
+      expect(clipboardInspect.output.shape.itemCount.description).toMatch(/clipboard_read/);
+    });
+  });
+
   describe('output contract (#41)', () => {
     const entry = clipboardInspect.output.shape.rawTypes.element.shape;
 
@@ -266,6 +429,7 @@ describe('clipboardInspect — surfaced failures (#23)', () => {
         clipboardInspect.output.parse({
           primaryFormat: 'empty',
           availableFormats: [],
+          itemCount: 1,
           rawTypes: [{ type: 'TARGETS' }],
         }).rawTypes[0],
       ).toEqual({ type: 'TARGETS' });

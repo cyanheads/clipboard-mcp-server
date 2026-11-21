@@ -2,10 +2,13 @@
  * @fileoverview PNG byte fixtures shared by the dimension-parser and Linux
  * backend tests. `REAL_PNG_13x7` and `REAL_PNG_1x1` are encoder-produced files
  * (base64 of the actual bytes); `buildPng` assembles structurally valid PNGs
- * with arbitrary dimensions and optional ancillary chunks.
+ * with arbitrary dimensions and optional ancillary chunks; `buildSolidPng`
+ * encodes a decodable raster of any size.
  *
  * @module tests/services/clipboard/png-fixtures
  */
+
+import { deflateSync } from 'node:zlib';
 
 /** The 8-byte PNG signature. */
 export const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -75,4 +78,25 @@ export function buildPng(
   parts.push(chunk('IDAT', Buffer.from([0x78, 0x9c, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01])));
   parts.push(chunk('IEND', Buffer.alloc(0)));
   return Buffer.concat(parts);
+}
+
+/**
+ * A decodable solid-grey 8-bit RGB PNG of the given dimensions, for tests that
+ * need real images of distinct sizes that a platform image decoder accepts.
+ */
+export function buildSolidPng(width: number, height: number): Buffer {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr.writeUInt8(8, 8); // bit depth
+  ihdr.writeUInt8(2, 9); // color type: RGB
+  // Each scanline is a filter-type byte (0, none) followed by its RGB samples.
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(width * 3, 0x80)]);
+  const raster = Buffer.concat(Array.from({ length: height }, () => row));
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', deflateSync(raster)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
 }

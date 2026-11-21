@@ -5,34 +5,26 @@
 
 import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
-import { collectByteWindow, collectHashedByteWindow, countBytes } from './byte-window.js';
-import { readPngDimensions } from './png-dimensions.js';
+import { collectByteWindow } from './byte-window.js';
+import { inspectSelection, type LinuxSelection, readSelection } from './linux-selection.js';
 import type {
   ByteRange,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
-  RawTypeEntry,
   ReadResult,
 } from './types.js';
-import { buildInspectResult, clipboardOutcome, isClipboardOutcome } from './types.js';
+import { clipboardOutcome, isClipboardOutcome } from './types.js';
 
 const PLATFORM = 'Linux Wayland';
 
-const TEXT_MIME_TYPES: readonly string[] = [
-  'text/plain',
-  'text/plain;charset=utf-8',
-  'UTF8_STRING',
-  'TEXT',
-  'STRING',
-];
-
 /** MIME types each semantic format is read from, in preference order. */
 const FORMAT_MIME_TYPES: Record<ClipboardFormat, readonly string[]> = {
-  text: TEXT_MIME_TYPES,
+  text: ['text/plain', 'text/plain;charset=utf-8', 'UTF8_STRING', 'TEXT', 'STRING'],
   html: ['text/html'],
   rtf: ['text/rtf', 'application/rtf'],
   image: ['image/png'],
+  files: ['text/uri-list'],
 };
 
 const INSTALL_HINT =
@@ -40,15 +32,6 @@ const INSTALL_HINT =
 
 const SESSION_HINT =
   'Run the server inside the Wayland desktop session so WAYLAND_DISPLAY (with XDG_RUNTIME_DIR) names a running compositor socket, then retry.';
-
-/** Map MIME type → semantic format. */
-function mimeToFormat(mime: string): ClipboardFormat | null {
-  if (TEXT_MIME_TYPES.includes(mime)) return 'text';
-  if (mime === 'text/html') return 'html';
-  if (mime === 'text/rtf' || mime === 'application/rtf') return 'rtf';
-  if (mime === 'image/png') return 'image';
-  return null;
-}
 
 /**
  * Classify a non-zero wl-paste/wl-copy exit from its diagnostic. wl-clipboard
@@ -198,67 +181,24 @@ function runWlCopy(args: string[], content?: Buffer): Promise<void> {
   });
 }
 
+/** The Wayland selection offer, as wl-paste lists and reads it. */
+const WAYLAND_SELECTION: LinuxSelection = {
+  platform: PLATFORM,
+  formatTypes: FORMAT_MIME_TYPES,
+  listTypes,
+  streamType: (mime, consume) => runWlPasteStream(payloadArgs(mime), consume),
+};
+
 /** Linux Wayland clipboard backend using wl-paste/wl-copy. */
 export class LinuxWaylandBackend implements ClipboardBackend {
   /** Only recognized MIME types are read to measure them; the rest are listed without a size. */
-  async inspect(): Promise<InspectResult> {
-    const rawTypes: RawTypeEntry[] = [];
-    for (const mime of await listTypes()) {
-      if (!mimeToFormat(mime)) {
-        rawTypes.push({ type: mime });
-        continue;
-      }
-      try {
-        // Stream and count — clipboard_inspect is metadata-only, so the
-        // representation is never retained just to report its size (#26).
-        const bytes = await runWlPasteStream(payloadArgs(mime), countBytes);
-        rawTypes.push({ type: mime, bytes });
-      } catch {
-        rawTypes.push({ type: mime, measurementFailed: true });
-      }
-    }
-    return buildInspectResult(rawTypes, mimeToFormat);
+  inspect(): Promise<InspectResult> {
+    return inspectSelection(WAYLAND_SELECTION);
   }
 
-  /**
-   * Presence is decided from `--list-types`; a listed representation is read
-   * as-is, so a zero-byte one is an empty success rather than an absent one.
-   */
-  async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
-    const offered = await listTypes();
-    if (offered.length === 0) {
-      throw clipboardOutcome(PLATFORM, 'The clipboard is empty.', { category: 'empty' });
-    }
-    const candidates = FORMAT_MIME_TYPES[format].filter((mime) => offered.includes(mime));
-    if (candidates.length === 0) {
-      throw clipboardOutcome(
-        PLATFORM,
-        `No ${format} representation on the clipboard (offered: ${offered.join(', ')}).`,
-        { category: 'format_unavailable' },
-      );
-    }
-
-    let lastError: unknown;
-    for (const mime of candidates) {
-      try {
-        // Every read streams the whole representation, so hashing it on the way
-        // through identifies the value the window was cut from.
-        const { window, totalByteSize, sha256 } = await runWlPasteStream(
-          payloadArgs(mime),
-          (stdout) => collectHashedByteWindow(stdout, range),
-        );
-        // wl-paste hands over opaque bytes with no dimension API — read them out
-        // of the PNG header so Linux reads carry what macOS and Windows report.
-        // The header only lives in the window when the window starts at byte 0.
-        const dimensions =
-          format === 'image' && range.offset === 0 ? readPngDimensions(window) : {};
-        return { format, content: window, totalByteSize, revision: sha256, ...dimensions };
-      } catch (error) {
-        if (isClipboardOutcome(error) && error.category === 'clipboard_unavailable') throw error;
-        lastError = error;
-      }
-    }
-    throw lastError;
+  /** Presence is decided from `--list-types`, never from a read succeeding. */
+  read(format: ClipboardFormat, range: ByteRange, item?: number): Promise<ReadResult> {
+    return readSelection(WAYLAND_SELECTION, format, range, item);
   }
 
   async write(
@@ -266,12 +206,8 @@ export class LinuxWaylandBackend implements ClipboardBackend {
     format: 'text' | 'html',
   ): Promise<{ format: 'text' | 'html'; byteSize: number }> {
     const buf = Buffer.from(content, 'utf8');
-    if (format === 'text') {
-      await runWlCopy(['-t', 'text/plain'], buf);
-      return { format: 'text', byteSize: buf.byteLength };
-    }
-    await runWlCopy(['-t', 'text/html'], buf);
-    return { format: 'html', byteSize: buf.byteLength };
+    await runWlCopy(['-t', format === 'text' ? 'text/plain' : 'text/html'], buf);
+    return { format, byteSize: buf.byteLength };
   }
 
   async clear(): Promise<void> {

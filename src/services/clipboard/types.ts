@@ -5,16 +5,37 @@
 
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
 
-/** A semantic clipboard format identifier. */
-export type ClipboardFormat = 'text' | 'html' | 'rtf' | 'image';
+/**
+ * A semantic clipboard format identifier. `files` is the absolute local paths
+ * of copied files, one per line — the paths only; the server never opens them.
+ */
+export type ClipboardFormat = 'text' | 'html' | 'rtf' | 'image' | 'files';
+
+/**
+ * How a read with no `item` drew on a clipboard holding more than one item
+ * (macOS only — Linux and Windows hold one): `first` — the first item carrying
+ * the format; `joined` — every item's representation joined by the platform
+ * (AppKit joins text and RTF items); `all` — every item's value (`files`).
+ */
+export type ItemScope = 'first' | 'joined' | 'all';
+
+/** Item metadata every backend read reports beside its bytes. */
+export interface ReadItems {
+  /** Number of items on the clipboard (`pasteboardItems.count` on macOS; 1 or 0 elsewhere). */
+  itemCount: number;
+  /** Present only for a read with no `item` on a clipboard holding more than one item. */
+  itemScope?: ItemScope;
+}
 
 /**
  * Metadata about a single pasteboard type, in one of three shapes:
  * `{ type, bytes }` — measured, where `0` means present and empty;
  * `{ type }` — listed but not sized by this backend (an unrecognized Linux
- * target, a Windows object that is not a string, byte array, or stream);
+ * target, a Windows object that is not a string, byte array, stream, or file
+ * drop list);
  * `{ type, measurementFailed: true }` — listed, but its data was nil, null, or
- * failed to read. Only a measured or unsized entry makes its format available.
+ * failed to read, or (Windows) a file drop list held no listable path. Only a
+ * measured or unsized entry makes its format available.
  */
 export interface RawTypeEntry {
   /** Measured byte size of this representation. Never a stand-in for an unknown size. */
@@ -81,7 +102,7 @@ export type ClipboardOutcomeCategory =
 
 /** Category-specific fields: an unavailable clipboard always says how to recover. */
 export type ClipboardOutcomeDetails =
-  | { category: 'empty' | 'format_unavailable' | 'representation_changed' }
+  | { category: Exclude<ClipboardOutcomeCategory, 'clipboard_unavailable'> }
   | {
       category: 'clipboard_unavailable';
       /** Next step for the caller — the install command or the session variable to fix. */
@@ -163,12 +184,21 @@ export interface RangedReadWindow {
   contentBase64: string;
   /** Image height in pixels (image reads only). */
   height?: number;
+  /** Number of items on the clipboard, when the helper reports it (macOS). */
+  itemCount?: number;
+  /** Paths a `files` read left out (see `ReadResult.omittedPaths`). */
+  omittedPaths?: number;
   /** Identity of the value the window was cut from (see `ReadResult.revision`). */
   revision: string;
   /** Byte size of the full representation. */
   total: number;
   /** Image width in pixels (image reads only). */
   width?: number;
+}
+
+/** A count a helper reports: a non-negative integer. */
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
 /** The outcome for a clipboard that changed while one read was in progress. */
@@ -181,8 +211,8 @@ export function representationChanged(platform: string, formatName: string): Cli
 }
 
 /**
- * Parse the `{ present, total, contentBase64, revision, width?, height? }`
- * envelope a macOS or Windows ranged read helper prints. `present: false` is
+ * Parse the `{ present, total, contentBase64, revision, width?, height?,
+ * itemCount?, omittedPaths? }` envelope a macOS or Windows ranged read helper prints. `present: false` is
  * the helper reporting the representation absent (`format_unavailable`);
  * `changed: true` is the helper seeing the clipboard change mid-read
  * (`representation_changed`). Anything else that is not a well-formed envelope
@@ -211,6 +241,8 @@ export function parseRangedReadEnvelope(
     changed?: unknown;
     contentBase64?: unknown;
     height?: unknown;
+    itemCount?: unknown;
+    omittedPaths?: unknown;
     present?: unknown;
     revision?: unknown;
     total?: unknown;
@@ -223,14 +255,16 @@ export function parseRangedReadEnvelope(
       category: 'format_unavailable',
     });
   }
-  const { total, contentBase64, revision, width, height } = envelope;
+  const { total, contentBase64, revision, width, height, itemCount, omittedPaths } = envelope;
   if (
     typeof total !== 'number' ||
     typeof contentBase64 !== 'string' ||
     typeof revision !== 'string' ||
     revision === '' ||
     (width !== undefined && typeof width !== 'number') ||
-    (height !== undefined && typeof height !== 'number')
+    (height !== undefined && typeof height !== 'number') ||
+    (itemCount !== undefined && !isCount(itemCount)) ||
+    (omittedPaths !== undefined && !isCount(omittedPaths))
   ) {
     throw unreadable();
   }
@@ -240,17 +274,26 @@ export function parseRangedReadEnvelope(
     revision,
     ...(width !== undefined && { width }),
     ...(height !== undefined && { height }),
+    ...(itemCount !== undefined && { itemCount }),
+    ...(omittedPaths !== undefined && { omittedPaths }),
   };
 }
 
 /** The `ReadResult` for a window a ranged read helper returned (see `parseRangedReadEnvelope`). */
-export function toReadResult(format: ClipboardFormat, window: RangedReadWindow): ReadResult {
-  const { total, contentBase64, revision, width, height } = window;
+export function toReadResult(
+  format: ClipboardFormat,
+  window: RangedReadWindow,
+  items: ReadItems,
+): ReadResult {
+  const { total, contentBase64, revision, width, height, omittedPaths } = window;
   return {
     format,
     content: Buffer.from(contentBase64, 'base64'),
     totalByteSize: total,
     revision,
+    itemCount: items.itemCount,
+    ...(items.itemScope !== undefined && { itemScope: items.itemScope }),
+    ...(omittedPaths !== undefined && omittedPaths > 0 && { omittedPaths }),
     ...(width !== undefined && { width }),
     ...(height !== undefined && { height }),
   };
@@ -260,17 +303,20 @@ export function toReadResult(format: ClipboardFormat, window: RangedReadWindow):
 export interface InspectResult {
   /** All semantic formats present on the clipboard. */
   availableFormats: ClipboardFormat[];
-  /** The richest semantic format present (image > html > rtf > text), or 'empty'. */
+  /** Number of items on the clipboard (`pasteboardItems.count` on macOS; 1 or 0 elsewhere). */
+  itemCount: number;
+  /** The richest semantic format present (files > image > html > rtf > text), or 'empty'. */
   primaryFormat: ClipboardFormat | 'empty';
   /** Every type the platform lists, with its measured size where there is one. */
   rawTypes: RawTypeEntry[];
 }
 
 /**
- * Format priority from lowest to highest richness (image wins, text is baseline).
+ * Format priority from lowest to highest richness (files win, so a file-manager
+ * copy resolves to its paths rather than its icon; text is baseline).
  * Sort descending by index to get richest-first order.
  */
-export const FORMAT_PRIORITY: ClipboardFormat[] = ['text', 'rtf', 'html', 'image'];
+export const FORMAT_PRIORITY: ClipboardFormat[] = ['text', 'rtf', 'html', 'image', 'files'];
 
 /**
  * Derive `availableFormats` (in `FORMAT_PRIORITY` order) and `primaryFormat`
@@ -281,93 +327,18 @@ export const FORMAT_PRIORITY: ClipboardFormat[] = ['text', 'rtf', 'html', 'image
 export function buildInspectResult(
   rawTypes: RawTypeEntry[],
   toFormat: (type: string) => ClipboardFormat | null,
+  itemCount: number,
 ): InspectResult {
   const readable = new Set(
     rawTypes.filter((entry) => !entry.measurementFailed).map((entry) => toFormat(entry.type)),
   );
   const availableFormats = FORMAT_PRIORITY.filter((format) => readable.has(format));
-  return { rawTypes, availableFormats, primaryFormat: availableFormats.at(-1) ?? 'empty' };
-}
-
-/**
- * Decode common named, decimal (`&#169;`), and hexadecimal (`&#xA9;`, `&#XA9;`)
- * references in one pass. `String.fromCodePoint` emits the correct surrogate pair for
- * astral code points. A reference outside the Unicode range, or one naming a
- * lone surrogate or NUL — none of which have a standalone text representation —
- * passes through as written rather than throwing.
- */
-function decodeReferences(text: string): string {
-  const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', nbsp: ' ' };
-  return text.replace(
-    /&(?:#(x[0-9a-f]+|[0-9]+)|(amp|lt|gt|quot|nbsp));/gi,
-    (reference, digits: string | undefined, name: string | undefined) => {
-      if (digits === undefined) return named[name ?? ''] ?? reference;
-      const codePoint =
-        digits[0] === 'x' || digits[0] === 'X'
-          ? Number.parseInt(digits.slice(1), 16)
-          : Number.parseInt(digits, 10);
-      if (codePoint <= 0 || codePoint > 0x10ffff) return reference;
-      if (codePoint >= 0xd800 && codePoint <= 0xdfff) return reference;
-      return String.fromCodePoint(codePoint);
-    },
-  );
-}
-
-/** Strip HTML tags to produce plain text, decoding common entities. */
-export function stripHtmlTags(html: string): string {
-  const parts: string[] = [];
-  const block =
-    /^(?:p|h[1-6]|div|li|td|tr|blockquote|pre|article|section|header|footer|aside|nav|main|figure|figcaption)$/;
-  let hidden: string | undefined;
-  let cursor = 0;
-  while (cursor < html.length) {
-    if (hidden) {
-      const close = new RegExp(`</${hidden}\\s*>`, 'gi');
-      close.lastIndex = cursor;
-      const match = close.exec(html);
-      if (!match) break;
-      cursor = close.lastIndex;
-      hidden = undefined;
-      continue;
-    }
-    const start = html.indexOf('<', cursor);
-    if (start === -1) {
-      parts.push(html.slice(cursor));
-      break;
-    }
-    parts.push(html.slice(cursor, start));
-    if (html.startsWith('<!--', start)) {
-      const end = html.indexOf('-->', start + 4);
-      cursor = end === -1 ? html.length : end + 3;
-      continue;
-    }
-    const tag = /^<[!/]?([a-z][a-z0-9:-]*)(?=[\s/>])/i.exec(html.slice(start));
-    if (!tag?.[1]) {
-      parts.push('<');
-      cursor = start + 1;
-      continue;
-    }
-    const name = tag[1].toLowerCase();
-    const closing = html[start + 1] === '/';
-    let end = start + tag[0].length;
-    let quote: string | undefined;
-    for (; end < html.length; end++) {
-      const char = html[end];
-      if (quote) {
-        if (char === quote) quote = undefined;
-      } else if (char === '"' || char === "'") {
-        quote = char;
-      } else if (char === '>') break;
-    }
-    if (!closing && (name === 'script' || name === 'style')) {
-      hidden = name;
-    } else if (name === 'br' || (closing && block.test(name))) {
-      parts.push(' ');
-    }
-    cursor = end + 1;
-  }
-  // Decode after tokenization, once: escaped markup remains literal text.
-  return decodeReferences(parts.join('')).replace(/\s+/g, ' ').trim();
+  return {
+    rawTypes,
+    availableFormats,
+    itemCount,
+    primaryFormat: availableFormats.at(-1) ?? 'empty',
+  };
 }
 
 /**
@@ -390,6 +361,16 @@ export interface ReadResult {
   format: ClipboardFormat;
   /** Image height in pixels (present only for image format). */
   height?: number;
+  /** Number of items on the clipboard (see `ReadItems`). */
+  itemCount: number;
+  /** How a read with no `item` drew on a multi-item clipboard (see `ItemScope`). */
+  itemScope?: ItemScope;
+  /**
+   * `files` reads only, present when > 0: paths left out of `content` because
+   * the one-path-per-line UTF-8 form cannot carry them — a path holding a line
+   * break, or (Linux) one whose bytes are not valid UTF-8.
+   */
+  omittedPaths?: number;
   /**
    * Identity of the value `content` was cut from, derived in the same pass that
    * produced it: the SHA-256 of the full representation (Linux, Windows), or
@@ -419,9 +400,18 @@ export interface RangedReadResult {
   format: ClipboardFormat;
   /** Image height in pixels (present only for image format). */
   height?: number;
+  /** Number of items on the clipboard (see `ReadItems`). */
+  itemCount: number;
+  /** How a read with no `item` drew on a multi-item clipboard (see `ItemScope`). */
+  itemScope?: ItemScope;
   /** Offset to pass to the next call. Absent once `complete` is true. */
   nextOffset?: number;
-  /** Opaque token for the value and format this window was cut from: `<format>:<revision>`. */
+  /** `files` reads only: paths left out (see `ReadResult.omittedPaths`). */
+  omittedPaths?: number;
+  /**
+   * Opaque token for the value, format, and item this window was cut from:
+   * `<format>:<revision>`, or `<format>#<item>:<revision>` for a read of one item.
+   */
   representationId: string;
   /** Total byte size of the full representation. */
   totalByteSize: number;
@@ -481,8 +471,13 @@ export interface ClipboardBackend {
    * format is returned as empty content. An image read takes the first image
    * representation that yields PNG bytes and returns the empty success only
    * when every listed one is zero-length.
+   *
+   * `item` (0-based) reads that one clipboard item alone; omitted, the read
+   * draws on the clipboard as a whole and reports `itemScope` when it holds
+   * more than one item. An `item` at or past `itemCount` throws
+   * `format_unavailable`.
    */
-  read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult>;
+  read(format: ClipboardFormat, range: ByteRange, item?: number): Promise<ReadResult>;
 
   /**
    * Write content to the clipboard.

@@ -33,6 +33,7 @@ import type { ClipboardBackend } from '@/services/clipboard/types.js';
 import { WindowsBackend } from '@/services/clipboard/windows-backend.js';
 import { REAL_PNG_13x7 } from '../services/clipboard/png-fixtures.js';
 import {
+  type HelperReply,
   type HelperScript,
   requestedType,
   scriptedSpawn,
@@ -277,6 +278,7 @@ describe.each(['0.13', 'git'] as const)('X11, xclip %s', (version) => {
     expect(inspect.structuredContent).toEqual({
       primaryFormat: 'empty',
       availableFormats: [],
+      itemCount: 0,
       rawTypes: [],
     });
 
@@ -490,6 +492,7 @@ describe.each(['2.1', '2.2'] as const)('Wayland, wl-clipboard %s', (version) => 
     expect(inspect.structuredContent).toEqual({
       primaryFormat: 'empty',
       availableFormats: [],
+      itemCount: 0,
       rawTypes: [],
     });
 
@@ -666,11 +669,35 @@ describe.each(['2.1', '2.2'] as const)('Wayland, wl-clipboard %s', (version) => 
 // #36 — macOS and Windows raise the typed categories too.
 // ---------------------------------------------------------------------------
 
-/** An empty macOS pasteboard: the type listing is `[]`, every ranged read is absent. */
+/** The JXA script of an osascript invocation: the argument after `-e`. */
+function jxaScriptOf(args: readonly string[]): string {
+  return args[args.indexOf('-e') + 1] ?? '';
+}
+
+/** The item a JXA read was passed after `--`; undefined for a read of the whole pasteboard. */
+function jxaItemOf(args: readonly string[]): number | undefined {
+  const index = args.indexOf('--');
+  return index >= 0 ? Number(args[index + 1]) : undefined;
+}
+
+/** True for the JXA inspection script, which alone prints the `hasFilePaths` flag. */
+function isJxaInspect(script: string): boolean {
+  return script.includes('hasFilePaths');
+}
+
+/** The `{ itemCount, hasFilePaths, types }` description the JXA inspection script prints. */
+function macosInspection(
+  types: readonly object[],
+  { itemCount = types.length > 0 ? 1 : 0, hasFilePaths = false } = {},
+): string {
+  return JSON.stringify({ itemCount, hasFilePaths, types });
+}
+
+/** An empty macOS pasteboard: no types and no items, and every ranged read is absent. */
 const macosEmptyScript: HelperScript = (_command, args) =>
-  (args.at(-1) ?? '').includes('subdataWithRange')
-    ? { stdout: JSON.stringify({ present: false }) }
-    : { stdout: '[]' };
+  isJxaInspect(jxaScriptOf(args))
+    ? { stdout: macosInspection([]) }
+    : { stdout: JSON.stringify({ present: false }) };
 
 describe('macOS and Windows typed outcomes', () => {
   it('macOS: an absent HTML representation fails format_unavailable', async () => {
@@ -679,10 +706,24 @@ describe('macOS and Windows typed outcomes', () => {
     expect(error).toMatchObject({ code: NotFound, data: { reason: 'format_unavailable' } });
   });
 
-  it('macOS: text on an empty pasteboard fails format_unavailable', async () => {
+  it('macOS: an empty pasteboard inspects as empty with no items; text and auto fail format_unavailable', async () => {
     install(new MacosBackend(), macosEmptyScript);
-    const error = wireError(await runToolContract(clipboardRead, { format: 'text' }));
-    expect(error).toMatchObject({ code: NotFound, data: { reason: 'format_unavailable' } });
+    const inspect = await runToolContract(clipboardInspect, {});
+    expect(inspect.structuredContent).toEqual({
+      primaryFormat: 'empty',
+      availableFormats: [],
+      itemCount: 0,
+      rawTypes: [],
+    });
+    expect(textOf(inspect)).toContain('**Item count:** 0');
+    for (const format of ['text', 'auto'] as const) {
+      const result = await runToolContract(clipboardRead, { format });
+      expect(wireError(result), format).toMatchObject({
+        code: NotFound,
+        data: { reason: 'format_unavailable' },
+      });
+      expect(textOf(result), format).toMatch(/not present on the clipboard|Clipboard is empty/);
+    }
   });
 
   it('Windows: an absent RTF representation fails format_unavailable', async () => {
@@ -725,6 +766,23 @@ function psInt(script: string, name: string): number {
   const match = new RegExp(`^\\$${name} = (\\d+)$`, 'm').exec(script);
   if (!match?.[1]) throw new Error(`script assigns no $${name}`);
   return Number(match[1]);
+}
+
+/**
+ * The present envelope a ranged PowerShell read prints: the `$offset`/`$limit`
+ * window of `bytes` and their SHA-256, as `psSliceSnippet` emits them.
+ */
+function psWindow(script: string, bytes: Buffer, extra: Record<string, number> = {}): HelperReply {
+  const from = Math.min(psInt(script, 'offset'), bytes.byteLength);
+  return {
+    stdout: JSON.stringify({
+      present: true,
+      total: bytes.byteLength,
+      contentBase64: bytes.subarray(from, from + psInt(script, 'limit')).toString('base64'),
+      revision: createHash('sha256').update(bytes).digest('base64'),
+      ...extra,
+    }),
+  };
 }
 
 /** Windows world whose clipboard holds the raw `HTML Format` bytes `payload`. */
@@ -830,13 +888,16 @@ describe('clipboard_write through the stdin writers (#30, #31)', () => {
     ['Windows', () => new WindowsBackend(), 'powershell.exe'],
   ] as const)('%s: a 1 MiB HTML write succeeds on both surfaces', async (_label, make, helper) => {
     const fake = install(make(), (command) => {
-      // Inspection (prior-text capture) reports an empty clipboard.
-      return command === helper ? { stdout: '[]' } : { errorCode: 'ENOENT' };
+      // The prior-text read finds no text; the writer's stdout is not read.
+      return command === helper
+        ? { stdout: JSON.stringify({ present: false }) }
+        : { errorCode: 'ENOENT' };
     });
     const html = `<p>${'x'.repeat(1048569)}</p>`;
     const result = await runToolContract(clipboardWrite, { content: html, format: 'html' });
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({ format: 'html', byteSize: 1048576 });
+    expect(result.structuredContent).not.toHaveProperty('previousContent');
     expect(textOf(result)).toContain('1,048,576 bytes');
     const writer = fake.calls.at(-1);
     expect(writer?.stdin?.byteLength).toBeGreaterThan(2 * 1048576);
@@ -845,9 +906,9 @@ describe('clipboard_write through the stdin writers (#30, #31)', () => {
 
   it('macOS: a failed pasteboard set surfaces as an error, not a success', async () => {
     install(new MacosBackend(), (_command, args) =>
-      args.at(-1)?.includes('fileHandleWithStandardInput')
+      jxaScriptOf(args).includes('fileHandleWithStandardInput')
         ? { exitCode: 1, stderr: 'execution error: Error: setting public.html failed (-2700)' }
-        : { stdout: '[]' },
+        : { stdout: JSON.stringify({ present: false }) },
     );
     const result = await runToolContract(clipboardWrite, { content: '<p>x</p>', format: 'html' });
     const error = wireError(result);
@@ -858,7 +919,7 @@ describe('clipboard_write through the stdin writers (#30, #31)', () => {
   it('macOS: previousContent is still captured before the text write, through one JXA read', async () => {
     const prior = Buffer.from('﻿prior text');
     const fake = install(new MacosBackend(), (_command, args) => {
-      const script = args.at(-1) ?? '';
+      const script = jxaScriptOf(args);
       if (script.includes('fileHandleWithStandardInput')) return { stdout: 'ok' };
       if (script.includes("dataForType('public.utf8-plain-text')")) {
         return {
@@ -867,6 +928,7 @@ describe('clipboard_write through the stdin writers (#30, #31)', () => {
             total: prior.byteLength,
             contentBase64: prior.toString('base64'),
             revision: '31',
+            itemCount: 1,
           }),
         };
       }
@@ -994,19 +1056,6 @@ interface WindowsImageWorld {
 function windowsImageScript(world: WindowsImageWorld): HelperScript {
   return (_command, args) => {
     const script = args.at(-1) ?? '';
-    /** The `$offset`/`$limit` window of `bytes`, answered as `psSliceSnippet` does. */
-    const envelope = (bytes: Buffer, extra: Record<string, number> = {}) => {
-      const from = Math.min(psInt(script, 'offset'), bytes.byteLength);
-      return {
-        stdout: JSON.stringify({
-          present: true,
-          total: bytes.byteLength,
-          contentBase64: bytes.subarray(from, from + psInt(script, 'limit')).toString('base64'),
-          revision: createHash('sha256').update(bytes).digest('base64'),
-          ...extra,
-        }),
-      };
-    };
     if (script.includes('GetFormats')) {
       const listing = [
         ...(world.png ? [{ type: 'PNG', bytes: world.png.byteLength }] : []),
@@ -1020,7 +1069,7 @@ function windowsImageScript(world: WindowsImageWorld): HelperScript {
     if (script.includes('nativeTextFormats')) {
       return world.text === undefined
         ? { stdout: JSON.stringify({ present: false }) }
-        : envelope(Buffer.from(world.text));
+        : psWindow(script, Buffer.from(world.text));
     }
     const png = script.includes("GetData('PNG', $false)") ? world.png : undefined;
     // A script that decodes the PNG first (System.Drawing, modeled by the header
@@ -1031,9 +1080,9 @@ function windowsImageScript(world: WindowsImageWorld): HelperScript {
           ? readPngDimensions(png)
           : {}
         : undefined;
-    if (png && decoded) return envelope(png, { ...decoded });
-    if (world.bitmap) return envelope(world.bitmap, { width: 13, height: 7 });
-    if (png?.byteLength === 0) return envelope(png);
+    if (png && decoded) return psWindow(script, png, { ...decoded });
+    if (world.bitmap) return psWindow(script, world.bitmap, { width: 13, height: 7 });
+    if (png?.byteLength === 0) return psWindow(script, png);
     return { stdout: JSON.stringify({ present: false }) };
   };
 }
@@ -1058,6 +1107,7 @@ describe('Windows clipboard_read image (#43)', () => {
         totalByteSize: 0,
         complete: true,
         representationId: `image:${createHash('sha256').update(Buffer.alloc(0)).digest('base64')}`,
+        itemCount: 1,
       });
       expect(result.content.some((b) => b.type === 'image')).toBe(false);
     }
@@ -1125,6 +1175,7 @@ describe('Windows clipboard_read image (#43)', () => {
     expect(inspect.structuredContent).toEqual({
       primaryFormat: 'image',
       availableFormats: ['image'],
+      itemCount: 1,
       rawTypes: [{ type: 'Bitmap' }],
     });
     expect(textOf(inspect)).toContain('| `Bitmap` | unknown |');
@@ -1160,7 +1211,7 @@ function expectRepresentationChanged(result: Awaited<ReturnType<typeof runToolCo
   const error = wireError(result);
   expect(error).toMatchObject({ code: Conflict, data: { reason: 'representation_changed' } });
   expect(hintOf(error)).toBe(
-    'The clipboard changed during the read — after an earlier slice, or while this call was reading. Discard the bytes read so far and restart at offset 0 without representationId.',
+    'The value being read is not the one the earlier slices came from: another application copied after an earlier slice or during this call, or this continuation named a different format or item. Discard the bytes read so far and restart at offset 0 without representationId, passing the same item on every slice.',
   );
   expect(textOf(result)).toContain(hintOf(error));
   expect(result.structuredContent).not.toHaveProperty('content');
@@ -1339,10 +1390,10 @@ interface MacosTextWorld {
  */
 function macosTextScript(world: MacosTextWorld): HelperScript {
   return (_command, args) => {
-    const script = args.at(-1) ?? '';
-    if (!script.includes('subdataWithRange')) {
+    const script = jxaScriptOf(args);
+    if (isJxaInspect(script)) {
       return {
-        stdout: JSON.stringify(
+        stdout: macosInspection(
           world.text ? [{ type: 'public.utf8-plain-text', bytes: world.text.byteLength }] : [],
         ),
       };
@@ -1352,33 +1403,36 @@ function macosTextScript(world: MacosTextWorld): HelperScript {
     if (!text || !script.includes("dataForType('public.utf8-plain-text')")) {
       return { stdout: JSON.stringify({ present: false }) };
     }
-    const from = Math.min(jxaInt(script, /Math\.min\((\d+), total\)/), text.byteLength);
-    const limit = jxaInt(script, /Math\.min\((\d+), total - location\)/);
-    return {
-      stdout: JSON.stringify({
-        present: true,
-        total: text.byteLength,
-        contentBase64: text.subarray(from, from + limit).toString('base64'),
-        revision: String(world.changeCount),
-      }),
-    };
+    return { stdout: jxaWindow(script, text, String(world.changeCount), 1) };
   };
+}
+
+/**
+ * The present envelope a JXA read script prints: the `[offset, offset + limit)`
+ * window its slice snippet asks for, as `jxaSliceSnippet` cuts it.
+ */
+function jxaWindow(
+  script: string,
+  bytes: Buffer,
+  revision: string,
+  itemCount: number,
+  extra: Record<string, number> = {},
+): string {
+  const from = Math.min(jxaInt(script, /Math\.min\((\d+), total\)/), bytes.byteLength);
+  const limit = jxaInt(script, /Math\.min\((\d+), total - location\)/);
+  return JSON.stringify({
+    present: true,
+    total: bytes.byteLength,
+    contentBase64: bytes.subarray(from, from + limit).toString('base64'),
+    revision,
+    itemCount,
+    ...extra,
+  });
 }
 
 /** Windows world holding plain text, answered as `psSliceSnippet` would. */
 function windowsTextScript(world: { text: Buffer }): HelperScript {
-  return (_command, args) => {
-    const script = args.at(-1) ?? '';
-    const from = Math.min(psInt(script, 'offset'), world.text.byteLength);
-    return {
-      stdout: JSON.stringify({
-        present: true,
-        total: world.text.byteLength,
-        contentBase64: world.text.subarray(from, from + psInt(script, 'limit')).toString('base64'),
-        revision: createHash('sha256').update(world.text).digest('base64'),
-      }),
-    };
-  };
+  return (_command, args) => psWindow(args.at(-1) ?? '', world.text);
 }
 
 describe('macOS and Windows: representationId across slices (#38)', () => {
@@ -1472,5 +1526,479 @@ describe('macOS and Windows: representationId across slices (#38)', () => {
     });
     expect(tail.structured.content).toBe('Z</p>');
     expect(tail.structured.representationId).toBe(head.structured.representationId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #57 — clipboard items; #59 — copied files, through each platform's helper.
+// ---------------------------------------------------------------------------
+
+/** A path a `files` read can list: one path per line holds no CR or LF. */
+const listablePath = (path: string) => !/[\r\n]/.test(path);
+
+/** The notice a 3-item read with no item carries for `format` and its item scope. */
+function threeItemNotice(format: string, scope: 'first' | 'joined' | 'all'): string {
+  const source = {
+    first:
+      format === 'image'
+        ? 'this "image" read comes from one item: the first holding a PNG, else the first holding another image type'
+        : `this "${format}" read comes from the first item that has the format`,
+    joined:
+      format === 'rtf'
+        ? 'this "rtf" read is one RTF document built from every item that holds text, HTML, or RTF'
+        : `this "${format}" read joins the ${format} of every item that has it into one value`,
+    all: `this "${format}" read lists every item's paths, in item order`,
+  }[scope];
+  return `The clipboard holds 3 items; ${source}. Pass item (0 to 2) to read one item alone.`;
+}
+
+const ONE_OMITTED_NOTICE =
+  '1 copied path contains a line break or bytes that are not UTF-8, which one-path-per-line UTF-8 content cannot hold, so it is left out.';
+
+/** One modeled macOS pasteboard item. */
+interface MacosItem {
+  html?: string;
+  /** The local path the item's `public.file-url` resolves to. */
+  path?: string;
+  text?: string;
+}
+
+/**
+ * macOS world holding several pasteboard items. A read of the whole pasteboard
+ * answers as AppKit does — text joined across items with "\n", HTML from the
+ * first item carrying it, every item's listable path — and a read passed
+ * `-- <item>` answers from that item alone; an item past the last is absent.
+ */
+function macosItemsScript(world: {
+  changeCount: number;
+  items: readonly MacosItem[];
+}): HelperScript {
+  return (_command, args) => {
+    const script = jxaScriptOf(args);
+    const { items } = world;
+    if (isJxaInspect(script)) {
+      const texts = items.flatMap((entry) => (entry.text === undefined ? [] : [entry.text]));
+      const html = items.find((entry) => entry.html !== undefined)?.html;
+      const paths = items.flatMap((entry) => (entry.path === undefined ? [] : [entry.path]));
+      const types = [
+        ...(texts.length > 0
+          ? [{ type: 'public.utf8-plain-text', bytes: Buffer.byteLength(texts.join('\n')) }]
+          : []),
+        ...(html !== undefined ? [{ type: 'public.html', bytes: Buffer.byteLength(html) }] : []),
+        ...(paths.length > 0
+          ? [{ type: 'public.file-url', bytes: Buffer.byteLength(`file://${paths[0]}`) }]
+          : []),
+      ];
+      return {
+        stdout: macosInspection(types, {
+          itemCount: items.length,
+          hasFilePaths: paths.some(listablePath),
+        }),
+      };
+    }
+    const item = jxaItemOf(args);
+    const selected = item === undefined ? items : items.slice(item, item + 1);
+    let bytes: Buffer | undefined;
+    let extra: Record<string, number> = {};
+    if (script.includes('const paths = item === null')) {
+      const paths = selected.flatMap((entry) => (entry.path === undefined ? [] : [entry.path]));
+      const listed = paths.filter(listablePath);
+      if (listed.length > 0) {
+        bytes = Buffer.from(listed.join('\n'));
+        extra = { omittedPaths: paths.length - listed.length };
+      }
+    } else if (script.includes("dataForType('public.utf8-plain-text')")) {
+      const texts = selected.flatMap((entry) => (entry.text === undefined ? [] : [entry.text]));
+      if (texts.length > 0) bytes = Buffer.from(texts.join('\n'));
+    } else if (script.includes("dataForType('public.html')")) {
+      const html = selected.find((entry) => entry.html !== undefined)?.html;
+      if (html !== undefined) bytes = Buffer.from(html);
+    }
+    return {
+      stdout:
+        bytes === undefined
+          ? JSON.stringify({ present: false })
+          : jxaWindow(script, bytes, String(world.changeCount), items.length, extra),
+    };
+  };
+}
+
+describe('macOS: a multi-item pasteboard through the JXA helper (#57, #59)', () => {
+  const ITEMS: MacosItem[] = [0, 1, 2].map((n) => ({
+    text: `item ${n}`,
+    html: `<p>${n}</p>`,
+    path: `/p/${n}`,
+  }));
+
+  it('inspect counts the items and ranks files first on both surfaces', async () => {
+    install(new MacosBackend(), macosItemsScript({ changeCount: 90, items: ITEMS }));
+    const inspect = await runToolContract(clipboardInspect, {});
+    expect(inspect.structuredContent).toMatchObject({
+      primaryFormat: 'files',
+      availableFormats: ['text', 'html', 'files'],
+      itemCount: 3,
+    });
+    expect(textOf(inspect)).toContain('**Item count:** 3');
+  });
+
+  it.each([
+    ['text', 'item 0\nitem 1\nitem 2', 'joined'],
+    ['html', '<p>0</p>', 'first'],
+    ['files', '/p/0\n/p/1\n/p/2', 'all'],
+  ] as const)(
+    'a %s read with no item draws on the items as AppKit does and says how on both surfaces',
+    async (format, content, scope) => {
+      const fake = install(new MacosBackend(), macosItemsScript({ changeCount: 90, items: ITEMS }));
+      const { result, structured } = await readOk({ format });
+      const notice = threeItemNotice(format, scope);
+      expect(structured).toMatchObject({
+        format,
+        content,
+        itemCount: 3,
+        notice,
+        representationId: `${format}:90`,
+      });
+      expect(textOf(result)).toContain(notice);
+      expect(textOf(result)).toContain('**Item count:** 3');
+      expect(fake.calls.at(-1)?.args).not.toContain('--');
+    },
+  );
+
+  it('item reads that item alone — passed after --, under its own token, with no notice; auto too', async () => {
+    const fake = install(new MacosBackend(), macosItemsScript({ changeCount: 90, items: ITEMS }));
+    const { result, structured } = await readOk({ format: 'text', item: 1 });
+    expect(structured).toMatchObject({
+      content: 'item 1',
+      itemCount: 3,
+      representationId: 'text#1:90',
+    });
+    expect(structured).not.toHaveProperty('notice');
+    expect(textOf(result)).not.toContain('The clipboard holds');
+    expect(fake.calls.at(-1)?.args.slice(-2)).toEqual(['--', '1']);
+
+    const auto = await readOk({ format: 'auto', item: 2 });
+    expect(auto.structured).toMatchObject({
+      format: 'files',
+      content: '/p/2',
+      representationId: 'files#2:90',
+    });
+  });
+
+  it('an item past the last: an explicit read finds it absent; auto stops at the item count before reading', async () => {
+    const fake = install(new MacosBackend(), macosItemsScript({ changeCount: 90, items: ITEMS }));
+    const explicit = await runToolContract(clipboardRead, { format: 'html', item: 3 });
+    expect(wireError(explicit)).toMatchObject({
+      code: NotFound,
+      data: { reason: 'format_unavailable', item: 3 },
+    });
+    expect(textOf(explicit)).toContain(
+      'Format "html" is not present on clipboard item 3, or the clipboard has no item 3.',
+    );
+
+    const before = fake.calls.length;
+    const auto = await runToolContract(clipboardRead, { format: 'auto', item: 3 });
+    expect(wireError(auto)).toMatchObject({
+      code: NotFound,
+      data: { reason: 'format_unavailable', item: 3, itemCount: 3 },
+    });
+    expect(textOf(auto)).toContain('The clipboard holds 3 items; item 3 is past the last (2).');
+    // Only the inspection ran: no read script was spawned for an item that is not there.
+    expect(fake.calls.slice(before).map((call) => isJxaInspect(jxaScriptOf(call.args)))).toEqual([
+      true,
+    ]);
+  });
+
+  it('a files read that left a line-break path out says so beside the item notice', async () => {
+    install(
+      new MacosBackend(),
+      macosItemsScript({
+        changeCount: 7,
+        items: [{ path: '/a' }, { path: '/line\nbreak' }, { path: '/c' }],
+      }),
+    );
+    expect((await runToolContract(clipboardInspect, {})).structuredContent).toMatchObject({
+      availableFormats: ['files'],
+    });
+    const { result, structured } = await readOk({ format: 'files' });
+    const notice = `${threeItemNotice('files', 'all')} ${ONE_OMITTED_NOTICE}`;
+    expect(structured).toMatchObject({ content: '/a\n/c', totalByteSize: 5, notice });
+    expect(textOf(result)).toContain(notice);
+  });
+
+  it('a continuation that drops or changes item fails representation_changed; the same item continues', async () => {
+    install(new MacosBackend(), macosItemsScript({ changeCount: 90, items: ITEMS }));
+    const first = await readOk({ format: 'text', item: 1, offset: 0, limit: 4 });
+    expect(first.structured).toMatchObject({
+      content: 'item',
+      nextOffset: 4,
+      representationId: 'text#1:90',
+    });
+    const { representationId } = first.structured;
+    for (const scope of [{ item: 2 }, {}]) {
+      expectRepresentationChanged(
+        await runToolContract(clipboardRead, {
+          format: 'text',
+          offset: 4,
+          limit: 4,
+          representationId,
+          ...scope,
+        }),
+      );
+    }
+    const next = await readOk({ format: 'text', item: 1, offset: 4, limit: 4, representationId });
+    expect(next.structured).toMatchObject({ content: ' 1', complete: true, representationId });
+  });
+});
+
+/** Install a Linux backend whose clipboard offers exactly `types`. */
+type LinuxOffer = (types: Record<string, string>) => void;
+
+const linuxOffers: readonly (readonly [string, string, LinuxOffer])[] = [
+  [
+    'X11',
+    'UTF8_STRING',
+    (types) => {
+      install(
+        new LinuxX11Backend(),
+        x11Script({ version: '0.13', owner: { kind: 'xsel', types } }),
+      );
+    },
+  ],
+  [
+    'Wayland',
+    'text/plain',
+    (types) => {
+      install(new LinuxWaylandBackend(), waylandScript({ version: '2.2', types }));
+    },
+  ],
+];
+
+/** Base64url SHA-256 of `value`: the revision a Linux read reports. */
+const linuxRevision = (value: string) => createHash('sha256').update(value).digest('base64url');
+
+describe.each(linuxOffers)(
+  '%s: one clipboard item, and files from text/uri-list (#57, #59)',
+  (_platform, textType, offer) => {
+    it('inspect and read report one item; item 0 reads the same bytes under its own token', async () => {
+      offer({ [textType]: 'abc' });
+      const inspect = await runToolContract(clipboardInspect, {});
+      expect(inspect.structuredContent).toMatchObject({ itemCount: 1, availableFormats: ['text'] });
+      expect(textOf(inspect)).toContain('**Item count:** 1');
+
+      const whole = await readOk({ format: 'text' });
+      expect(whole.structured).toMatchObject({
+        content: 'abc',
+        itemCount: 1,
+        representationId: `text:${linuxRevision('abc')}`,
+      });
+      expect(whole.structured).not.toHaveProperty('notice');
+      expect(textOf(whole.result)).toContain('**Item count:** 1');
+
+      const scoped = await readOk({ format: 'text', item: 0 });
+      expect(scoped.structured).toMatchObject({
+        content: 'abc',
+        itemCount: 1,
+        representationId: `text#0:${linuxRevision('abc')}`,
+      });
+      expect(scoped.structured).not.toHaveProperty('notice');
+    });
+
+    it('item 1 is format_unavailable: an explicit read after listing the types, auto at the item count', async () => {
+      offer({ [textType]: 'abc' });
+      const explicit = await runToolContract(clipboardRead, { format: 'text', item: 1 });
+      expect(wireError(explicit)).toMatchObject({
+        code: NotFound,
+        data: { reason: 'format_unavailable', item: 1 },
+      });
+      expect(textOf(explicit)).toContain(
+        'Format "text" is not present on clipboard item 1, or the clipboard has no item 1.',
+      );
+
+      const auto = await runToolContract(clipboardRead, { format: 'auto', item: 1 });
+      expect(wireError(auto)).toMatchObject({
+        code: NotFound,
+        data: { reason: 'format_unavailable', item: 1, itemCount: 1 },
+      });
+      expect(textOf(auto)).toContain('The clipboard holds 1 item; item 1 is past the last (0).');
+    });
+
+    it('a text/uri-list reads as its local file paths, skipping other URIs; auto ranks it first', async () => {
+      const uriList = 'file:///a%20b\r\nhttps://x.test\r\n';
+      offer({ 'text/uri-list': uriList, [textType]: 'caption' });
+      const inspect = await runToolContract(clipboardInspect, {});
+      expect(inspect.structuredContent).toMatchObject({
+        primaryFormat: 'files',
+        availableFormats: ['text', 'files'],
+      });
+      expect((inspect.structuredContent as { rawTypes: unknown[] }).rawTypes).toContainEqual({
+        type: 'text/uri-list',
+        bytes: Buffer.byteLength(uriList),
+      });
+
+      for (const format of ['files', 'auto'] as const) {
+        const { result, structured } = await readOk({ format });
+        expect(structured, format).toMatchObject({
+          format: 'files',
+          content: '/a b',
+          totalByteSize: 4,
+          itemCount: 1,
+          representationId: `files:${linuxRevision('/a b')}`,
+        });
+        expect(structured, format).not.toHaveProperty('notice');
+        expect(textOf(result)).toContain('/a b');
+      }
+    });
+
+    it.each([
+      ['names no local file', 'https://x.test/a\r\n'],
+      ['holds only a line-break path', 'file:///a%0Ab\r\n'],
+    ])(
+      'a uri-list that %s lists no files: the files read fails, auto reads the text',
+      async (_label, uriList) => {
+        offer({ 'text/uri-list': uriList, [textType]: 'caption' });
+        const inspect = await runToolContract(clipboardInspect, {});
+        expect(inspect.structuredContent).toMatchObject({
+          primaryFormat: 'text',
+          availableFormats: ['text'],
+        });
+        expect((inspect.structuredContent as { rawTypes: unknown[] }).rawTypes).toContainEqual({
+          type: 'text/uri-list',
+          bytes: Buffer.byteLength(uriList),
+        });
+
+        expect(wireError(await runToolContract(clipboardRead, { format: 'files' }))).toMatchObject({
+          code: NotFound,
+          data: { reason: 'format_unavailable' },
+        });
+        const auto = await readOk({ format: 'auto' });
+        expect(auto.structured).toMatchObject({ format: 'text', content: 'caption' });
+      },
+    );
+
+    it('a line-break path beside a listable one is left out and counted in the notice', async () => {
+      offer({ 'text/uri-list': 'file:///a%0Ab\r\nfile:///c\r\n' });
+      const { result, structured } = await readOk({ format: 'files' });
+      expect(structured).toMatchObject({ content: '/c', notice: ONE_OMITTED_NOTICE });
+      expect(textOf(result)).toContain(ONE_OMITTED_NOTICE);
+    });
+  },
+);
+
+/**
+ * Windows world holding a file drop list, answered as `PS_INSPECT` and
+ * `buildPsReadFiles` print it: paths holding a CR or LF are left out and
+ * counted, and a list with no path left is a failed measurement and an absent
+ * read.
+ */
+function windowsFilesScript(world: { paths: readonly string[]; text?: string }): HelperScript {
+  return (_command, args) => {
+    const script = args.at(-1) ?? '';
+    const kept = world.paths.filter(listablePath);
+    const joined = Buffer.from(kept.join('\n'));
+    if (script.includes('GetFormats')) {
+      return {
+        stdout: JSON.stringify([
+          kept.length > 0
+            ? { type: 'FileDrop', bytes: joined.byteLength }
+            : { type: 'FileDrop', measurementFailed: true },
+          ...(world.text !== undefined
+            ? [{ type: 'UnicodeText', bytes: Buffer.byteLength(world.text) }]
+            : []),
+        ]),
+      };
+    }
+    if (script.includes('GetFileDropList()') && kept.length > 0) {
+      return psWindow(script, joined, { omittedPaths: world.paths.length - kept.length });
+    }
+    if (script.includes('nativeTextFormats') && world.text !== undefined) {
+      return psWindow(script, Buffer.from(world.text));
+    }
+    return { stdout: JSON.stringify({ present: false }) };
+  };
+}
+
+describe('Windows: the file drop list (#59) and the one-item clipboard (#57)', () => {
+  const PATHS = ['C:\\Users\\me\\b.txt', 'C:\\Users\\me\\a dir\\a.txt'];
+  const sha = (value: string) => createHash('sha256').update(value).digest('base64');
+
+  it('FileDrop reads as its paths in list order, one per line; inspect and auto rank files first', async () => {
+    install(new WindowsBackend(), windowsFilesScript({ paths: PATHS, text: 'caption' }));
+    const joined = PATHS.join('\n');
+    const inspect = await runToolContract(clipboardInspect, {});
+    expect(inspect.structuredContent).toEqual({
+      primaryFormat: 'files',
+      availableFormats: ['text', 'files'],
+      itemCount: 1,
+      rawTypes: [
+        { type: 'FileDrop', bytes: Buffer.byteLength(joined) },
+        { type: 'UnicodeText', bytes: 7 },
+      ],
+    });
+    for (const format of ['files', 'auto'] as const) {
+      const { result, structured } = await readOk({ format });
+      expect(structured, format).toMatchObject({
+        format: 'files',
+        content: joined,
+        itemCount: 1,
+        representationId: `files:${sha(joined)}`,
+      });
+      expect(structured, format).not.toHaveProperty('notice');
+      expect(textOf(result)).toContain(joined);
+    }
+  });
+
+  it('a line-break path is left out and counted; a list of only such paths lists no files and auto reads the text', async () => {
+    install(
+      new WindowsBackend(),
+      windowsFilesScript({ paths: ['C:\\a.txt', 'C:\\line\nbreak.txt'] }),
+    );
+    const counted = await readOk({ format: 'files' });
+    expect(counted.structured).toMatchObject({ content: 'C:\\a.txt', notice: ONE_OMITTED_NOTICE });
+    expect(textOf(counted.result)).toContain(ONE_OMITTED_NOTICE);
+
+    install(
+      new WindowsBackend(),
+      windowsFilesScript({ paths: ['C:\\line\nbreak.txt'], text: 'caption' }),
+    );
+    expect((await runToolContract(clipboardInspect, {})).structuredContent).toMatchObject({
+      primaryFormat: 'text',
+      availableFormats: ['text'],
+      rawTypes: [
+        { type: 'FileDrop', measurementFailed: true },
+        { type: 'UnicodeText', bytes: 7 },
+      ],
+    });
+    expect(wireError(await runToolContract(clipboardRead, { format: 'files' }))).toMatchObject({
+      code: NotFound,
+      data: { reason: 'format_unavailable' },
+    });
+    expect((await readOk({ format: 'auto' })).structured).toMatchObject({
+      format: 'text',
+      content: 'caption',
+    });
+  });
+
+  it('item 1 fails format_unavailable without spawning a helper; auto checks it after inspecting; item 0 reads', async () => {
+    const fake = install(new WindowsBackend(), windowsFilesScript({ paths: PATHS }));
+    for (const format of ['files', 'text', 'html', 'rtf', 'image'] as const) {
+      const result = await runToolContract(clipboardRead, { format, item: 1 });
+      expect(wireError(result), format).toMatchObject({
+        code: NotFound,
+        data: { reason: 'format_unavailable', item: 1 },
+      });
+    }
+    expect(fake.calls).toHaveLength(0);
+
+    const auto = await runToolContract(clipboardRead, { format: 'auto', item: 1 });
+    expect(wireError(auto)).toMatchObject({
+      data: { reason: 'format_unavailable', item: 1, itemCount: 1 },
+    });
+    expect(fake.calls.map((call) => call.args.at(-1)?.includes('GetFormats'))).toEqual([true]);
+
+    const scoped = await readOk({ format: 'files', item: 0 });
+    expect(scoped.structured).toMatchObject({
+      content: PATHS.join('\n'),
+      representationId: `files#0:${sha(PATHS.join('\n'))}`,
+    });
   });
 });

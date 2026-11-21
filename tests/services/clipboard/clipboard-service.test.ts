@@ -20,7 +20,15 @@ import {
 import { LinuxWaylandBackend } from '@/services/clipboard/linux-wayland-backend.js';
 import { LinuxX11Backend } from '@/services/clipboard/linux-x11-backend.js';
 import { MacosBackend } from '@/services/clipboard/macos-backend.js';
-import type { ClipboardBackend, ReadResult, WriteResult } from '@/services/clipboard/types.js';
+import type {
+  ByteRange,
+  ClipboardBackend,
+  ClipboardFormat,
+  ItemScope,
+  ReadResult,
+  WriteResult,
+} from '@/services/clipboard/types.js';
+import { clipboardOutcome } from '@/services/clipboard/types.js';
 import { WindowsBackend } from '@/services/clipboard/windows-backend.js';
 
 const mockExecFile = vi.mocked(execFile);
@@ -255,10 +263,11 @@ describe('ClipboardService.write — prior contents capture (#28)', () => {
     const result = await svc.write('new', 'text', createMockContext());
 
     expect(result).toEqual({ format: 'text', byteSize: 3, previousContent: 'the old note' });
-    expect(backend.read).toHaveBeenCalledWith('text', {
-      offset: 0,
-      limit: SIZE_LIMITS.READ_TEXT + 1,
-    });
+    expect(backend.read).toHaveBeenCalledWith(
+      'text',
+      { offset: 0, limit: SIZE_LIMITS.READ_TEXT + 1 },
+      undefined,
+    );
   });
 
   it('reads the prior contents before overwriting them', async () => {
@@ -499,7 +508,11 @@ describe('ClipboardService.read — bounded ranged reads (#7)', () => {
       bytes: SIZE_LIMITS.READ_TEXT + 10,
       limit: SIZE_LIMITS.READ_TEXT,
     });
-    expect(read).toHaveBeenCalledWith('text', { offset: 0, limit: SIZE_LIMITS.READ_TEXT + 1 });
+    expect(read).toHaveBeenCalledWith(
+      'text',
+      { offset: 0, limit: SIZE_LIMITS.READ_TEXT + 1 },
+      undefined,
+    );
   });
 
   it('unranged: content within the limit is one complete slice', async () => {
@@ -577,7 +590,11 @@ describe('ClipboardService.read — bounded ranged reads (#7)', () => {
       offset: 0,
       limit: Number.MAX_SAFE_INTEGER,
     });
-    expect(read).toHaveBeenCalledWith('text', { offset: 0, limit: SIZE_LIMITS.READ_TEXT });
+    expect(read).toHaveBeenCalledWith(
+      'text',
+      { offset: 0, limit: SIZE_LIMITS.READ_TEXT },
+      undefined,
+    );
     expect(result.byteSize).toBe(SIZE_LIMITS.READ_TEXT);
     expect(result).toMatchObject({
       totalByteSize: SIZE_LIMITS.READ_TEXT + 10,
@@ -667,5 +684,189 @@ describe('ClipboardService.read — representationId (#38)', () => {
     await expect(svc.read('text', createMockContext())).rejects.toMatchObject({
       category: 'representation_changed',
     });
+  });
+});
+
+/**
+ * A backend holding one representation per clipboard item, sliced the way the
+ * real ones slice. With no `item` it reads the clipboard whole the way macOS
+ * does: text items joined by newlines, file paths listed one per line, any
+ * other format from the first item. `item` reads that item alone, and an item
+ * past the last fails `format_unavailable`, as the backends' contract says.
+ */
+function itemBackend(items: string[], revision = 'r', omittedPaths?: number) {
+  const read = vi.fn(async (format: ClipboardFormat, range: ByteRange, item?: number) => {
+    if (item !== undefined && item >= items.length) {
+      throw clipboardOutcome('macOS', `${format} format not found on clipboard`, {
+        category: 'format_unavailable',
+      });
+    }
+    const whole =
+      item !== undefined
+        ? (items[item] ?? '')
+        : format === 'text' || format === 'files'
+          ? items.join('\n')
+          : (items[0] ?? '');
+    const full = Buffer.from(whole, 'utf8');
+    const itemScope: ItemScope | undefined =
+      item !== undefined || items.length <= 1
+        ? undefined
+        : format === 'files'
+          ? 'all'
+          : format === 'text' || format === 'rtf'
+            ? 'joined'
+            : 'first';
+    return {
+      format,
+      content: full.subarray(range.offset, range.offset + range.limit),
+      totalByteSize: full.byteLength,
+      revision,
+      itemCount: items.length,
+      ...(itemScope && { itemScope }),
+      ...(omittedPaths !== undefined && { omittedPaths }),
+    } satisfies ReadResult;
+  });
+  return {
+    read,
+    svc: new ClipboardService({
+      clear: vi.fn(),
+      inspect: vi.fn(),
+      read,
+      write: vi.fn(),
+    } as unknown as ClipboardBackend),
+  };
+}
+
+/** Every slice of a ranged walk from offset 0, `limit` bytes at a time. */
+async function walk(
+  svc: ClipboardService,
+  format: ClipboardFormat,
+  limit: number,
+  item?: number,
+): Promise<Awaited<ReturnType<ClipboardService['read']>>[]> {
+  const ctx = createMockContext();
+  const slices: Awaited<ReturnType<ClipboardService['read']>>[] = [];
+  let offset: number | undefined = 0;
+  while (offset !== undefined) {
+    const slice = await svc.read(format, ctx, { offset, limit }, item);
+    slices.push(slice);
+    if (slice.nextOffset !== undefined) expect(slice.nextOffset).toBeGreaterThan(offset);
+    offset = slice.nextOffset;
+  }
+  return slices;
+}
+
+describe('ClipboardService.read — clipboard items (#57)', () => {
+  it('characterization: a read with no item keeps the <format>:<revision> token', async () => {
+    const { svc, read } = itemBackend(['one'], 'r');
+    const result = await svc.read('text', createMockContext());
+    expect(result.representationId).toBe('text:r');
+    expect(read.mock.calls[0]?.[2]).toBeUndefined();
+  });
+
+  it('passes item to the backend beside the range', async () => {
+    const { svc, read } = itemBackend(['a', 'b', 'c']);
+    await svc.read('html', createMockContext(), undefined, 2);
+    expect(read).toHaveBeenCalledWith('html', { offset: 0, limit: SIZE_LIMITS.READ_TEXT + 1 }, 2);
+    await svc.read('image', createMockContext(), { offset: 4, limit: 8 }, 0);
+    expect(read).toHaveBeenLastCalledWith('image', { offset: 4, limit: 8 }, 0);
+  });
+
+  it('encodes item in representationId, so each item and the whole clipboard are different tokens', async () => {
+    const { svc } = itemBackend(['a', 'b'], 'r');
+    const ctx = createMockContext();
+    const tokens = [
+      (await svc.read('text', ctx)).representationId,
+      (await svc.read('text', ctx, undefined, 0)).representationId,
+      (await svc.read('text', ctx, undefined, 1)).representationId,
+    ];
+    expect(tokens).toEqual(['text:r', 'text#0:r', 'text#1:r']);
+    expect(new Set(tokens).size).toBe(3);
+  });
+
+  it('carries itemCount and itemScope from the backend, and no itemScope for one item or a given item', async () => {
+    const { svc } = itemBackend(['<p>0</p>', '<p>1</p>', '<p>2</p>']);
+    const ctx = createMockContext();
+    expect(await svc.read('html', ctx)).toMatchObject({
+      content: Buffer.from('<p>0</p>'),
+      itemCount: 3,
+      itemScope: 'first',
+    });
+    const one = await svc.read('html', ctx, undefined, 1);
+    expect(one).toMatchObject({ content: Buffer.from('<p>1</p>'), itemCount: 3 });
+    expect(one).not.toHaveProperty('itemScope');
+
+    const single = await itemBackend(['only']).svc.read('text', ctx);
+    expect(single.itemCount).toBe(1);
+    expect(single).not.toHaveProperty('itemScope');
+    expect(single).not.toHaveProperty('omittedPaths');
+  });
+
+  it('a multi-slice text walk with item stays on that item and keeps one token across slices', async () => {
+    const { svc } = itemBackend(['AAAAAAAAAA', 'bé😀cdefgh€ij', 'CCCCCCCCCC'], 'r');
+    const slices = await walk(svc, 'text', 4, 1);
+    expect(slices.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(slices.map((s) => s.representationId))).toEqual(new Set(['text#1:r']));
+    for (const slice of slices) expect(slice.content.toString('utf8')).not.toContain('�');
+    expect(Buffer.concat(slices.map((s) => s.content)).toString('utf8')).toBe('bé😀cdefgh€ij');
+  });
+
+  it('an item past the last propagates the backend format_unavailable outcome', async () => {
+    const { svc } = itemBackend(['a', 'b', 'c']);
+    await expect(svc.read('text', createMockContext(), undefined, 3)).rejects.toMatchObject({
+      category: 'format_unavailable',
+    });
+  });
+});
+
+describe('ClipboardService.read — files (#59)', () => {
+  const paths = ['/Users/me/doc 0.txt', '/Users/me/dossier é/😀 notes.md', '/tmp/ünïcode.pdf'];
+
+  it('characterization: an unranged files read is held to the text size limit', async () => {
+    const huge = Array.from({ length: 20_000 }, (_, i) => `/very/long/path/number/${i}.txt`);
+    const { svc, read } = itemBackend(huge);
+    await expect(svc.read('files', createMockContext())).rejects.toMatchObject({
+      _contentTooLarge: true,
+      limit: SIZE_LIMITS.READ_TEXT,
+      format: 'files',
+    });
+    expect(read.mock.calls[0]?.slice(0, 2)).toEqual([
+      'files',
+      { offset: 0, limit: SIZE_LIMITS.READ_TEXT + 1 },
+    ]);
+  });
+
+  it('characterization: a ranged files read clamps its limit to the text size limit', async () => {
+    const { svc, read } = itemBackend(paths);
+    await svc.read('files', createMockContext(), { offset: 0, limit: Number.MAX_SAFE_INTEGER });
+    expect(read.mock.calls[0]?.[1]).toEqual({ offset: 0, limit: SIZE_LIMITS.READ_TEXT });
+  });
+
+  it('characterization: a multi-slice files walk never splits a UTF-8 path and reassembles exactly', async () => {
+    const { svc } = itemBackend(paths, 'r');
+    const slices = await walk(svc, 'files', 5);
+    expect(slices.length).toBeGreaterThanOrEqual(10);
+    for (const slice of slices) expect(slice.content.toString('utf8')).not.toContain('�');
+    expect(Buffer.concat(slices.map((s) => s.content)).toString('utf8')).toBe(paths.join('\n'));
+    expect(slices.at(-1)).toMatchObject({ complete: true });
+    expect(slices.at(-1)).not.toHaveProperty('nextOffset');
+  });
+
+  it('a files walk with no item reports every item, and with item reads that item alone', async () => {
+    const { svc } = itemBackend(paths, 'r');
+    const whole = await walk(svc, 'files', 7);
+    expect(new Set(whole.map((s) => s.representationId))).toEqual(new Set(['files:r']));
+    for (const slice of whole) expect(slice).toMatchObject({ itemCount: 3, itemScope: 'all' });
+
+    const second = await walk(svc, 'files', 7, 1);
+    expect(second.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(second.map((s) => s.representationId))).toEqual(new Set(['files#1:r']));
+    expect(Buffer.concat(second.map((s) => s.content)).toString('utf8')).toBe(paths[1]);
+    for (const slice of second) expect(slice).not.toHaveProperty('itemScope');
+  });
+
+  it('carries the count of paths left out for a line break', async () => {
+    const { svc } = itemBackend(['/a', '/b'], 'r', 2);
+    expect(await svc.read('files', createMockContext())).toMatchObject({ omittedPaths: 2 });
   });
 });

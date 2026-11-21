@@ -36,9 +36,11 @@ export const OSASCRIPT_STDIN_LOG = 'osascript-stdin.log';
 /**
  * Create a bin directory of clipboard stubs. Writers swallow stdin, `wl-paste`
  * emits nothing, and the `osascript` stub swallows any stdin payload (logging
- * its byte count to `OSASCRIPT_STDIN_LOG`) and prints an empty type listing
- * (`[]`) — enough for every backend this suite exercises
- * without reading or mutating the developer's real clipboard.
+ * its byte count to `OSASCRIPT_STDIN_LOG`) and prints an empty pasteboard's
+ * description (`{"itemCount":0,"hasFilePaths":false,"types":[]}`) on every
+ * call: inspection reads it as empty, a read as unreadable output, and a write
+ * ignores it — enough for every backend this suite exercises without reading or
+ * mutating the developer's real clipboard.
  */
 export function createClipboardStubBin(): string {
   const dir = mkdtempSync(join(tmpdir(), 'clipboard-mcp-stub-'));
@@ -48,7 +50,7 @@ export function createClipboardStubBin(): string {
   writeScript(join(dir, 'wl-paste'), "printf ''");
   writeScript(
     join(dir, 'osascript'),
-    `wc -c | tr -d ' ' >> "${join(dir, OSASCRIPT_STDIN_LOG)}"\nprintf '[]'`,
+    `wc -c | tr -d ' ' >> "${join(dir, OSASCRIPT_STDIN_LOG)}"\nprintf '%s' '{"itemCount":0,"hasFilePaths":false,"types":[]}'`,
   );
   return dir;
 }

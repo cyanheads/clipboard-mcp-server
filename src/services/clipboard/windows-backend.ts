@@ -7,12 +7,14 @@ import { spawn } from 'node:child_process';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
 import { assertByteRange } from './byte-window.js';
 import { buildCfHtml, parseCfHtmlHeader } from './cf-html.js';
+import { htmlToPlainText } from './html-to-text.js';
 import type {
   ByteRange,
   ClipboardBackend,
   ClipboardFormat,
   InspectResult,
   RangedReadWindow,
+  ReadItems,
   ReadResult,
 } from './types.js';
 import {
@@ -21,7 +23,6 @@ import {
   parseNativeTypeEntries,
   parseRangedReadEnvelope,
   representationChanged,
-  stripHtmlTags,
   toReadResult,
 } from './types.js';
 
@@ -74,13 +75,30 @@ function runPowershell(script: string, stdin?: Buffer): Promise<Buffer> {
 }
 
 /**
+ * PowerShell snippet that splits the file drop list in `$list` into `$kept`,
+ * the paths the `files` format lists, and `$omitted`, the count of paths it
+ * leaves out because they hold a line break (CR or LF) and so cannot be listed
+ * one per line.
+ */
+const PS_LISTABLE_PATHS = `
+$kept = [System.Collections.Generic.List[string]]::new()
+$omitted = 0
+foreach ($path in $list) {
+  if ($path.IndexOfAny([char[]]@(10, 13)) -ge 0) { $omitted++ } else { $kept.Add($path) }
+}`;
+
+/** PowerShell expression for the LF-joined `$kept` paths. */
+const PS_JOINED_PATHS = '[string]::Join([string][char]10, $kept.ToArray())';
+
+/**
  * Static PowerShell script listing the clipboard's native formats
  * (`GetDataObject().GetFormats($false)`), printed as JSON `RawTypeEntry`
- * values. A string is sized as UTF-8, a byte array or stream by its length; a
- * `GetData` that returns null or throws is a failed measurement, and so is
- * non-string data under a text or RTF format, which the text and RTF reads
- * cannot return; any other object (a `Bitmap`, a FileDrop `string[]`) is
- * listed without a size.
+ * values. A string is sized as UTF-8, a byte array or stream by its length,
+ * and a FileDrop list as the UTF-8 of the paths a `files` read returns; a
+ * FileDrop list with no path to return, a `GetData` that returns null or
+ * throws, and non-string data under a text or RTF format (which the text and
+ * RTF reads cannot return) are failed measurements; any other object (a
+ * `Bitmap`) is listed without a size.
  */
 const PS_INSPECT = `
 Add-Type -AssemblyName System.Windows.Forms
@@ -95,6 +113,11 @@ if ($data) {
       if ($null -eq $obj) { $entry.measurementFailed = $true }
       elseif ($obj -is [string]) { $entry.bytes = [System.Text.Encoding]::UTF8.GetByteCount($obj) }
       elseif ($stringOnly -contains $fmt) { $entry.measurementFailed = $true }
+      elseif ($fmt -eq [System.Windows.Forms.DataFormats]::FileDrop -and $obj -is [string[]]) {
+        $list = $obj${PS_LISTABLE_PATHS}
+        if ($kept.Count -gt 0) { $entry.bytes = [System.Text.Encoding]::UTF8.GetByteCount(${PS_JOINED_PATHS}) }
+        else { $entry.measurementFailed = $true }
+      }
       elseif ($obj -is [byte[]]) { $entry.bytes = $obj.Length }
       elseif ($obj -is [System.IO.Stream]) { $entry.bytes = $obj.Length }
     } catch { $entry.measurementFailed = $true }
@@ -276,6 +299,25 @@ if ($pngDecodes) {
 }
 
 /**
+ * PowerShell script builder to read the copied files' paths, bounded to
+ * `range`: the file drop list (`GetFileDropList()`, in list order) minus the
+ * paths holding a line break, LF-joined and encoded as UTF-8. The envelope
+ * counts the left-out paths as `omittedPaths`; a list with no path to return
+ * is absent.
+ */
+function buildPsReadFiles(range: ByteRange): string {
+  assertByteRange(range);
+  return `
+Add-Type -AssemblyName System.Windows.Forms
+$list = [System.Windows.Forms.Clipboard]::GetFileDropList()${PS_LISTABLE_PATHS}
+if ($kept.Count -gt 0) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes(${PS_JOINED_PATHS})
+  ${psSliceSnippet('$bytes', range, '; omittedPaths = $omitted')}
+} else { [PSCustomObject]@{ present = $false } | ConvertTo-Json -Compress }
+`;
+}
+
+/**
  * Static PowerShell script that empties the clipboard.
  * `Clipboard::Clear()` removes every format; setting an empty string instead
  * would leave a zero-length text representation behind.
@@ -389,6 +431,9 @@ async function runPsReadHtml(prefixLimit: number, window: ByteRange): Promise<Ht
   };
 }
 
+/** A Windows clipboard holds one data object: every successful read is of item 0 of 1. */
+const ONE_ITEM: ReadItems = { itemCount: 1 };
+
 /**
  * Read `range` of the clipboard's HTML. For a CF_HTML payload, `range` and the
  * reported total apply to `[StartFragment, EndFragment)`; a payload without a
@@ -407,6 +452,7 @@ async function readHtml(range: ByteRange): Promise<ReadResult> {
     content,
     totalByteSize: spanSize,
     revision: first.sha256,
+    ...ONE_ITEM,
   });
 
   const from = spanStart + Math.min(range.offset, spanSize);
@@ -422,7 +468,8 @@ async function readHtml(range: ByteRange): Promise<ReadResult> {
 /**
  * Map a .NET clipboard format name → semantic format. CF_DIB surfaces as
  * `DeviceIndependentBitmap`, and CF_DIBV5, which has no .NET name, as
- * `Format17`; Windows synthesizes the `Bitmap` that `GetImage()` reads from either.
+ * `Format17`; Windows synthesizes the `Bitmap` that `GetImage()` reads from
+ * either. CF_HDROP surfaces as `FileDrop`.
  */
 function winFormatToSemantic(fmt: string): ClipboardFormat | null {
   const lower = fmt.toLowerCase();
@@ -437,6 +484,7 @@ function winFormatToSemantic(fmt: string): ClipboardFormat | null {
   ) {
     return 'image';
   }
+  if (lower === 'filedrop') return 'files';
   return null;
 }
 
@@ -449,19 +497,34 @@ export class WindowsBackend implements ClipboardBackend {
     // PowerShell writes nothing (or `null`) for an empty clipboard; every other
     // shape must parse as a type listing or the inspection has failed.
     const entries = raw === '' || raw === 'null' ? [] : parseNativeTypeEntries(raw, 'Windows');
-    return buildInspectResult(entries, winFormatToSemantic);
+    return buildInspectResult(entries, winFormatToSemantic, entries.length > 0 ? 1 : 0);
   }
 
-  async read(format: ClipboardFormat, range: ByteRange): Promise<ReadResult> {
+  /**
+   * The clipboard is one data object: `item` 0 reads it, and any later `item`
+   * is `format_unavailable` without running a helper.
+   */
+  async read(format: ClipboardFormat, range: ByteRange, item?: number): Promise<ReadResult> {
+    if (item !== undefined && item > 0) {
+      throw clipboardOutcome(
+        'Windows',
+        `The clipboard holds one item (item 0); item ${item} is not on it.`,
+        { category: 'format_unavailable' },
+      );
+    }
+    const readRanged = async (build: (range: ByteRange) => string, formatName: string) =>
+      toReadResult(format, await runPsRangedRead(build(range), formatName), ONE_ITEM);
     switch (format) {
       case 'text':
-        return toReadResult('text', await runPsRangedRead(buildPsReadText(range), 'Text'));
+        return await readRanged(buildPsReadText, 'Text');
       case 'html':
         return await readHtml(range);
       case 'rtf':
-        return toReadResult('rtf', await runPsRangedRead(buildPsReadRtf(range), 'RTF'));
+        return await readRanged(buildPsReadRtf, 'RTF');
       case 'image':
-        return toReadResult('image', await runPsRangedRead(buildPsReadImage(range), 'Image'));
+        return await readRanged(buildPsReadImage, 'Image');
+      case 'files':
+        return await readRanged(buildPsReadFiles, 'FileDrop');
     }
   }
 
@@ -474,7 +537,7 @@ export class WindowsBackend implements ClipboardBackend {
       format === 'text'
         ? { text: buf.toString('base64') }
         : {
-            text: Buffer.from(stripHtmlTags(content), 'utf8').toString('base64'),
+            text: Buffer.from(htmlToPlainText(content), 'utf8').toString('base64'),
             html: buildCfHtml(content).toString('base64'),
           };
     await runPowershell(PS_WRITE, Buffer.from(JSON.stringify(envelope), 'utf8'));

@@ -46,7 +46,7 @@ export function isContentTooLarge(err: unknown): err is ContentTooLargeError {
 
 /** Size limits in bytes. */
 export const SIZE_LIMITS = {
-  /** Max text/HTML/RTF content for reads. 512KB. */
+  /** Max text/HTML/RTF/files content for reads. 512KB. */
   READ_TEXT: 512 * 1024,
   /** Max image content for reads. 5MB (raw bytes before base64 expansion). */
   READ_IMAGE: 5 * 1024 * 1024,
@@ -173,7 +173,11 @@ async function detectBackend(): Promise<ClipboardBackend> {
  * correlated logging via ctx.
  */
 export class ClipboardService {
-  constructor(private readonly backend: ClipboardBackend) {}
+  private readonly backend: ClipboardBackend;
+
+  constructor(backend: ClipboardBackend) {
+    this.backend = backend;
+  }
 
   /** Inspect clipboard types and byte sizes. */
   async inspect(ctx: Context): Promise<InspectResult> {
@@ -192,15 +196,25 @@ export class ClipboardService {
    * size limit and `content_too_large` is never thrown — the caller owns
    * paging through the representation via `nextOffset`. Every result carries
    * `representationId`, which stays equal across reads of an unchanged value.
+   * File paths are text: they share its size limit and UTF-8 boundary trimming.
+   *
+   * `item` (0-based) reads that one clipboard item alone (see
+   * `ClipboardBackend.read`); the result reports the clipboard's `itemCount`,
+   * and an `itemScope` when a read with no `item` drew on several items.
    */
-  async read(format: ClipboardFormat, ctx: Context, range?: ByteRange): Promise<RangedReadResult> {
-    ctx.log.debug('clipboard read', { format, range });
+  async read(
+    format: ClipboardFormat,
+    ctx: Context,
+    range?: ByteRange,
+    item?: number,
+  ): Promise<RangedReadResult> {
+    ctx.log.debug('clipboard read', { format, range, item });
     const limit = format === 'image' ? SIZE_LIMITS.READ_IMAGE : SIZE_LIMITS.READ_TEXT;
     const effectiveRange: ByteRange = range
       ? { offset: range.offset, limit: Math.min(range.limit, limit) }
       : { offset: 0, limit: limit + 1 };
 
-    const result = await this.backend.read(format, effectiveRange);
+    const result = await this.backend.read(format, effectiveRange, item);
 
     if (!range && result.totalByteSize > limit) {
       throw Object.assign(new Error('content_too_large'), {
@@ -229,8 +243,16 @@ export class ClipboardService {
       totalByteSize: result.totalByteSize,
       complete,
       ...(complete ? {} : { nextOffset }),
-      // The format is part of the token: the same bytes read as another format are another value.
-      representationId: `${result.format}:${result.revision}`,
+      // The format and the item are part of the token: the same bytes read as
+      // another format, from another item, or from the whole clipboard are
+      // another value, so a continuation that changes either one conflicts.
+      representationId:
+        item === undefined
+          ? `${result.format}:${result.revision}`
+          : `${result.format}#${item}:${result.revision}`,
+      itemCount: result.itemCount,
+      ...(result.itemScope !== undefined && { itemScope: result.itemScope }),
+      ...(result.omittedPaths !== undefined && { omittedPaths: result.omittedPaths }),
     };
   }
 
@@ -240,8 +262,8 @@ export class ClipboardService {
    * unintended overwrite stays recoverable.
    */
   async write(content: string, format: 'text' | 'html', ctx: Context): Promise<WriteResult> {
-    ctx.log.debug('clipboard write', { format, bytes: Buffer.byteLength(content, 'utf8') });
     const bytes = Buffer.byteLength(content, 'utf8');
+    ctx.log.debug('clipboard write', { format, bytes });
     if (bytes > SIZE_LIMITS.WRITE) {
       throw Object.assign(new Error('content_too_large'), {
         _contentTooLarge: true,

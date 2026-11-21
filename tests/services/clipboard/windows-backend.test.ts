@@ -1,11 +1,17 @@
 /**
- * @fileoverview Unit tests for WindowsBackend — mocks child_process.spawn.
+ * @fileoverview Unit tests for WindowsBackend — mocks child_process.spawn; where
+ * `pwsh` is on PATH, also runs the FileDrop helper scripts under it against a
+ * WinForms stub.
  * @module tests/services/clipboard/windows-backend.test
  */
 
+import type * as ChildProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 
@@ -193,6 +199,7 @@ describe('WindowsBackend', () => {
         await expect(backend.inspect()).resolves.toEqual({
           primaryFormat: 'empty',
           availableFormats: [],
+          itemCount: 0,
           rawTypes: [],
         });
       },
@@ -241,6 +248,7 @@ describe('WindowsBackend', () => {
         content: Buffer.alloc(0),
         totalByteSize: 0,
         revision: sha256Of(Buffer.alloc(0)),
+        itemCount: 1,
       });
     });
   });
@@ -359,7 +367,7 @@ describe('WindowsBackend', () => {
       expect(result).toEqual({ format: 'html', byteSize: Buffer.byteLength(html) });
       const envelope = envelopeOf(fake.calls[0]?.stdin);
       expect(Buffer.from(envelope.html ?? '', 'base64').equals(buildCfHtml(html))).toBe(true);
-      expect(Buffer.from(envelope.text ?? '', 'base64').toString('utf8')).toBe('Title café 😀');
+      expect(Buffer.from(envelope.text ?? '', 'base64').toString('utf8')).toBe('Title\n\ncafé 😀');
     });
 
     it('stores the envelope bytes as a MemoryStream and the fallback as UnicodeText', async () => {
@@ -605,7 +613,7 @@ describe('WindowsBackend — measured, unmeasured, and failed inspection entries
     expect(script).not.toContain('$bytes = 0');
     expect(script).toMatch(/if \(\$null -eq \$obj\) \{ \$entry\.measurementFailed = \$true \}/);
     expect(script).toMatch(/\} catch \{ \$entry\.measurementFailed = \$true \}/);
-    // Any other object (a Bitmap, a FileDrop string[]) leaves bytes absent.
+    // Any other object (a Bitmap, a non-FileDrop string[]) leaves bytes absent.
     expect(script).not.toMatch(/else \{ \$entry\.bytes/);
   });
 
@@ -646,6 +654,7 @@ describe('WindowsBackend — measured, unmeasured, and failed inspection entries
     await expect(backend.inspect()).resolves.toEqual({
       primaryFormat: 'image',
       availableFormats: ['rtf', 'image'],
+      itemCount: 1,
       rawTypes: listing,
     });
   });
@@ -753,6 +762,7 @@ describe('WindowsBackend — image reads (#43)', () => {
       content: Buffer.alloc(0),
       totalByteSize: 0,
       revision: sha256Of(Buffer.alloc(0)),
+      itemCount: 1,
     });
   });
 
@@ -768,6 +778,9 @@ describe('WindowsBackend — image reads (#43)', () => {
     ['PNG', ['image']],
     ['dib', []],
     ['dibv5', []],
+    ['FileDrop', ['files']],
+    ['FileNameW', []],
+    ['Shell IDList Array', []],
   ] as const)('inspection maps %s to %j', async (type, formats) => {
     mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify([{ type, bytes: 40 }]) }));
     await expect(backend.inspect()).resolves.toMatchObject({ availableFormats: formats });
@@ -1035,3 +1048,379 @@ describe('WindowsBackend — SHA-256 revision computed in the helper (#38)', () 
     await expect(backend.read('rtf', FULL)).rejects.toMatchObject({ code: -32070 });
   });
 });
+
+/**
+ * Model of the FileDrop read helper over the drop list `paths()`: it keeps the
+ * paths that hold no line break, joins them with LF, and answers the
+ * `$offset`/`$limit` window of those UTF-8 bytes with their SHA-256 and the
+ * count it left out — or `present: false` when it keeps none.
+ */
+function fileDropClipboard(paths: () => readonly string[]): HelperScript {
+  return (_command, args) => {
+    const script = args.at(-1) ?? '';
+    const list = paths();
+    const kept = list.filter((path) => !/[\r\n]/.test(path));
+    if (kept.length === 0) return { stdout: JSON.stringify({ present: false }) };
+    const bytes = Buffer.from(kept.join('\n'));
+    const from = Math.min(psInt(script, 'offset'), bytes.byteLength);
+    return {
+      stdout: JSON.stringify({
+        present: true,
+        total: bytes.byteLength,
+        contentBase64: bytes.subarray(from, from + psInt(script, 'limit')).toString('base64'),
+        revision: sha256Of(bytes),
+        omittedPaths: list.length - kept.length,
+      }),
+    };
+  };
+}
+
+/** Serve reads from `fileDropClipboard` and record every helper call. */
+function installFileDrop(paths: () => readonly string[]) {
+  const fake = scriptedSpawn(fileDropClipboard(paths));
+  mockSpawn.mockImplementation(fake.spawnImpl as unknown as typeof spawn);
+  return fake;
+}
+
+/** A drop list as Explorer copies it: a local file with a space, one with an accent, a UNC path. */
+const DROP_LIST = [
+  'C:\\Users\\u\\a b.txt',
+  'C:\\Users\\u\\cafe\u0301.txt',
+  '\\\\server\\share\\x.pdf',
+];
+
+describe('WindowsBackend — one item per data object (#57)', () => {
+  let backend: WindowsBackend;
+  beforeEach(() => {
+    backend = new WindowsBackend();
+    vi.resetAllMocks();
+  });
+
+  it('inspect reports one item for a listing with any format', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify([{ type: 'Bitmap' }]) }));
+    expect((await backend.inspect()).itemCount).toBe(1);
+  });
+
+  it.each(['text', 'rtf', 'image'] as const)(
+    'a %s read reports one item and no item scope',
+    async (format) => {
+      mockSpawn.mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('abc') }));
+      const result = await backend.read(format, FULL);
+      expect(result.itemCount).toBe(1);
+      expect(result).not.toHaveProperty('itemScope');
+    },
+  );
+
+  it('an html read reports one item and no item scope', async () => {
+    installHtml(() => buildCfHtml('<p>x</p>'));
+    const result = await backend.read('html', FULL);
+    expect(result.itemCount).toBe(1);
+    expect(result).not.toHaveProperty('itemScope');
+  });
+
+  it('a files read reports one item and no item scope', async () => {
+    installFileDrop(() => DROP_LIST);
+    const result = await backend.read('files', FULL);
+    expect(result.itemCount).toBe(1);
+    expect(result).not.toHaveProperty('itemScope');
+  });
+
+  it('item 0 reads exactly what a read without item does', async () => {
+    mockSpawn
+      .mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('abc') }))
+      .mockReturnValueOnce(fakeChild({ stdout: stringEnvelope('abc') }));
+    const whole = await backend.read('text', FULL);
+    expect(await backend.read('text', FULL, 0)).toEqual(whole);
+  });
+
+  it.each(['text', 'html', 'rtf', 'image', 'files'] as const)(
+    'item 1 on a %s read fails format_unavailable without running PowerShell',
+    async (format) => {
+      await expect(backend.read(format, FULL, 1)).rejects.toMatchObject({
+        _clipboardOutcome: true,
+        category: 'format_unavailable',
+        platform: 'Windows',
+        message: expect.stringContaining('item 1'),
+      });
+      expect(mockSpawn).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('WindowsBackend — files from FileDrop (#59)', () => {
+  let backend: WindowsBackend;
+  beforeEach(() => {
+    backend = new WindowsBackend();
+    vi.resetAllMocks();
+  });
+
+  const joined = Buffer.from(DROP_LIST.join('\n'));
+
+  it('inspect maps FileDrop to files, the richest format, beside the icon and shell formats Explorer offers', async () => {
+    const listing = [
+      { type: 'Shell IDList Array', bytes: 412 },
+      { type: 'FileDrop', bytes: joined.byteLength },
+      { type: 'FileNameW' },
+      { type: 'Bitmap' },
+    ];
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify(listing) }));
+    await expect(backend.inspect()).resolves.toEqual({
+      primaryFormat: 'files',
+      availableFormats: ['image', 'files'],
+      itemCount: 1,
+      rawTypes: listing,
+    });
+  });
+
+  it('a FileDrop the inspection could not list a path from offers no files', async () => {
+    const listing = [{ type: 'FileDrop', measurementFailed: true }, { type: 'Bitmap' }];
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: JSON.stringify(listing) }));
+    await expect(backend.inspect()).resolves.toMatchObject({
+      primaryFormat: 'image',
+      availableFormats: ['image'],
+    });
+  });
+
+  it('the inspection sizes FileDrop as its LF-joined listable paths, and fails a list with none', async () => {
+    mockSpawn.mockReturnValueOnce(fakeChild({ stdout: 'null' }));
+    await backend.inspect();
+    const script = mockSpawn.mock.calls[0]?.[1].at(-1) ?? '';
+    const branch = script.slice(
+      script.indexOf('[System.Windows.Forms.DataFormats]::FileDrop -and $obj -is [string[]]'),
+    );
+    expect(branch).not.toBe(script);
+    expect(branch).toContain('.IndexOfAny([char[]]@(10, 13))');
+    expect(branch).toMatch(
+      /if \(\$kept\.Count -gt 0\) \{ \$entry\.bytes = \[System\.Text\.Encoding\]::UTF8\.GetByteCount\(\[string\]::Join\(\[string\]\[char\]10, \$kept\.ToArray\(\)\)\) \}\s*else \{ \$entry\.measurementFailed = \$true \}/,
+    );
+  });
+
+  it('reads the paths in drop-list order, LF-joined, hashed, with one item', async () => {
+    installFileDrop(() => DROP_LIST);
+    await expect(backend.read('files', FULL)).resolves.toEqual({
+      format: 'files',
+      content: joined,
+      totalByteSize: joined.byteLength,
+      revision: sha256Of(joined),
+      itemCount: 1,
+    });
+  });
+
+  it('reports how many paths it left out for holding a line break', async () => {
+    installFileDrop(() => ['C:\\a.txt', 'C:\\line\nbreak.txt', 'C:\\b.txt', 'C:\\cr\rhere']);
+    const result = await backend.read('files', FULL);
+    expect(result.content.toString('utf8')).toBe('C:\\a.txt\nC:\\b.txt');
+    expect(result.omittedPaths).toBe(2);
+  });
+
+  it('pages through the paths: every window reassembles them under one revision', async () => {
+    installFileDrop(() => DROP_LIST);
+    for (const limit of [1, 4, 9]) {
+      const pieces: Buffer[] = [];
+      for (let offset = 0; offset < joined.byteLength; offset += limit) {
+        const slice = await backend.read('files', { offset, limit });
+        expect(slice.totalByteSize).toBe(joined.byteLength);
+        expect(slice.revision).toBe(sha256Of(joined));
+        pieces.push(slice.content);
+      }
+      expect(Buffer.concat(pieces).equals(joined)).toBe(true);
+    }
+    const past = await backend.read('files', { offset: joined.byteLength + 10, limit: 10 });
+    expect(past.content.byteLength).toBe(0);
+    expect(past.totalByteSize).toBe(joined.byteLength);
+  });
+
+  it.each([
+    ['an empty drop list', []],
+    ['a drop list of paths it cannot list', ['C:\\a\nb']],
+  ])('%s is format_unavailable naming FileDrop', async (_label, paths) => {
+    installFileDrop(() => paths);
+    await expect(backend.read('files', FULL)).rejects.toMatchObject({
+      category: 'format_unavailable',
+      message: expect.stringMatching(/FileDrop/),
+    });
+  });
+
+  it('the read script takes the drop list from GetFileDropList, slices its LF-joined UTF-8 bytes, and hashes them whole', async () => {
+    const fake = installFileDrop(() => DROP_LIST);
+    await backend.read('files', { offset: 2, limit: 3 });
+    const script = fake.calls[0]?.args.at(-1) ?? '';
+    expect(script).toContain('$list = [System.Windows.Forms.Clipboard]::GetFileDropList()');
+    expect(script).toContain('.IndexOfAny([char[]]@(10, 13))');
+    expect(script).toContain(
+      '$bytes = [System.Text.Encoding]::UTF8.GetBytes([string]::Join([string][char]10, $kept.ToArray()))',
+    );
+    expect(script).toContain('$offset = 2');
+    expect(script).toContain('$limit = 3');
+    expect(script).toContain(
+      'contentBase64 = [Convert]::ToBase64String($bytes, $start, $sliceLen)',
+    );
+    expect(script).toContain('ComputeHash($bytes)); omittedPaths = $omitted }');
+    expect(script).not.toContain('C:\\Users');
+  });
+
+  it('refuses to build the files script from an unsafe range', async () => {
+    await expect(backend.read('files', { offset: -1, limit: 4 })).rejects.toThrow(
+      /Invalid read range offset/,
+    );
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+});
+
+const actualChildProcess = await vi.importActual<typeof ChildProcess>('node:child_process');
+
+/** Environment for every pwsh this file starts: no startup telemetry or update check. */
+const PWSH_ENV = {
+  ...process.env,
+  POWERSHELL_TELEMETRY_OPTOUT: '1',
+  POWERSHELL_UPDATECHECK: 'Off',
+};
+
+const hasPwsh =
+  actualChildProcess.spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], {
+    env: PWSH_ENV,
+  }).status === 0;
+
+/** The line every helper script loads WinForms with; the suite below swaps it for the stub. */
+const LOAD_WINFORMS = 'Add-Type -AssemblyName System.Windows.Forms';
+
+/**
+ * C# stub of the `System.Windows.Forms` members the FileDrop inspection and read
+ * call. `Clipboard.Files` is the drop list a case sets: `GetFileDropList()`
+ * returns it as a `StringCollection` and `GetDataObject()` offers it as
+ * `FileDrop` data, a `string[]`, as WinForms does.
+ */
+const WINFORMS_STUB = `
+namespace System.Windows.Forms {
+  public static class DataFormats {
+    public static readonly string UnicodeText = "UnicodeText";
+    public static readonly string Text = "Text";
+    public static readonly string OemText = "OEMText";
+    public static readonly string Rtf = "Rich Text Format";
+    public static readonly string FileDrop = "FileDrop";
+  }
+  public sealed class DataObject {
+    private readonly string[] files;
+    public DataObject(string[] files) { this.files = files; }
+    public string[] GetFormats(bool autoConvert) { return new[] { DataFormats.FileDrop }; }
+    public object GetData(string format) { return format == DataFormats.FileDrop ? files : null; }
+  }
+  public static class Clipboard {
+    public static string[] Files = new string[0];
+    public static DataObject GetDataObject() { return new DataObject(Files); }
+    public static System.Collections.Specialized.StringCollection GetFileDropList() {
+      var list = new System.Collections.Specialized.StringCollection();
+      list.AddRange(Files);
+      return list;
+    }
+  }
+}`;
+
+/**
+ * The inspection and files-read scripts the backend generates, run end to end
+ * under PowerShell 7 with only their WinForms load replaced by the stub, so the
+ * shipped line-break filter and both "no path to list" branches run for real
+ * rather than through a TypeScript model of them.
+ */
+describe.skipIf(!hasPwsh)(
+  'WindowsBackend — FileDrop scripts run under pwsh (skipped when pwsh is not on PATH)',
+  { timeout: 30_000 },
+  () => {
+    let dir = '';
+    let stubPath = '';
+    let dropList: readonly string[] = [];
+    let backend: WindowsBackend;
+
+    beforeAll(() => {
+      dir = mkdtempSync(join(tmpdir(), 'clipboard-pwsh-'));
+      stubPath = join(dir, 'winforms-stub.dll');
+      const compiled = actualChildProcess.spawnSync(
+        'pwsh',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          'Add-Type -TypeDefinition $env:WINFORMS_STUB -OutputAssembly $env:WINFORMS_STUB_PATH -OutputType Library',
+        ],
+        { env: { ...PWSH_ENV, WINFORMS_STUB, WINFORMS_STUB_PATH: stubPath } },
+      );
+      if (compiled.status !== 0) {
+        throw new Error(`compiling the WinForms stub failed: ${compiled.stderr.toString()}`);
+      }
+    });
+
+    afterAll(() => {
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    });
+
+    beforeEach(() => {
+      backend = new WindowsBackend();
+      vi.resetAllMocks();
+      mockSpawn.mockImplementation(((command: string, args: readonly string[], options: object) => {
+        const parts = (args.at(-1) ?? '').split(LOAD_WINFORMS);
+        if (command !== 'powershell.exe' || parts.length !== 2) {
+          throw new Error(
+            `test isolation: expected one powershell.exe script with one ${LOAD_WINFORMS}`,
+          );
+        }
+        const files = dropList
+          .map(
+            (path) =>
+              `[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(path).toString('base64')}'))`,
+          )
+          .join(', ');
+        const stubbed = `Add-Type -Path '${stubPath.replaceAll("'", "''")}'\n[System.Windows.Forms.Clipboard]::Files = [string[]]@(${files})${parts.join('')}`;
+        return actualChildProcess.spawn('pwsh', args.with(-1, stubbed), {
+          ...options,
+          env: PWSH_ENV,
+        });
+      }) as unknown as typeof spawn);
+    });
+
+    it.each([
+      ['a clean list', DROP_LIST, DROP_LIST.join('\n'), {}],
+      [
+        'an LF path',
+        ['C:\\a.txt', 'C:\\line\nbreak.txt', 'C:\\b.txt'],
+        'C:\\a.txt\nC:\\b.txt',
+        { omittedPaths: 1 },
+      ],
+      ['a CR path', ['C:\\cr\rhere.txt', 'C:\\b.txt'], 'C:\\b.txt', { omittedPaths: 1 }],
+      ['a CRLF path', ['C:\\a.txt', 'C:\\crlf\r\npath.txt'], 'C:\\a.txt', { omittedPaths: 1 }],
+    ])(
+      '%s: inspect sizes the kept paths, and the read returns them with the left-out count',
+      async (_label, list, kept, omitted) => {
+        dropList = list;
+        const bytes = Buffer.from(kept);
+        await expect(backend.inspect()).resolves.toEqual({
+          primaryFormat: 'files',
+          availableFormats: ['files'],
+          itemCount: 1,
+          rawTypes: [{ type: 'FileDrop', bytes: bytes.byteLength }],
+        });
+        await expect(backend.read('files', FULL)).resolves.toEqual({
+          format: 'files',
+          content: bytes,
+          totalByteSize: bytes.byteLength,
+          revision: sha256Of(bytes),
+          itemCount: 1,
+          ...omitted,
+        });
+      },
+    );
+
+    it('a list whose every path holds a line break: inspect fails the FileDrop measurement, and the read is format_unavailable', async () => {
+      dropList = ['C:\\a\nb', 'C:\\c\rd', 'C:\\e\r\nf'];
+      await expect(backend.inspect()).resolves.toEqual({
+        primaryFormat: 'empty',
+        availableFormats: [],
+        itemCount: 1,
+        rawTypes: [{ type: 'FileDrop', measurementFailed: true }],
+      });
+      await expect(backend.read('files', FULL)).rejects.toMatchObject({
+        category: 'format_unavailable',
+        message: expect.stringMatching(/FileDrop/),
+      });
+    });
+  },
+);

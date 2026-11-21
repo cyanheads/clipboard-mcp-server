@@ -32,6 +32,17 @@ describe('clipboardWrite', () => {
     expect(clipboardWrite.input.shape.format.description).toContain('macOS and Windows');
   });
 
+  it('says the macOS and Windows plain-text fallback keeps line breaks and cell tabs, not list markers', () => {
+    for (const text of [
+      clipboardWrite.description,
+      clipboardWrite.input.shape.format.description,
+    ]) {
+      expect(text).toContain(
+        'plain-text fallback that keeps line breaks and separates table cells with tabs, but drops list markers and numbering',
+      );
+    }
+  });
+
   it('states that a Linux HTML write reaches plain-text paste targets as raw markup', () => {
     for (const text of [
       clipboardWrite.description,
@@ -258,6 +269,12 @@ describe('clipboardWrite — previous clipboard contents (#28)', () => {
     const result = await clipboardWrite.handler(input, ctx);
 
     expect(result).not.toHaveProperty('previousContent');
+  });
+
+  it('keeps the previousContent description text unchanged', () => {
+    expect(clipboardWrite.output.shape.previousContent.description).toBe(
+      'Plain-text content that was on the clipboard before this write or clear, if any and within size limits. Write it back with clipboard_write to undo an unintended overwrite. Absent if the clipboard was empty, held no text representation, or the prior content exceeded the read size limit.',
+    );
   });
 
   it('declares previousContent as an optional string on the output schema', () => {
