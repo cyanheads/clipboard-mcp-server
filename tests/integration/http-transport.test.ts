@@ -2,7 +2,8 @@
  * @fileoverview HTTP transport integration tests — boots the built server and
  * asserts the behavior only the real transport exhibits: session-mode defaults,
  * the request-body cap that stands between a client and `clipboard_write`'s
- * declared size error, and which tools a read-only deployment registers.
+ * declared size error, which tools a read-only deployment registers, and how an
+ * invalid read-only flag fails startup.
  *
  * @module tests/integration/http-transport.test
  */
@@ -91,7 +92,9 @@ describe('default HTTP launch', () => {
     expect(instructions).toContain('single live slot');
     expect(instructions).toContain('clipboard_inspect shows what is present');
     expect(instructions).toContain('format "auto"');
-    expect(instructions).toContain('an image whenever one is present');
+    expect(instructions).toContain('(format "files", one per line');
+    expect(instructions).toContain('whenever any are present, else an image whenever one is');
+    expect(instructions).toContain('clipboard_read takes item to read one alone');
     expect(instructions).toContain('clipboard_write replaces it');
   });
 
@@ -258,11 +261,78 @@ describe('read-only deployment', () => {
   });
 });
 
+describe('CLIPBOARD_READ_ONLY values that keep the write tool', () => {
+  it.each([
+    ['false', 'false'],
+    ['empty', ''],
+    ['an unsubstituted placeholder', `\${user_config.CLIPBOARD_READ_ONLY}`],
+  ])(
+    'registers clipboard_write and serves write instructions for %s',
+    async (_label, value) => {
+      const server = await startServer({ env: { CLIPBOARD_READ_ONLY: value } });
+      try {
+        const client = await connect(server.url);
+        expect(await listToolNames(client)).toEqual([
+          'clipboard_inspect',
+          'clipboard_read',
+          'clipboard_write',
+        ]);
+        const instructions = resultOf<InitializeResult>(client.initialize).instructions ?? '';
+        expect(instructions).toContain('clipboard_write replaces it');
+      } finally {
+        await server.stop();
+      }
+    },
+    60_000,
+  );
+});
+
+describe('read-only deployment configured in .env', () => {
+  it('omits clipboard_write when CLIPBOARD_READ_ONLY=true is set only in .env', async () => {
+    const cwd = createTempDir();
+    writeFileSync(join(cwd, '.env'), 'CLIPBOARD_READ_ONLY=true\n', 'utf8');
+    const server = await startServer({ cwd });
+    try {
+      const client = await connect(server.url);
+      expect(await listToolNames(client)).toEqual(['clipboard_inspect', 'clipboard_read']);
+      const instructions = resultOf<InitializeResult>(client.initialize).instructions ?? '';
+      expect(instructions).not.toContain('clipboard_write');
+    } finally {
+      await server.stop();
+    }
+  }, 60_000);
+});
+
 describe('invalid CLIPBOARD_READ_ONLY', () => {
-  it('fails startup naming the variable', async () => {
-    await expect(startServer({ env: { CLIPBOARD_READ_ONLY: 'maybe' } })).rejects.toThrow(
-      /CLIPBOARD_READ_ONLY/,
+  /** Start a server expected to fail, and return the harness's rejection text (exit code plus output). */
+  async function startupFailure(options: Parameters<typeof startServer>[0]): Promise<string> {
+    const failure = await startServer(options).then(
+      async (server) => {
+        await server.stop();
+        throw new Error('server started despite an invalid CLIPBOARD_READ_ONLY');
+      },
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
     );
+    return failure;
+  }
+
+  function expectConfigBanner(failure: string): void {
+    expect(failure).toContain('exited with code 1');
+    expect(failure).toContain('Configuration error — server failed to start');
+    expect(failure).toContain('CLIPBOARD_READ_ONLY (readOnly): Invalid option: expected one of');
+    // The banner replaces the uncaught McpError and its stack frames.
+    expect(failure).not.toContain('McpError');
+    expect(failure).not.toMatch(/^\s+at /m);
+  }
+
+  it('fails startup behind the configuration banner, with no stack trace', async () => {
+    expectConfigBanner(await startupFailure({ env: { CLIPBOARD_READ_ONLY: 'maybe' } }));
+  }, 60_000);
+
+  it('fails startup behind the banner when the invalid value comes from .env', async () => {
+    const cwd = createTempDir();
+    writeFileSync(join(cwd, '.env'), 'CLIPBOARD_READ_ONLY=maybe\n', 'utf8');
+    expectConfigBanner(await startupFailure({ cwd }));
   }, 60_000);
 });
 

@@ -9,18 +9,18 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 /**
- * Boolean env flag parser. Accepts true/false/1/0/yes/no/on/off (case-insensitive)
- * and rejects anything else at startup rather than coercing it — `z.coerce.boolean()`
- * would turn the string `"false"` into `true`, leaving the flag impossible to
- * switch off from the environment.
+ * `z.stringbool()` accepts true/false/1/0/yes/no/on/off and the like
+ * (case-insensitive) and rejects anything else at startup rather than coercing
+ * it — `z.coerce.boolean()` would turn the string `"false"` into `true`, leaving
+ * the flag impossible to switch off from the environment. Its rejection names
+ * the accepted values, which the startup banner then shows.
  *
  * parseEnvConfig normalizes blank and unsubstituted placeholder values to unset;
  * z.stringbool() itself rejects those values.
  */
-const envBoolean = z.union([z.boolean(), z.stringbool()]);
-
 const ServerConfigSchema = z.object({
-  readOnly: envBoolean
+  readOnly: z
+    .stringbool()
     .default(false)
     .describe(
       'Serve the clipboard read-only. When true, clipboard_write is absent from tools/list and uncallable, but listed as disabled in the server manifest, landing page, and startup log. Defaults to false.',
@@ -37,6 +37,18 @@ export function getServerConfig(): ServerConfig {
     readOnly: 'CLIPBOARD_READ_ONLY',
   });
   return _config;
+}
+
+/**
+ * Read `CLIPBOARD_READ_ONLY` without throwing, for the registration choice made
+ * before `createApp()` runs. An unrecognized value reads as `false`; that never
+ * reaches a client, because `getServerConfig()` in `setup()` then fails startup
+ * behind the configuration-error banner. Blank and placeholder values also read
+ * as `false`, which matches the default `getServerConfig()` gives them as unset.
+ */
+export function peekReadOnly(): boolean {
+  const parsed = ServerConfigSchema.shape.readOnly.safeParse(process.env.CLIPBOARD_READ_ONLY);
+  return parsed.success && parsed.data;
 }
 
 /** Test hook to reset the cached config. Not used at runtime. */

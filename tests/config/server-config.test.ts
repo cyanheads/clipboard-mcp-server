@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getServerConfig, resetServerConfig } from '@/config/server-config.js';
+import { getServerConfig, peekReadOnly, resetServerConfig } from '@/config/server-config.js';
 
 beforeEach(() => {
   resetServerConfig();
@@ -44,9 +44,11 @@ describe('getServerConfig', () => {
     expect(getServerConfig().readOnly).toBe(false);
   });
 
-  it('rejects an unrecognized value, naming the variable', () => {
+  it('rejects an unrecognized value, naming the variable and the values it accepts', () => {
     vi.stubEnv('CLIPBOARD_READ_ONLY', 'maybe');
-    expect(() => getServerConfig()).toThrow(/CLIPBOARD_READ_ONLY/);
+    expect(() => getServerConfig()).toThrow(
+      /CLIPBOARD_READ_ONLY \(readOnly\): Invalid option: expected one of "true"\|"1"\|"yes"\|"on"/,
+    );
   });
 
   it('caches the parsed config until it is reset', () => {
@@ -58,5 +60,49 @@ describe('getServerConfig', () => {
 
     resetServerConfig();
     expect(getServerConfig().readOnly).toBe(false);
+  });
+});
+
+describe('peekReadOnly', () => {
+  it.each(['true', '1', 'yes', 'on', 'TRUE', 'On'])('reads %s as true', (value) => {
+    vi.stubEnv('CLIPBOARD_READ_ONLY', value);
+    expect(peekReadOnly()).toBe(true);
+  });
+
+  it.each([
+    ['unset', undefined],
+    ['false', 'false'],
+    ['0', '0'],
+    ['empty', ''],
+    ['whitespace-only', '  '],
+    ['an unsubstituted placeholder', `\${user_config.CLIPBOARD_READ_ONLY}`],
+  ])('reads %s as false', (_label, value) => {
+    vi.stubEnv('CLIPBOARD_READ_ONLY', value as string);
+    expect(peekReadOnly()).toBe(false);
+  });
+
+  it.each(['maybe', ' true', 'true1'])(
+    'reads the unrecognized value %j as false without throwing, where getServerConfig rejects it',
+    (value) => {
+      vi.stubEnv('CLIPBOARD_READ_ONLY', value);
+      expect(peekReadOnly()).toBe(false);
+      expect(() => getServerConfig()).toThrow(/CLIPBOARD_READ_ONLY/);
+    },
+  );
+
+  it.each([
+    'true',
+    'false',
+    'yes',
+    'OFF',
+    'y',
+    'disabled',
+    '',
+    ' ',
+    `\${user_config.CLIPBOARD_READ_ONLY}`,
+    ` \${X} `,
+  ])('agrees with getServerConfig on the accepted value %j', (value) => {
+    vi.stubEnv('CLIPBOARD_READ_ONLY', value);
+    expect(peekReadOnly()).toBe(getServerConfig().readOnly);
   });
 });

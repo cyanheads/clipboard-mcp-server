@@ -6,7 +6,7 @@
 
 import { createApp, disabledTool } from '@cyanheads/mcp-ts-core';
 import { config, resetConfig } from '@cyanheads/mcp-ts-core/config';
-import { getServerConfig } from './config/server-config.js';
+import { getServerConfig, peekReadOnly } from './config/server-config.js';
 import { clipboardInspect } from './mcp-server/tools/definitions/clipboard-inspect.tool.js';
 import { clipboardRead } from './mcp-server/tools/definitions/clipboard-read.tool.js';
 import { clipboardWrite } from './mcp-server/tools/definitions/clipboard-write.tool.js';
@@ -36,7 +36,14 @@ process.env.MCP_HTTP_MAX_BODY_BYTES ??= '7340032';
 
 resetConfig();
 
-const { readOnly } = getServerConfig();
+/**
+ * Registration needs the read-only flag before `createApp()` runs, so read it
+ * here without throwing; `setup()` parses the full server config and fails an
+ * invalid value behind the framework's configuration-error banner, before any
+ * transport starts. Under Node `.env` loads on the first `config` read above,
+ * so this read must stay below it.
+ */
+const readOnly = peekReadOnly();
 
 const writeTool = readOnly
   ? disabledTool(clipboardWrite, {
@@ -58,7 +65,7 @@ function buildInstructions(writeEnabled: boolean): string {
     ? 'There is no history — the clipboard is a single live slot, so clipboard_read returns whatever is on it right now and clipboard_write replaces it.'
     : 'There is no history — the clipboard is a single live slot, so clipboard_read returns whatever is on it right now.';
   const formats =
-    'A clipboard holds one item in several formats (text/html/rtf/image); clipboard_inspect shows what is present, and clipboard_read with format "auto" returns the richest one — an image whenever one is present — so name "html" or "text" when the user wants the copied text. Images come back as base64 PNG; read in offset/limit slices, they are PNG byte chunks to base64-decode and concatenate in offset order, not standalone images. When paging with nextOffset, pass back the returned representationId so a clipboard change between slices fails instead of mixing two values.';
+    'A clipboard holds one or more items (itemCount; several only on macOS, and clipboard_read takes item to read one alone), each in several formats (text/html/rtf/image/files); clipboard_inspect shows what is present, and clipboard_read with format "auto" returns the richest one — the absolute paths of copied files (format "files", one per line, paths on the machine the server runs on, which it never opens) whenever any are present, else an image whenever one is — so name "html" or "text" when the user wants the copied text. Images come back as base64 PNG; read in offset/limit slices, they are PNG byte chunks to base64-decode and concatenate in offset order, not standalone images. When paging with nextOffset, pass back the returned representationId so a clipboard change between slices fails instead of mixing two values.';
   const skill =
     'The clipboard-guide skill (skill://clipboard-guide/SKILL.md) carries the gates for choosing a format, paging large values, and replacing the clipboard without losing what the user copied.';
   return `${lead} ${slot} ${formats} ${skill}`;
@@ -75,6 +82,7 @@ await createApp({
   prompts: [],
   skills: 'skills',
   async setup(core) {
+    getServerConfig();
     await initClipboardService(core.config, core.storage);
   },
 });

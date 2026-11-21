@@ -44,7 +44,7 @@
     },
     "CLIPBOARD_READ_ONLY": {
       "title": "Read-Only Mode",
-      "description": "Serve the clipboard read-only. When true, the clipboard_write tool is not registered. Accepts true/false/1/0/yes/no/on/off.",
+      "description": "Serve the clipboard read-only. When true, clipboard_write is absent from tools/list and uncallable, but listed as disabled in the server manifest, landing page, and startup log. Accepts true/false/1/0/yes/no/on/off.",
       "type": "string",
       "default": "false",
       "required": false
