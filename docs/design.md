@@ -163,9 +163,9 @@ Without `item`, a read of several items draws on them by format, and the notice 
 | `image` | The first item holding `public.png`, else the first holding `public.tiff` (AppKit converts JPEG, HEIC, GIF, and the like to it across the pasteboard), else PICT — so not always the first item holding an image |
 | `text` | Every item's text, joined by AppKit |
 | `rtf` | One RTF document AppKit builds from every item it can render as RTF — text and HTML items included |
+| `files` | Every item's paths, in item order |
 
 A read of one item has no pasteboard-wide TIFF conversion, so an image read of one item also tries that item's own types `NSImage` reads (JPEG, HEIC, GIF), after PNG, TIFF, and PICT; a type `NSBitmapImageRep` cannot decode (PDF) stays unreadable.
-| `files` | Every item's paths, in item order |
 
 An `item` at or past `itemCount` fails `format_unavailable`, before any read under `auto`. The item is part of the `representationId` token, so a continuation that changes it fails `representation_changed`.
 
