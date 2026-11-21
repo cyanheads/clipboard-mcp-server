@@ -2,8 +2,8 @@
 
 **Server:** clipboard-mcp-server
 **Version:** 0.3.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -239,6 +239,9 @@ src/
       cf-html.ts                        # Windows CF_HTML envelope builder/parser
       byte-window.ts                    # Bounded byte-window reads + UTF-8 boundary trimming
       png-dimensions.ts                 # PNG width/height from the IHDR chunk
+      html-to-text.ts                   # Plain-text rendering of HTML for the write fallback (HTML Standard innerText rules)
+      uri-list.ts                       # text/uri-list (RFC 2483) to local file paths, the Linux source of `files`
+      linux-selection.ts                # Inspection and reads shared by the Linux backends
 ```
 
 ---
@@ -343,7 +346,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs at a package's root (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) — a `skills/` deeper in a package, such as the MCP SDK's `dist/ext/skills/` runtime, stays (`tests/scripts/bundle-agent-docs.test.ts` pins this local change to the synced scripts until cyanheads/mcp-ts-core#794 ships, so re-apply it after a script resync); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp`, which records the packing machine's paths; and build-only package files (the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases). MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package, such as the MCP SDK's `dist/ext/skills/` runtime, is code and stays; `tests/scripts/bundle-agent-docs.test.ts` holds the cleaner and `lint:packaging` to that boundary); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp`, which records the packing machine's paths; and build-only package files (the framework's `changelog/`, `scripts/`, `templates/`, and config bases). MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` verifies matching names, every user option wired into `mcp_config.env` as `${user_config.X}`, and optional string options carrying `default: ""`. The host substitutes no arbitrary `${X}` placeholders.
 

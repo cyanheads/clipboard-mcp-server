@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/clipboard-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/clipboard-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -23,13 +23,13 @@
 
 ## Overview
 
-The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write, and inspect text, HTML, RTF, and image content.
+The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write, and inspect text, HTML, RTF, image, and copied-file path content.
 
 ### Tools
 
 | Tool | Description |
 |:---|:---|
-| `clipboard_read` | Read clipboard contents in a specified format (text, HTML, RTF, image, or auto-select richest) |
+| `clipboard_read` | Read clipboard contents in a specified format (text, HTML, RTF, image, copied-file paths, or auto-select richest) |
 | `clipboard_write` | Write plain text or HTML to the clipboard, replacing current contents, or clear it outright |
 | `clipboard_inspect` | List available clipboard formats and byte sizes without reading full content |
 
@@ -39,15 +39,17 @@ The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write
 
 ### `clipboard_read` <sub>tool</sub>
 
-- Read `text`, `html`, `rtf`, or `image`; `auto` selects the richest present format (image > html > rtf > text). Whole-read limits: 512 KB text/HTML/RTF, 5 MB image
-- Returns `format`, `content`, byte sizes, `complete`, and `representationId`; images are base64 PNG with optional `width`/`height`. Failures carry `format_unavailable`, `content_too_large`, `representation_changed`, `clipboard_unavailable`, or `inspect_unreadable`
-- For larger values, use byte `offset`/`limit` (minimum limit 4, capped per format), then pass each `nextOffset` as `offset` along with `representationId` until complete. Image slices are byte chunks: decode each separately and concatenate in order; only a whole image attaches an image block
+- Read `text`, `html`, `rtf`, `image`, or `files`; `auto` selects the richest present format (files > image > html > rtf > text). Whole-read limits: 512 KB text/HTML/RTF/files, 5 MB image
+- `files` returns the absolute paths of files copied in a file manager, one per line (LF, no trailing newline). They are paths on the machine the server runs on, and the server never opens them. A path holding a line break (on Linux, also one whose bytes are not UTF-8) is left out, and the `notice` counts it
+- A macOS clipboard can hold several items; `itemCount` reports how many, and `item` (0-based) reads one alone. Without `item`, text joins every item's text, RTF is one document built from every item holding text, HTML, or RTF, HTML comes from the first item that has it, an image from the first item holding a PNG (else the first holding another image type), and files list every item; the `notice` says which. Linux and Windows hold one item
+- Returns `format`, `content`, byte sizes, `complete`, `representationId`, and `itemCount`; images are base64 PNG with optional `width`/`height`. Failures carry `format_unavailable` (also for an `item` past the last), `content_too_large`, `representation_changed`, `clipboard_unavailable`, or `inspect_unreadable`
+- For larger values, use byte `offset`/`limit` (minimum limit 4, capped per format), then pass each `nextOffset` as `offset` along with `representationId` and the same `item` until complete. Image slices are byte chunks: decode each separately and concatenate in order; only a whole image attaches an image block
 
 ---
 
 ### `clipboard_write` <sub>tool</sub>
 
-- Supply non-empty `content` or `clear: true`, exclusively; `format` accepts `text` or `html`, with a 1 MB write limit. HTML gets a stripped plain-text fallback on macOS/Windows; Linux plain-text pastes can receive markup
+- Supply non-empty `content` or `clear: true`, exclusively; `format` accepts `text` or `html`, with a 1 MB write limit. HTML gets a tag-stripped plain-text fallback on macOS/Windows that keeps line breaks and tab-separates table cells; Linux plain-text pastes can receive markup
 - Returns `format`/`byteSize`, or `cleared: true` with zero bytes; optional `previousContent` holds prior plain text within the 512 KB read limit. Failures carry `content_too_large` or `clipboard_unavailable`; X11 clear requires `xsel`
 - `CLIPBOARD_READ_ONLY` disables both writes and clears by removing the tool from `tools/list`
 
@@ -55,7 +57,7 @@ The system clipboard across macOS, Linux (X11/Wayland), and Windows. Read, write
 
 ### `clipboard_inspect` <sub>tool</sub>
 
-- Returns `primaryFormat` (image > html > rtf > text, or `empty`) and `availableFormats` for choosing a read format
+- Returns `primaryFormat` (files > image > html > rtf > text, or `empty`), `availableFormats` for choosing a read format, and `itemCount`
 - `rawTypes` lists platform identifiers with measured `bytes`, or `measurementFailed` when unreadable. Failures carry `inspect_unreadable` or `clipboard_unavailable`
 
 ---
@@ -67,8 +69,9 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Clipboard-specific:
 
 - Cross-platform backend detection at startup — macOS (osascript/JXA), Linux X11 (xclip), Linux Wayland (wl-clipboard), Windows (PowerShell 5.1+)
-- Semantic format mapping — platform-native type identifiers (UTIs, TARGETS, Windows format names) mapped to `text`, `html`, `rtf`, `image` across all backends
-- Platform-aware HTML writes — macOS and Windows publish HTML plus a stripped plain-text fallback; on Linux the HTML is the only payload, which plain-text paste targets can also receive
+- Semantic format mapping — platform-native type identifiers (UTIs, TARGETS, Windows format names) mapped to `text`, `html`, `rtf`, `image`, `files` across all backends
+- Copied-file paths — `files` reads each item's `public.file-url` on macOS, `text/uri-list` `file:` URIs on Linux, and the FileDrop list on Windows, as paths only; no file is opened
+- Platform-aware HTML writes — macOS and Windows publish HTML plus a tag-stripped plain-text fallback that follows the HTML Standard's `innerText` line-break rules; on Linux the HTML is the only payload, which plain-text paste targets can also receive
 - Image support — every backend returns PNG as base64, with width/height when the returned bytes carry a readable PNG header (Linux backends read them from that header, so only a whole image or a slice starting at offset 0 has them)
 
 Agent-friendly output:
@@ -129,7 +132,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Prerequisites
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+), plus the platform's clipboard helper:
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+), plus the platform's clipboard helper:
 
 **macOS:** No additional tools required — `osascript` is built in.
 
