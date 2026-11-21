@@ -2,18 +2,13 @@
  * @fileoverview tests/scripts/bundle-agent-docs.test.ts — the `.mcpb` cleaner
  * and packaging check keep executable dependency modules under a nested
  * `skills/` directory (the MCP SDK's `dist/ext/skills/` runtime) while stripping
- * agent documentation at a dependency's package root.
+ * agent documentation at a dependency's package root. The two scripts carry
+ * separate copies of the pattern; this suite holds the pair to one behavior.
  * @module tests/scripts/bundle-agent-docs
  */
 import { describe, expect, it } from 'vitest';
 import { filterAgentDocEntries } from '../../scripts/clean-mcpb.js';
-
-// Loaded by URL so `tsc` never follows the script's repo-only fallback import.
-const {
-  checkBundleEntries,
-}: { checkBundleEntries: (entries: string[], bundleLabel: string) => string[] } = await import(
-  new URL('../../scripts/lint-packaging.ts', import.meta.url).href
-);
+import { checkBundleEntries } from '../../scripts/lint-packaging.js';
 
 describe('bundle agent-doc boundaries', () => {
   it.each([
@@ -36,6 +31,8 @@ describe('bundle agent-doc boundaries', () => {
     'node_modules/package/.agents/guide.md',
     'node_modules/package/SKILL.md',
     'node_modules/package/docs/SKILL.md',
+    'node_modules/package/AGENTS.md',
+    'node_modules/@cyanheads/mcp-ts-core/CLAUDE.md',
   ])('strips dependency agent documentation %s', (entry) => {
     expect(filterAgentDocEntries([entry])).toEqual([entry]);
     const findings = checkBundleEntries([entry], 'fixture.mcpb');
