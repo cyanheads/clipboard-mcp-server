@@ -1,6 +1,6 @@
 # clipboard-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 04:04:53
+Generated on: 2026-11-21 17:36:56
 
 ```text
 clipboard-mcp-server/
@@ -121,7 +121,6 @@ clipboard-mcp-server/
 │   └── tool-defs-analysis/
 │       └── SKILL.md
 ├── scripts/
-│   ├── audit-open-index-signatures.ts
 │   ├── build-changelog.ts
 │   ├── build.ts
 │   ├── check-dependency-specifiers.ts
@@ -160,11 +159,14 @@ clipboard-mcp-server/
 │   │       ├── byte-window.ts
 │   │       ├── cf-html.ts
 │   │       ├── clipboard-service.ts
+│   │       ├── html-to-text.ts
+│   │       ├── linux-selection.ts
 │   │       ├── linux-wayland-backend.ts
 │   │       ├── linux-x11-backend.ts
 │   │       ├── macos-backend.ts
 │   │       ├── png-dimensions.ts
 │   │       ├── types.ts
+│   │       ├── uri-list.ts
 │   │       └── windows-backend.ts
 │   └── index.ts
 ├── tests/
@@ -184,6 +186,7 @@ clipboard-mcp-server/
 │   │       ├── byte-window.test.ts
 │   │       ├── cf-html.test.ts
 │   │       ├── clipboard-service.test.ts
+│   │       ├── html-to-text.test.ts
 │   │       ├── linux-wayland-backend.test.ts
 │   │       ├── linux-x11-backend.test.ts
 │   │       ├── macos-backend.test.ts
@@ -192,6 +195,8 @@ clipboard-mcp-server/
 │   │       ├── png-fixtures.ts
 │   │       ├── scripted-spawn.ts
 │   │       ├── types.test.ts
+│   │       ├── uri-list-fixtures.ts
+│   │       ├── uri-list.test.ts
 │   │       └── windows-backend.test.ts
 │   └── tools/
 │       ├── clipboard-inspect.tool.test.ts
